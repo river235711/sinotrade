@@ -27,6 +27,8 @@ class ORBStrategy:
 
     def reset(self):
         """重置每日盤中狀態"""
+        self.pre_orb_high = None
+        self.pre_orb_low = None
         self.orb_high = None
         self.orb_low = None
         self.orb_calculated = False
@@ -48,7 +50,15 @@ class ORBStrategy:
         return df
 
     def calculate_orb_levels(self, kbars: pd.DataFrame):
-        """計算指定日期的現貨開盤區間高低點 (預設 09:00 ~ 09:15)"""
+        """計算指定日期的早盤區間 (08:45~09:00) 與現貨開盤區間 (09:00~09:15) 高低點"""
+        pre_bars = kbars.between_time(
+            self.config.pre_orb_start_time[:5],
+            self.config.pre_orb_end_time[:5]
+        )
+        if len(pre_bars) > 0:
+            self.pre_orb_high = float(pre_bars['high'].max())
+            self.pre_orb_low = float(pre_bars['low'].min())
+
         orb_bars = kbars.between_time(
             self.config.orb_start_time[:5], 
             self.config.orb_end_time[:5]
@@ -263,7 +273,42 @@ class ORBStrategy:
                         self.position = 0
                         return {"action": "EXIT", "record": trade_record}
 
-        # 3. 無部位時，檢查開盤突破 + VWAP & EMA 濾網進場信號
+        # 3A. 09:01 ~ 09:15 早盤強勢爆發突破進場 (防止如 10/30 現貨一開盤直接崩跌 500 點而錯失行情)
+        if (self.position == 0 and
+            self.pre_orb_high is not None and
+            self.trade_count < self.config.max_initial_trades and
+            "09:01:00" <= t_str <= self.config.orb_end_time):
+
+            long_filter = (not self.config.use_vwap_ema_filter) or (c > vwap and ema9 > ema21)
+            short_filter = (not self.config.use_vwap_ema_filter) or (c < vwap and ema9 < ema21)
+            sb = self.config.early_super_breakout_pts
+
+            if c >= (self.pre_orb_high + sb) and long_filter:
+                self.position = 1
+                self.entry_price = c
+                self.entry_time = ts
+                self.trade_count += 1
+                self.highest_profit = 0.0
+                return {
+                    "action": "BUY",
+                    "price": c,
+                    "time": ts,
+                    "detail": f"早盤強勢爆發突破 ({self.pre_orb_high}+{sb:.0f}點) + VWAP/EMA 多頭確認"
+                }
+            elif c <= (self.pre_orb_low - sb) and short_filter:
+                self.position = -1
+                self.entry_price = c
+                self.entry_time = ts
+                self.trade_count += 1
+                self.highest_profit = 0.0
+                return {
+                    "action": "SELL",
+                    "price": c,
+                    "time": ts,
+                    "detail": f"早盤強勢跳水突破 ({self.pre_orb_low}-{sb:.0f}點) + VWAP/EMA 空頭確認"
+                }
+
+        # 3B. 09:16 ~ 11:30 標準現貨開盤區間突破 + VWAP & EMA 濾網進場信號
         if (self.position == 0 and 
             self.orb_calculated and 
             self.trade_count < self.config.max_initial_trades and

@@ -13,10 +13,13 @@ class BacktestMetrics:
         if not trades:
             return {
                 "total_trades": 0,
+                "win_count": 0,
+                "loss_count": 0,
                 "win_rate": 0.0,
                 "total_points": 0.0,
                 "net_profit_ntd": 0.0,
                 "profit_factor": 0.0,
+                "avg_trade_ntd": 0.0,
                 "max_drawdown_pts": 0.0,
                 "max_drawdown_ntd": 0.0,
                 "trades_df": pd.DataFrame()
