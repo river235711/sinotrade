@@ -3,17 +3,46 @@
 支援：
 1. --mode paper  (模擬測試環境 simulation=True，不下真單，驗證即時報價與訊號)
 2. --mode live   (正式實盤環境 simulation=False，掛載憑證自動送單)
+
+成交確認與對帳機制：
+- 每張單送出後都會輪詢委託狀態，確認真的 Filled，並取得實際成交價與口數。
+- 送單後再用 list_positions 查帳上真實部位，與策略預期部位對帳。
+- 沒成交、部分成交、卡單：自動撤單、重新對齊策略狀態，必要時強制平倉並停止開新倉。
+- 所有委託與成交結果寫入 logs/orders_YYYYMMDD.csv 供事後核對。
 """
+import os
+import csv
+import json
 import time
 import datetime
 import logging
-import pandas as pd
+from dataclasses import dataclass
 from typing import Optional
+
+import pandas as pd
 from config import InstrumentConfig, ORBStrategyConfig, ShioajiConfig
 from strategies.orb_strategy import ORBStrategy
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger("ShioajiTrader")
+
+FINAL_STATUSES = {"Filled", "Cancelled", "Failed", "Inactive"}
+PENDING_STATUSES = {"PendingSubmit", "PreSubmitted", "Submitted", "PartFilled"}
+
+
+def _status_name(s) -> str:
+    """把 Shioaji 的列舉值統一轉成純文字，如 Status.Filled -> 'Filled'"""
+    v = getattr(s, "value", s)
+    return str(v).split(".")[-1]
+
+
+@dataclass
+class FillResult:
+    ok: bool                 # 是否「全部成交」
+    filled_qty: int          # 實際成交口數
+    avg_price: float         # 實際成交均價 (未成交為 0)
+    status: str              # 最終委託狀態
+
 
 class ShioajiTMFTrader:
     def __init__(self, simulation: bool = True, api_key: str = "", secret_key: str = "", quantity: int = 1):
@@ -27,10 +56,23 @@ class ShioajiTMFTrader:
         self.quantity = quantity
         self.api = None
         self.contract = None
-        
-        # 風控狀態
-        self.is_kill_switch_triggered = False
 
+        # 風控狀態
+        self.is_kill_switch_triggered = False   # True 時拒絕所有委託 (含平倉)，僅供緊急手動使用
+        self.entries_halted = False             # True 時只允許平倉，不再開新倉
+        self.order_failures = 0                 # 開倉單連續未成交次數
+        self.max_order_failures = 3
+
+        # 成交確認參數
+        self.fill_timeout = 10.0                # 等待成交的秒數
+        self.fill_poll_interval = 0.5           # 輪詢委託狀態的間隔秒數
+        self.retry_pause = 1.0                  # 平倉重試之間的等待秒數
+        self.reconcile_interval = 30.0          # 平時對帳間隔秒數
+        self.log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
+
+    # ------------------------------------------------------------------
+    # 連線與合約
+    # ------------------------------------------------------------------
     def initialize(self) -> bool:
         """初始化 Shioaji API、登入並啟用憑證"""
         try:
@@ -85,9 +127,12 @@ class ShioajiTMFTrader:
             logger.error(f"獲取合約失敗: {e}")
             return None
 
+    # ------------------------------------------------------------------
+    # 送單
+    # ------------------------------------------------------------------
     def place_order(self, action: str, price: float, quantity: int = 1, price_type: str = "MKP", octype: str = "Auto"):
         """
-        送出期貨委託單
+        送出期貨委託單 (只負責送出，是否成交請用 _send_and_verify 確認)
         :param action: 'BUY' 或 'SELL'
         :param price: 限價價格 (若為 MKP 範圍市價則填 0 或當前價)
         :param quantity: 下單口數
@@ -104,70 +149,503 @@ class ShioajiTMFTrader:
 
         import shioaji as sj
         sj_action = sj.Action.Buy if action == "BUY" else sj.Action.Sell
-        sj_price_type = (sj.FuturesPriceType.MKP if price_type == "MKP" 
+        sj_price_type = (sj.FuturesPriceType.MKP if price_type == "MKP"
                          else sj.FuturesPriceType.LMT)
         sj_octype = getattr(sj.FuturesOCType, octype, sj.FuturesOCType.Auto)
 
-        order = self.api.Order(
-            action=sj_action,
-            price=price if price_type == "LMT" else 0,
-            quantity=quantity,
-            price_type=sj_price_type,
-            order_type=sj.OrderType.IOC,
-            octype=sj_octype,
-            account=self.api.futopt_account
-        )
+        try:
+            order = self.api.Order(
+                action=sj_action,
+                price=price if price_type == "LMT" else 0,
+                quantity=quantity,
+                price_type=sj_price_type,
+                order_type=sj.OrderType.IOC,
+                octype=sj_octype,
+                account=self.api.futopt_account
+            )
+            trade = self.api.place_order(self.contract, order)
+        except Exception as e:
+            logger.error(f"❌ 送單失敗 [{action}] {quantity}口: {e}")
+            return None
 
-        trade = self.api.place_order(self.contract, order)
-        logger.info(f"✅ 委託單已送出: [{action}] {quantity}口 ({price_type}/IOC) -> {trade.status.status}")
+        logger.info(f"📤 委託單已送出: [{action}] {quantity}口 ({price_type}/IOC/{octype}) -> {_status_name(trade.status.status)} (尚未確認成交)")
         return trade
 
+    def wait_for_fill(self, trade, qty: int) -> FillResult:
+        """輪詢委託狀態直到終態；逾時仍未成交就撤單，避免單子之後才偷偷成交"""
+        deadline = time.time() + self.fill_timeout
+        status = _status_name(trade.status.status)
+
+        while True:
+            try:
+                self.api.update_status(self.api.futopt_account)
+            except Exception as e:
+                logger.warning(f"更新委託狀態失敗: {e}")
+            status = _status_name(trade.status.status)
+            if status in FINAL_STATUSES or time.time() >= deadline:
+                break
+            time.sleep(self.fill_poll_interval)
+
+        # 逾時仍掛在市場上：撤單，再確認最終狀態
+        if status in PENDING_STATUSES:
+            logger.warning(f"⚠️ 委託 {self.fill_timeout:.0f} 秒仍為 {status}，嘗試撤單...")
+            try:
+                self.api.cancel_order(trade)
+                time.sleep(self.fill_poll_interval)
+                self.api.update_status(self.api.futopt_account)
+            except Exception as e:
+                logger.error(f"撤單失敗: {e}")
+            status = _status_name(trade.status.status)
+
+        deals = list(getattr(trade.status, "deals", None) or [])
+        filled = sum(int(d.quantity) for d in deals)
+        avg_price = (sum(float(d.price) * int(d.quantity) for d in deals) / filled) if filled else 0.0
+        if filled == 0:
+            filled = int(getattr(trade.status, "deal_quantity", 0) or 0)
+        if filled == 0 and status == "Filled":
+            filled = qty    # 狀態已是 Filled 但成交明細尚未更新
+        return FillResult(ok=filled >= qty, filled_qty=filled, avg_price=avg_price, status=status)
+
+    def _send_and_verify(self, action: str, qty: int, octype: str = "Auto", price: float = 0.0) -> FillResult:
+        """送單並確認成交結果，同時寫入稽核紀錄"""
+        trade = self.place_order(action, price, qty, "MKP", octype)
+        if trade is None:
+            result = FillResult(False, 0, 0.0, "Rejected")
+        elif isinstance(trade, dict):      # 乾跑模式：沒有真正的券商回報
+            result = FillResult(True, qty, price, "Simulated")
+        else:
+            result = self.wait_for_fill(trade, qty)
+
+        if result.ok:
+            logger.info(f"✅ 成交確認: [{action}] {qty}口 全部成交 均價 {result.avg_price:.0f} ({result.status})")
+        else:
+            logger.error(f"❌ 未完全成交: [{action}] 要求 {qty}口，實際成交 {result.filled_qty}口，狀態 {result.status}")
+        self._audit(action, qty, octype, result)
+        return result
+
+    def _audit(self, action: str, qty: int, octype: str, result: FillResult):
+        """把每次委託結果寫入 logs/orders_YYYYMMDD.csv"""
+        try:
+            os.makedirs(self.log_dir, exist_ok=True)
+            now = datetime.datetime.now()
+            path = os.path.join(self.log_dir, f"orders_{now.strftime('%Y%m%d')}.csv")
+            is_new = not os.path.exists(path)
+            with open(path, "a", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                if is_new:
+                    w.writerow(["time", "action", "qty", "octype", "status", "filled_qty", "avg_price", "ok"])
+                w.writerow([now.strftime("%H:%M:%S"), action, qty, octype, result.status,
+                            result.filled_qty, f"{result.avg_price:.0f}", result.ok])
+        except Exception as e:
+            logger.warning(f"寫入稽核紀錄失敗: {e}")
+
+    # ------------------------------------------------------------------
+    # 帳上部位對帳與狀態持久化 (Position Reconciliation & State Recovery)
+    # ------------------------------------------------------------------
+    def get_real_position_details(self) -> dict:
+        """
+        查詢券商帳上 TMF 詳細部位資訊 (以券商帳上為唯一真實依據 Single Source of Truth)
+        回傳: {"net": int, "avg_price": float, "direction": str, "positions": list}
+        若無 API 或查詢失敗，回傳 {"net": None, ...}
+        """
+        if self.api is None:
+            return {"net": None, "avg_price": 0.0, "direction": "None", "positions": []}
+        try:
+            positions = self.api.list_positions(self.api.futopt_account)
+        except Exception as e:
+            logger.error(f"查詢帳上部位詳細資訊失敗: {e}")
+            return {"net": None, "avg_price": 0.0, "direction": "None", "positions": []}
+
+        net = 0
+        tmf_positions = []
+        total_cost = 0.0
+        total_qty = 0
+
+        for p in positions:
+            code = str(getattr(p, "code", ""))
+            if not code.startswith("TMF"):
+                continue
+            qty = int(getattr(p, "quantity", 0))
+            d = _status_name(getattr(p, "direction", ""))
+            price = float(getattr(p, "price", 0.0))
+            tmf_positions.append({"code": code, "direction": d, "qty": qty, "price": price})
+            if d == "Buy":
+                net += qty
+            else:
+                net -= qty
+            total_cost += price * qty
+            total_qty += qty
+
+        avg_price = (total_cost / total_qty) if total_qty > 0 else 0.0
+        direction = "Buy" if net > 0 else ("Sell" if net < 0 else "Flat")
+        return {"net": net, "avg_price": avg_price, "direction": direction, "positions": tmf_positions}
+
+    def get_real_position(self) -> Optional[int]:
+        """查詢券商帳上 TMF 淨部位：多單為正、空單為負、無部位為 0；查詢失敗回傳 None"""
+        return self.get_real_position_details()["net"]
+
+    def _get_state_path(self) -> str:
+        today_str = datetime.date.today().strftime("%Y%m%d")
+        return os.path.join(self.log_dir, f"state_{today_str}.json")
+
+    def _save_state(self, strategy: ORBStrategy):
+        """將當日策略即時狀態保存至 logs/state_YYYYMMDD.json"""
+        try:
+            os.makedirs(self.log_dir, exist_ok=True)
+            path = self._get_state_path()
+            state = {
+                "date": datetime.date.today().strftime("%Y-%m-%d"),
+                "updated_at": datetime.datetime.now().strftime("%H:%M:%S"),
+                "position": int(strategy.position),
+                "entry_price": float(strategy.entry_price),
+                "entry_time": str(strategy.entry_time) if strategy.entry_time is not None else None,
+                "highest_profit": float(strategy.highest_profit),
+                "trade_count": int(strategy.trade_count),
+                "orb_high": float(strategy.orb_high) if strategy.orb_high is not None else None,
+                "orb_low": float(strategy.orb_low) if strategy.orb_low is not None else None,
+                "orb_calculated": bool(strategy.orb_calculated),
+                "entries_halted": bool(self.entries_halted),
+            }
+            tmp_path = path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(state, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, path)
+        except Exception as e:
+            logger.warning(f"保存策略狀態失敗: {e}")
+
+    def _load_state(self) -> Optional[dict]:
+        """讀取當日策略狀態檔 logs/state_YYYYMMDD.json"""
+        try:
+            path = self._get_state_path()
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+        except Exception as e:
+            logger.warning(f"讀取策略狀態失敗: {e}")
+        return None
+
+    def _reconcile_and_recover_on_startup(self, strategy: ORBStrategy, kbars: pd.DataFrame) -> set:
+        """
+        啟動或中斷重啟時，對帳並接管帳上真實部位：
+        以券商帳上部位 (Single Source of Truth) 為最高依據。
+        回傳已處理的時間戳記集合 processed_timestamps，防止重播歷史 K 棒重複送單。
+        """
+        processed_timestamps = set()
+        if not kbars.empty:
+            # 將目前收盤的歷史 K 棒全部標記為已處理，避免重播重複開倉
+            processed_timestamps.update(kbars.index[:-1])
+
+        pos_details = self.get_real_position_details()
+        real_net = pos_details["net"]
+        broker_avg = pos_details["avg_price"]
+        saved_state = self._load_state()
+
+        if real_net is None:
+            # 乾跑模式或無法連線券商
+            if self.api is None and saved_state:
+                logger.info("ℹ️ [乾跑模式] 讀取本地策略狀態檔恢復進度...")
+                strategy.position = int(saved_state.get("position", 0))
+                strategy.entry_price = float(saved_state.get("entry_price", 0.0))
+                strategy.trade_count = int(saved_state.get("trade_count", 0))
+                strategy.highest_profit = float(saved_state.get("highest_profit", 0.0))
+            elif self.api is not None:
+                logger.warning("⚠️ 啟動檢查: 無法查詢帳上部位，將無法進行帳戶對帳，請特別留意。")
+            return processed_timestamps
+
+        # 情況一：券商帳上有 TMF 部位 (實體持倉) -> 機器人必須無縫接管！
+        if real_net != 0:
+            target_pos = 1 if real_net > 0 else -1
+            pos_label = "多單" if target_pos == 1 else "空單"
+            
+            strategy.position = target_pos
+            strategy.trade_count = max(1, saved_state.get("trade_count", 1) if saved_state else 1)
+            
+            # 優先使用券商真實平均成本
+            if broker_avg > 0:
+                strategy.entry_price = broker_avg
+            elif saved_state and saved_state.get("entry_price", 0) > 0:
+                strategy.entry_price = float(saved_state["entry_price"])
+            elif not kbars.empty:
+                strategy.entry_price = float(kbars.iloc[-1]['close'])
+                
+            # 恢復最高浮盈
+            if saved_state and "highest_profit" in saved_state:
+                strategy.highest_profit = float(saved_state["highest_profit"])
+            else:
+                strategy.highest_profit = 0.0
+
+            # 若有當日 K 棒，檢查持倉期間是否創出更高浮盈
+            if not kbars.empty and strategy.entry_price > 0:
+                if target_pos == 1:
+                    max_gain = float(kbars['high'].max() - strategy.entry_price)
+                else:
+                    max_gain = float(strategy.entry_price - kbars['low'].min())
+                if max_gain > strategy.highest_profit:
+                    strategy.highest_profit = max(0.0, max_gain)
+
+            logger.warning("=" * 75)
+            logger.warning(f"🔄 [重啟接管部位] 帳上發現未平倉 TMF {pos_label} {abs(real_net)}口 (均價 {strategy.entry_price:.0f})！")
+            logger.warning("🛡️ 機器人已成功接管該部位！持續執行停損、保本鎖利與 13:25 強制平倉風控。")
+            logger.warning(f"📊 當前追蹤最高浮盈: {strategy.highest_profit:+.0f} 點")
+            logger.warning("=" * 75)
+            self._save_state(strategy)
+            return processed_timestamps
+
+        # 情況二：券商帳上無部位 (空手)
+        logger.info("✅ 啟動檢查: 券商帳上目前無 TMF 部位 (淨部位 0)")
+        strategy.position = 0
+        strategy.highest_profit = 0.0
+
+        if saved_state:
+            # 恢復今日已交易次數與紀錄，避免重啟後重複突破開倉超過當日上限
+            strategy.trade_count = saved_state.get("trade_count", 0)
+            if saved_state.get("position", 0) != 0:
+                logger.warning("⚠️ 本地紀錄原為持倉，但券商帳上已無部位 (可能已由手機App手動平倉或由券商停損)，策略拉回空手。")
+            max_trades = getattr(strategy.config, "max_trades_per_day", None)
+            if max_trades is None:
+                max_trades = getattr(strategy.config, "max_initial_trades", 1) + (1 if getattr(strategy.config, "enable_sar", False) else 0)
+            if strategy.trade_count >= max_trades:
+                self._halt_entries(f"今日交易次數已達上限 ({strategy.trade_count}次)")
+                logger.info(f"🛑 今日已完成 {strategy.trade_count} 次交易，不再開新倉，維持空手監控至收盤。")
+        self._save_state(strategy)
+        return processed_timestamps
+
+    def flatten_real_position(self, retries: int = 3) -> bool:
+        """依帳上真實部位反向平倉，最多重試 retries 次；成功回傳 True"""
+        for i in range(retries):
+            real = self.get_real_position()
+            if real is None:
+                logger.error("無法查詢帳上部位，無法確認是否已平倉！請立即手動檢查券商軟體。")
+                return False
+            if real == 0:
+                return True
+            action = "SELL" if real > 0 else "BUY"
+            logger.warning(f"🧹 平倉嘗試 {i + 1}/{retries}: 帳上 {real:+d} 口，送出 {action} {abs(real)}口")
+            self._send_and_verify(action, abs(real), octype="Cover")
+            time.sleep(self.retry_pause)
+        return self.get_real_position() == 0
+
+    def _halt_entries(self, reason: str):
+        if not self.entries_halted:
+            logger.error(f"🛑 停止開新倉: {reason}（仍允許平倉）")
+        self.entries_halted = True
+
+    def _post_trade_check(self, strategy: ORBStrategy, act: str, result: FillResult):
+        """送單後以帳上真實部位對帳，並把策略狀態拉回與現實一致"""
+        expected = strategy.position * self.quantity
+        real = self.get_real_position()
+
+        if real is None:
+            # 沒有券商資料可對帳 (乾跑模式，或查詢失敗)
+            if self.api is not None and not result.ok:
+                self._halt_entries("委託未成交且無法查詢帳上部位")
+            return
+
+        if real == expected:
+            logger.info(f"📒 對帳通過: 帳上部位 {real:+d} 口 = 策略預期 {expected:+d} 口")
+            self.order_failures = 0
+            return
+
+        logger.error(f"📒 對帳不符: 帳上 {real:+d} 口，策略預期 {expected:+d} 口")
+
+        if expected == 0:
+            # 策略認為已平倉，但帳上還有部位 -> 一定要平掉
+            if not self.flatten_real_position():
+                strategy.position = 1 if real > 0 else -1
+                self._halt_entries("平倉失敗，帳上仍有部位")
+                logger.critical("🚨 帳上仍有未平倉部位，請立刻手動處理！")
+            else:
+                logger.info("✅ 已補平帳上殘留部位")
+            return
+
+        if real == 0:
+            # 開倉單根本沒成交：策略退回空手，讓之後可以重新判斷
+            strategy.position = 0
+            strategy.highest_profit = 0.0
+            strategy.trade_count = max(0, strategy.trade_count - 1)
+            self.order_failures += 1
+            logger.warning(f"開倉單未成交，策略退回空手 (連續失敗 {self.order_failures}/{self.max_order_failures})")
+            if self.order_failures >= self.max_order_failures:
+                self._halt_entries("開倉單連續未成交")
+            return
+
+        # 其他不一致 (方向相反、口數不對、部分成交)：為安全起見全部平掉
+        logger.error("部位方向或口數與預期不符，為安全起見全部平倉")
+        self.flatten_real_position()
+        strategy.position = 0
+        strategy.highest_profit = 0.0
+        self._halt_entries("成交結果與預期不符")
+        self._save_state(strategy)
+
+    def _periodic_reconcile(self, strategy: ORBStrategy):
+        """沒有交易動作時的定期對帳 (例如你在券商軟體手動平倉或加碼)"""
+        real = self.get_real_position()
+        if real is None:
+            return
+        expected = strategy.position * self.quantity
+        if real == expected:
+            return
+        logger.warning(f"⚠️ 定期對帳發現不一致: 帳上 {real:+d} 口，策略預期 {expected:+d} 口（可能有手動操作）")
+        if real == 0:
+            strategy.position = 0
+            strategy.highest_profit = 0.0
+        elif strategy.position != 0:
+            strategy.position = 1 if real > 0 else -1
+        self._halt_entries("帳上部位與策略不一致，需人工確認")
+        self._save_state(strategy)
+
+    def _force_flatten_all(self, strategy: ORBStrategy):
+        """收盤前強制平倉：以帳上真實部位為準，查不到才退回用策略部位"""
+        real = self.get_real_position()
+        if real is None:
+            if strategy.position == 0:
+                return
+            action = "SELL" if strategy.position == 1 else "BUY"
+            logger.warning("無法查詢帳上部位，改依策略部位平倉")
+            self._send_and_verify(action, self.quantity, octype="Cover")
+        elif real != 0:
+            logger.warning(f"⏰ 收盤前安全底線，帳上有 {real:+d} 口，強制平倉！")
+            if not self.flatten_real_position():
+                logger.critical("🚨 收盤前平倉失敗，帳上仍有部位，請立刻手動處理！")
+                return
+        strategy.position = 0
+        strategy.highest_profit = 0.0
+        self._save_state(strategy)
+
+    # ------------------------------------------------------------------
+    # K 棒與主迴圈
+    # ------------------------------------------------------------------
     def fetch_today_day_kbars(self) -> pd.DataFrame:
         """從 Shioaji 抓取今日日盤 (08:45 ~ 13:45) 1分K 資料"""
-        today_str = datetime.date.today().strftime("%Y-%m-%d")
-        kbars = self.api.kbars(self.contract, start=today_str, end=today_str)
-        df = pd.DataFrame({**kbars})
-        if df.empty:
+        if self.api is None or self.contract is None:
+            return pd.DataFrame()
+        try:
+            today_str = datetime.date.today().strftime("%Y-%m-%d")
+            kbars = self.api.kbars(self.contract, start=today_str, end=today_str)
+            df = pd.DataFrame({**kbars})
+            if df.empty:
+                return pd.DataFrame()
+
+            df['ts'] = pd.to_datetime(df['ts'])
+            df = df.set_index('ts')
+            df.columns = [c.lower() for c in df.columns]
+            # 篩選今日日盤 08:45 ~ 13:45
+            day_df = df[df.index.strftime("%Y-%m-%d") == today_str].between_time("08:45", "13:45")
+            return day_df[['open', 'high', 'low', 'close', 'volume']].copy()
+        except Exception as e:
+            logger.warning(f"抓取今日 K 棒失敗: {e}")
             return pd.DataFrame()
 
-        df['ts'] = pd.to_datetime(df['ts'])
-        df = df.set_index('ts')
-        df.columns = [c.lower() for c in df.columns]
-        # 篩選今日日盤 08:45 ~ 13:45
-        day_df = df[df.index.strftime("%Y-%m-%d") == today_str].between_time("08:45", "13:45")
-        return day_df[['open', 'high', 'low', 'close', 'volume']].copy()
+    def _handle_action(self, strategy: ORBStrategy, res: dict, ts: pd.Timestamp, bar: pd.Series, prev_pos: int):
+        """依策略動作送單、確認成交，並對帳"""
+        act = res.get("action", "HOLD")
+        if act == "HOLD":
+            return
+        rec = res.get("record", {})
+        q = self.quantity
+        is_entry = act in ("BUY", "SELL", "SAR_BUY", "SAR_SELL")
+
+        if is_entry and self.entries_halted:
+            # 不開新倉：把策略狀態退回，SAR 的反手單則只做前半段(平掉原部位)
+            logger.warning(f"🛑 已停止開新倉，忽略訊號 {act}")
+            if act in ("SAR_BUY", "SAR_SELL"):
+                close_action = "SELL" if prev_pos == 1 else "BUY"
+                self._send_and_verify(close_action, q, octype="Cover", price=rec.get('exit_price', 0))
+            strategy.position = 0
+            strategy.highest_profit = 0.0
+            if act in ("BUY", "SELL"):
+                strategy.trade_count = max(0, strategy.trade_count - 1)
+            self._post_trade_check(strategy, act, FillResult(True, q, 0.0, "Skipped"))
+            return
+
+        if act == "BUY":
+            logger.info(f"🟢 [訊號觸發] {ts.strftime('%H:%M')} 做多進場 @ {bar['close']:.0f} ({res.get('detail')})")
+            result = self._send_and_verify("BUY", q, price=bar['close'])
+        elif act == "SELL":
+            logger.info(f"🔴 [訊號觸發] {ts.strftime('%H:%M')} 做空進場 @ {bar['close']:.0f} ({res.get('detail')})")
+            result = self._send_and_verify("SELL", q, price=bar['close'])
+        elif act == "EXIT":
+            close_action = "SELL" if prev_pos == 1 else "BUY"
+            logger.info(f"🏁 [平倉回補] {ts.strftime('%H:%M')} {rec.get('reason')} @ {rec.get('exit_price'):.0f} (損益: {rec.get('pnl_pts'):+.0f}點)")
+            result = self._send_and_verify(close_action, q, octype="Cover", price=rec.get('exit_price', 0))
+        elif act == "SAR_SELL":
+            logger.info(f"🔄 [假突破反手做空 SAR] {ts.strftime('%H:%M')} 多單停損並反手做空 @ {rec.get('exit_price'):.0f}")
+            result = self._send_and_verify("SELL", q * 2, price=rec.get('exit_price', 0))
+        elif act == "SAR_BUY":
+            logger.info(f"🔄 [假跌破反手做多 SAR] {ts.strftime('%H:%M')} 空單停損並反手做多 @ {rec.get('exit_price'):.0f}")
+            result = self._send_and_verify("BUY", q * 2, price=rec.get('exit_price', 0))
+        else:
+            return
+
+        # 開倉成功後，用實際成交價取代回測用的收盤價，停損與鎖利才會以真實成本計算
+        if is_entry and result.ok and result.avg_price > 0:
+            if abs(result.avg_price - strategy.entry_price) >= 1:
+                logger.info(f"📌 進場價以實際成交價為準: {strategy.entry_price:.0f} -> {result.avg_price:.0f}")
+            strategy.entry_price = result.avg_price
+
+        self._post_trade_check(strategy, act, result)
+        self._save_state(strategy)
 
     def run_intraday_bot(self, strat_cfg: ORBStrategyConfig = None):
         """
-        啟動日盤全自動監控與下單迴圈 (08:45 ~ 13:32)
-        每分鐘自動更新 1分K、計算 ORB 高低點與 VWAP/EMA 指標，觸發訊號時自動下單
+        啟動日盤全自動監控與下單迴圈 (08:45 ~ 13:28)
+        每分鐘自動更新 1分K、計算 ORB 高低點與 VWAP/EMA 指標，觸發訊號時自動下單並確認成交
+        支援中途斷線 / 重啟無縫接管帳上真實部位與狀態恢復
         """
         strat_cfg = strat_cfg or ORBStrategyConfig()
         strategy = ORBStrategy(config=strat_cfg, inst_config=InstrumentConfig())
-        processed_timestamps = set()
+        last_reconcile = time.time()
+        last_state_save = time.time()
 
         logger.info("=" * 75)
         logger.info("🤖 TMF 微台指 ORB Pro 自動當沖機器人已啟動！")
         logger.info(f"• 下單口數: {self.quantity} 口 | 開盤區間: {strat_cfg.orb_start_time} ~ {strat_cfg.orb_end_time}")
         logger.info(f"• 風控設定: 停損 -{strat_cfg.stop_loss_pts:.0f}點 | 一階鎖利 +{strat_cfg.breakeven_trigger_pts:.0f}->+{strat_cfg.breakeven_lock_pts:.0f}點 | 二階鎖利 +{strat_cfg.tier2_trigger_pts:.0f}->+{strat_cfg.tier2_lock_pts:.0f}點 | {strat_cfg.force_close_time[:5]} 強制安全平倉")
+        logger.info("• 單一真實來源 (Single Source of Truth): 永豐券商帳上 list_positions")
+        logger.info("• 重啟保護: 自動偵測帳上未平倉部位並無縫接管風控；歷史 K 棒不重播下單")
+        logger.info("• 每張單都會確認成交並與帳上部位對帳，稽核紀錄寫入 logs/orders_YYYYMMDD.csv")
         logger.info("• 按下 Ctrl+C 可隨時安全停止程式。")
         logger.info("=" * 75)
+
+        # 1. 抓取今日日盤 K 棒，計算指標與 ORB 區間 (若已過 09:15)
+        kbars = self.fetch_today_day_kbars()
+        if not kbars.empty and len(kbars) >= 2:
+            kbars = strategy.prepare_indicators(kbars)
+            now_str = datetime.datetime.now().strftime("%H:%M:%S")
+            if now_str >= strat_cfg.orb_end_time:
+                orb_h, orb_l = strategy.calculate_orb_levels(kbars)
+                if orb_h and orb_l:
+                    logger.info(f"📌 今日現貨開盤區間 ({strat_cfg.orb_start_time}~{strat_cfg.orb_end_time}) 已鎖定: 上界={orb_h:.0f}, 下界={orb_l:.0f} (振幅={orb_h-orb_l:.0f}點)")
+
+        # 2. 帳上部位對帳與狀態恢復 / 部位接管
+        processed_timestamps = self._reconcile_and_recover_on_startup(strategy, kbars)
 
         try:
             while True:
                 now = datetime.datetime.now()
                 now_str = now.strftime("%H:%M:%S")
 
-                # 保險起見：若超過 13:26:00 帳上仍有部位，不等待 K 棒直接強制平倉
-                if now_str >= "13:26:00" and strategy.position != 0:
-                    close_action = "SELL" if strategy.position == 1 else "BUY"
-                    logger.warning(f"⏰ 已達 {now_str} 收盤前安全底線，強制市價平倉剩餘部位！")
-                    self.place_order(close_action, 0, quantity=self.quantity, price_type="MKP", octype="Cover")
-                    strategy.position = 0
+                # 保險起見：13:26 後帳上仍有部位，不等待 K 棒直接強制平倉
+                if now_str >= "13:26:00":
+                    self._force_flatten_all(strategy)
 
                 if now_str > "13:28:00":
-                    logger.info("🏁 已完成收盤前安全平倉檢查，今日自動交易結束。")
+                    final_pos = self.get_real_position()
+                    if final_pos:
+                        logger.critical(f"🚨 收盤檢查: 帳上仍有 TMF 部位 {final_pos:+d} 口，請立刻手動處理！")
+                    else:
+                        logger.info("🏁 收盤檢查通過，帳上無未平倉部位，今日自動交易結束。")
                     break
+
+                # 平時定期對帳
+                if time.time() - last_reconcile >= self.reconcile_interval:
+                    self._periodic_reconcile(strategy)
+                    last_reconcile = time.time()
+
+                # 定期更新策略狀態存檔
+                if time.time() - last_state_save >= 30.0:
+                    self._save_state(strategy)
+                    last_state_save = time.time()
 
                 kbars = self.fetch_today_day_kbars()
                 if not kbars.empty and len(kbars) >= 2:
@@ -188,36 +666,15 @@ class ShioajiTMFTrader:
                             processed_timestamps.add(ts)
                             prev_pos = strategy.position
                             res = strategy.execute_bar(ts, bar, prev_bar)
-                            act = res.get("action", "HOLD")
-
-                            # 根據策略動作執行實際下單
-                            if act == "BUY":
-                                logger.info(f"🟢 [訊號觸發] {ts.strftime('%H:%M')} 做多進場 @ {bar['close']:.0f} ({res.get('detail')})")
-                                self.place_order("BUY", bar['close'], quantity=self.quantity, price_type="MKP")
-                            elif act == "SELL":
-                                logger.info(f"🔴 [訊號觸發] {ts.strftime('%H:%M')} 做空進場 @ {bar['close']:.0f} ({res.get('detail')})")
-                                self.place_order("SELL", bar['close'], quantity=self.quantity, price_type="MKP")
-                            elif act == "EXIT":
-                                rec = res.get("record", {})
-                                close_action = "SELL" if prev_pos == 1 else "BUY"
-                                logger.info(f"🏁 [平倉回補] {ts.strftime('%H:%M')} {rec.get('reason')} @ {rec.get('exit_price'):.0f} (損益: {rec.get('pnl_pts'):+.0f}點)")
-                                self.place_order(close_action, rec.get('exit_price', 0), quantity=self.quantity, price_type="MKP", octype="Cover")
-                            elif act == "SAR_SELL":
-                                rec = res.get("record", {})
-                                logger.info(f"🔄 [假突破反手做空 SAR] {ts.strftime('%H:%M')} 多單停損並反手做空 @ {rec.get('exit_price'):.0f}")
-                                self.place_order("SELL", rec.get('exit_price', 0), quantity=self.quantity * 2, price_type="MKP")
-                            elif act == "SAR_BUY":
-                                rec = res.get("record", {})
-                                logger.info(f"🔄 [假跌破反手做多 SAR] {ts.strftime('%H:%M')} 空單停損並反手做多 @ {rec.get('exit_price'):.0f}")
-                                self.place_order("BUY", rec.get('exit_price', 0), quantity=self.quantity * 2, price_type="MKP")
-
+                            self._handle_action(strategy, res, ts, bar, prev_pos)
                         prev_bar = bar
 
                     # 印出最新即時狀態列
                     latest = kbars.iloc[-1]
                     pos_str = "無部位" if strategy.position == 0 else ("🟢多單持倉" if strategy.position == 1 else "🔴空單持倉")
                     orb_info = f"ORB:{strategy.orb_low:.0f}~{strategy.orb_high:.0f}" if strategy.orb_calculated else "等待09:15鎖定ORB"
-                    logger.info(f"⏱️ [{now_str}] 報價:{latest['close']:.0f} | VWAP:{latest['vwap']:.0f} | {orb_info} | 狀態:{pos_str} (最高浮盈:{strategy.highest_profit:+.0f}點)")
+                    halt_info = " | 🛑停開新倉" if self.entries_halted else ""
+                    logger.info(f"⏱️ [{now_str}] 報價:{latest['close']:.0f} | VWAP:{latest['vwap']:.0f} | {orb_info} | 狀態:{pos_str} (最高浮盈:{strategy.highest_profit:+.0f}點){halt_info}")
                 else:
                     logger.info(f"⏱️ [{now_str}] 等待日盤 08:45 開盤 K 棒資料...")
 
@@ -225,8 +682,11 @@ class ShioajiTMFTrader:
 
         except KeyboardInterrupt:
             logger.warning("⚠️ 收到使用者中斷指令 (Ctrl+C)，停止自動監控。")
-            if strategy.position != 0:
-                logger.warning(f"⚠️ 注意：目前帳上仍有部位 ({'多單' if strategy.position==1 else '空單'})，請確認是否需要手動平倉！")
+            real = self.get_real_position()
+            if real:
+                logger.warning(f"⚠️ 注意：目前帳上仍有 TMF 部位 {real:+d} 口，請確認是否需要手動平倉！")
+            elif real is None and strategy.position != 0:
+                logger.warning(f"⚠️ 注意：策略記錄仍有部位 ({'多單' if strategy.position==1 else '空單'})，請確認是否需要手動平倉！")
 
     def emergency_close_all(self):
         """緊急撤銷所有未成交掛單"""
@@ -235,7 +695,7 @@ class ShioajiTMFTrader:
             try:
                 self.api.update_status(self.api.futopt_account)
                 for trade in self.api.list_trades():
-                    if trade.status.status in ["Submitted", "PartFilled", "PendingSubmit"]:
+                    if _status_name(trade.status.status) in PENDING_STATUSES:
                         self.api.cancel_order(trade)
                 logger.info("所有未成交掛單已全數撤銷。")
             except Exception as e:
