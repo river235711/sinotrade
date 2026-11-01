@@ -49,7 +49,9 @@ class ORBStrategyConfig:
     entry_start_time: str = "09:16:00"       # 允許突破進場開始時間
     entry_end_time: str = "11:30:00"         # 停止首次進場時間
     sar_end_time: str = "11:00:00"           # 允許假突破反手 (Stop & Reverse) 截止時間
-    force_close_time: str = "13:25:00"       # 當沖強制收盤平倉時間 (提前至 13:25 避開結算日 13:30 關門、現貨尾盤集合競價與券商代沖銷)
+    force_close_time: str = "13:20:00"       # 第一道：當沖策略強制平倉時間 (提前至 13:20 避開現貨 13:25 集合競價、尾盤甩尾與週三結算風險)
+    failsafe_close_time: str = "13:22:00"   # 第二道：安全底線強制補平時間 (若帳上仍有殘留部位，直接 MKP IOC 強制補平)
+    shutdown_time: str = "13:24:00"         # 第三道：收盤確認零部位並安全退出時間 (在 13:24:00 前完全結束今日交易)
     stop_loss_pts: float = 90.0              # 初始停損點數 (90 點，適應高基期波動)
     breakeven_trigger_pts: float = 80.0      # 一階保本鎖利門檻 (獲利達 80 點啟動)
     breakeven_lock_pts: float = 30.0         # 一階保本鎖定點數 (拉回時至少鎖住 +30 點)

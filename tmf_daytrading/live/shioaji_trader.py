@@ -385,7 +385,7 @@ class ShioajiTMFTrader:
 
             logger.warning("=" * 75)
             logger.warning(f"🔄 [重啟接管部位] 帳上發現未平倉 TMF {pos_label} {abs(real_net)}口 (均價 {strategy.entry_price:.0f})！")
-            logger.warning("🛡️ 機器人已成功接管該部位！持續執行停損、保本鎖利與 13:25 強制平倉風控。")
+            logger.warning(f"🛡️ 機器人已成功接管該部位！持續執行停損、保本鎖利與 {strategy.config.force_close_time[:5]} 強制平倉風控。")
             logger.warning(f"📊 當前追蹤最高浮盈: {strategy.highest_profit:+.0f} 點")
             logger.warning("=" * 75)
             self._save_state(strategy)
@@ -588,7 +588,7 @@ class ShioajiTMFTrader:
 
     def run_intraday_bot(self, strat_cfg: ORBStrategyConfig = None):
         """
-        啟動日盤全自動監控與下單迴圈 (08:45 ~ 13:28)
+        啟動日盤全自動監控與下單迴圈 (08:45 ~ 13:24)
         每分鐘自動更新 1分K、計算 ORB 高低點與 VWAP/EMA 指標，觸發訊號時自動下單並確認成交
         支援中途斷線 / 重啟無縫接管帳上真實部位與狀態恢復
         """
@@ -596,11 +596,14 @@ class ShioajiTMFTrader:
         strategy = ORBStrategy(config=strat_cfg, inst_config=InstrumentConfig())
         last_reconcile = time.time()
         last_state_save = time.time()
+        failsafe_time = getattr(strat_cfg, "failsafe_close_time", "13:22:00")
+        shutdown_time = getattr(strat_cfg, "shutdown_time", "13:24:00")
 
         logger.info("=" * 75)
         logger.info("🤖 TMF 微台指 ORB Pro 自動當沖機器人已啟動！")
         logger.info(f"• 下單口數: {self.quantity} 口 | 開盤區間: {strat_cfg.orb_start_time} ~ {strat_cfg.orb_end_time}")
-        logger.info(f"• 風控設定: 停損 -{strat_cfg.stop_loss_pts:.0f}點 | 一階鎖利 +{strat_cfg.breakeven_trigger_pts:.0f}->+{strat_cfg.breakeven_lock_pts:.0f}點 | 二階鎖利 +{strat_cfg.tier2_trigger_pts:.0f}->+{strat_cfg.tier2_lock_pts:.0f}點 | {strat_cfg.force_close_time[:5]} 強制安全平倉")
+        logger.info(f"• 風控設定: 停損 -{strat_cfg.stop_loss_pts:.0f}點 | 一階鎖利 +{strat_cfg.breakeven_trigger_pts:.0f}->+{strat_cfg.breakeven_lock_pts:.0f}點 | 二階鎖利 +{strat_cfg.tier2_trigger_pts:.0f}->+{strat_cfg.tier2_lock_pts:.0f}點")
+        logger.info(f"• 收盤安全時程: {strat_cfg.force_close_time[:5]} 策略平倉 | {failsafe_time[:5]} 底線強制補平 | {shutdown_time[:5]} 零部位安全退出")
         logger.info("• 單一真實來源 (Single Source of Truth): 永豐券商帳上 list_positions")
         logger.info("• 重啟保護: 自動偵測帳上未平倉部位並無縫接管風控；歷史 K 棒不重播下單")
         logger.info("• 每張單都會確認成交並與帳上部位對帳，稽核紀錄寫入 logs/orders_YYYYMMDD.csv")
@@ -625,16 +628,17 @@ class ShioajiTMFTrader:
                 now = datetime.datetime.now()
                 now_str = now.strftime("%H:%M:%S")
 
-                # 保險起見：13:26 後帳上仍有部位，不等待 K 棒直接強制平倉
-                if now_str >= "13:26:00":
+                # 第二道防線：13:22:00 後帳上仍有部位，不等待 K 棒直接強制平倉
+                if now_str >= failsafe_time:
                     self._force_flatten_all(strategy)
 
-                if now_str > "13:28:00":
+                # 第三道防線：13:24:00 前完成所有檢查並安全退出
+                if now_str >= shutdown_time:
                     final_pos = self.get_real_position()
                     if final_pos:
                         logger.critical(f"🚨 收盤檢查: 帳上仍有 TMF 部位 {final_pos:+d} 口，請立刻手動處理！")
                     else:
-                        logger.info("🏁 收盤檢查通過，帳上無未平倉部位，今日自動交易結束。")
+                        logger.info("🏁 收盤檢查通過，帳上無未平倉部位，今日自動交易順利結束。")
                     break
 
                 # 平時定期對帳
