@@ -1,0 +1,15 @@
+# 私密金鑰與憑證 (切勿上傳至 GitHub)
+.env
+*.pfx
+*.pem
+
+# 期交所大型原始逐筆 CSV 檔 (保留輕量化的 tmf_20days_1m_kbars.csv 快取檔供直接回測)
+data/Daily_*.csv
+data/*.zip
+
+# Python 快取與系統檔
+__pycache__/
+*.py[cod]
+*$py.class
+.DS_Store
+*.log

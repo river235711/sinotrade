@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+"""
+TMF (微型臺指期) 當沖交易程式 - 前 10 個交易日回測腳本
+回測區間: 2026-10-15 ~ 2026-10-30 (共 10 個交易日)
+商品: 微型臺指期近月主力合約 (TMF)
+策略: ORB 開盤區間突破策略 + 移動停利 (Trailing Stop)
+"""
+import os
+import shutil
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+from config import InstrumentConfig, ORBStrategyConfig
+from backtester.engine import BacktestEngine
+from backtester.metrics import BacktestMetrics
+
+def main():
+    trading_days = [
+        ("2026_10_15", "20261015"),
+        ("2026_10_16", "20261016"),
+        ("2026_10_19", "20261019"),
+        ("2026_10_20", "20261020"),
+        ("2026_10_21", "20261021"),
+        ("2026_10_22", "20261022"),
+        ("2026_10_27", "20261027"),
+        ("2026_10_28", "20261028"),
+        ("2026_10_29", "20261029"),
+        ("2026_10_30", "20261030"),
+    ]
+
+    inst_cfg = InstrumentConfig(
+        symbol="TMF",
+        multiplier=10.0,
+        commission_per_order=12.0,
+        tax_rate=0.00001,
+        slippage_points=1.0
+    )
+
+    strat_cfg = ORBStrategyConfig()
+
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    all_trades = []
+    daily_summaries = []
+
+    print("=" * 90)
+    print("🚀 TMF 微型臺指期貨 - 前 10 個交易日當沖回測報告 (2026-10-15 ~ 2026-10-30)")
+    print("=" * 90)
+
+    for file_date, target_date in trading_days:
+        csv_path = os.path.join(base_dir, "data", f"Daily_{file_date}.csv")
+        engine = BacktestEngine(data_path=csv_path, inst_config=inst_cfg)
+        kbars = engine.load_taifex_csv(target_date=target_date, contract_month="AUTO")
+        contract_m = engine.active_contract_month
+        metrics = engine.run_orb_strategy(strat_cfg)
+
+        tdf = metrics["trades_df"]
+        day_date_fmt = f"{target_date[:4]}-{target_date[4:6]}-{target_date[6:]}"
+        day_open = kbars.iloc[0]['open']
+        day_high = kbars['high'].max()
+        day_low = kbars['low'].min()
+        day_close = kbars.iloc[-1]['close']
+        orb_h = metrics["orb_high"]
+        orb_l = metrics["orb_low"]
+
+        day_pts = metrics["total_points"] if not tdf.empty else 0.0
+        day_ntd = metrics["net_profit_ntd"] if not tdf.empty else 0.0
+
+        daily_summaries.append({
+            "date": day_date_fmt,
+            "contract": contract_m,
+            "open": day_open,
+            "high": day_high,
+            "low": day_low,
+            "close": day_close,
+            "range": day_high - day_low,
+            "orb_high": orb_h,
+            "orb_low": orb_l,
+            "orb_range": orb_h - orb_l,
+            "trades": metrics["total_trades"],
+            "win_count": metrics.get("win_count", 0),
+            "loss_count": metrics.get("loss_count", 0),
+            "points_pnl": day_pts,
+            "net_ntd": day_ntd
+        })
+
+        if not tdf.empty:
+            for _, row in tdf.iterrows():
+                r_dict = row.to_dict()
+                r_dict["date"] = day_date_fmt
+                r_dict["contract"] = contract_m
+                all_trades.append(r_dict)
+
+    # 印出每日摘要表
+    print("\n📅 【每日行情與損益總覽】")
+    print("-" * 90)
+    print(f"{'日期':<12} {'合約':<8} {'開盤':<7} {'最高':<7} {'最低':<7} {'收盤':<7} {'全日振幅':<8} {'ORB上界':<8} {'ORB下界':<8} {'筆數':<4} {'點數損益':<8} {'淨損益(NTD)':<10}")
+    print("-" * 90)
+    for d in daily_summaries:
+        pts_str = f"{d['points_pnl']:+.0f}"
+        ntd_str = f"{d['net_ntd']:+,.0f}"
+        print(f"{d['date']:<12} {d['contract']:<8} {d['open']:<7.0f} {d['high']:<7.0f} {d['low']:<7.0f} {d['close']:<7.0f} {d['range']:<8.0f} {d['orb_high']:<8.0f} {d['orb_low']:<8.0f} {d['trades']:<4} {pts_str:<8} {ntd_str:<10}")
+    print("-" * 90)
+
+    # 印出所有逐筆交易明細
+    print("\n📋 【10 個交易日完整逐筆交易時間與回補明細】")
+    print("-" * 90)
+    for idx, t in enumerate(all_trades, 1):
+        act_str = "🟢 做多 (BUY)" if t["action"] == "BUY" else "🔴 做空 (SELL)"
+        e_t = pd.to_datetime(t["entry_time"]).strftime("%H:%M:%S")
+        x_t = pd.to_datetime(t["exit_time"]).strftime("%H:%M:%S")
+        dur_min = int((pd.to_datetime(t["exit_time"]) - pd.to_datetime(t["entry_time"])).total_seconds() // 60)
+        print(f"#{idx:02d} | {t['date']} ({t['contract']}) | {act_str} | 進場: {e_t} @ {t['entry_price']:.0f} -> 回補: {x_t} @ {t['exit_price']:.0f} ({dur_min}分) | {t['pnl_pts']:+.0f}點 ({t['net_ntd']:+,.0f}元) | {t['reason']}")
+
+    # 計算 10 日總體統計
+    all_df = pd.DataFrame(all_trades)
+    total_trades = len(all_df)
+    wins = all_df[all_df["net_ntd"] > 0]
+    losses = all_df[all_df["net_ntd"] <= 0]
+    win_rate = (len(wins) / total_trades * 100.0) if total_trades > 0 else 0.0
+    total_pts = all_df["pnl_pts"].sum()
+    total_ntd = all_df["net_ntd"].sum()
+    gross_win = wins["net_ntd"].sum() if len(wins) > 0 else 0.0
+    gross_loss = abs(losses["net_ntd"].sum()) if len(losses) > 0 else 0.0
+    pf = gross_win / gross_loss if gross_loss > 0 else 999.0
+
+    all_df["cum_ntd"] = all_df["net_ntd"].cumsum()
+    all_df["peak_ntd"] = all_df["cum_ntd"].cummax().clip(lower=0)
+    all_df["dd_ntd"] = all_df["peak_ntd"] - all_df["cum_ntd"]
+    mdd_ntd = all_df["dd_ntd"].max()
+
+    daily_df = pd.DataFrame(daily_summaries)
+    win_days = (daily_df["net_ntd"] > 0).sum()
+    loss_days = (daily_df["net_ntd"] < 0).sum()
+    flat_days = (daily_df["net_ntd"] == 0).sum()
+
+    print("\n" + "=" * 90)
+    print("📈 【前 10 個交易日整體績效統計 (10-Day Performance Summary)】")
+    print("=" * 90)
+    print(f"• 回測期間:                 2026-10-15 ~ 2026-10-30 (共 10 個交易日)")
+    print(f"• 獲利天數 / 虧損天數:      {win_days} 天獲利 / {loss_days} 天虧損 / {flat_days} 天無交易 (日勝率: {win_days/(win_days+loss_days)*100:.1f}%)")
+    print(f"• 總交易筆數:               {total_trades} 筆 (做多 {(all_df['action']=='BUY').sum()} 筆 / 做空 {(all_df['action']=='SELL').sum()} 筆)")
+    print(f"• 交易勝率 (Win Rate):      {win_rate:.1f}% ({len(wins)} 勝 / {len(losses)} 負)")
+    print(f"• 累積總獲利點數:           {total_pts:+.0f} 點")
+    print(f"• 扣除成本總淨損益 (NTD):   NT$ {total_ntd:+,.0f} 元")
+    print(f"• 獲利因子 (Profit Factor): {pf:.2f}")
+    print(f"• 平均每筆淨損益:           NT$ {total_ntd/total_trades:+,.0f} 元")
+    print(f"• 最大區間回撤 (MDD):       NT$ {mdd_ntd:,.0f} 元")
+    print("=" * 90)
+
+    # 繪製 10 日損益圖表
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(13, 8), gridspec_kw={'height_ratios': [1.3, 1]})
+    plt.style.use('seaborn-v0_8-whitegrid' if 'seaborn-v0_8-whitegrid' in plt.style.available else 'default')
+
+    dates_short = [d["date"][5:] for d in daily_summaries]
+    daily_ntds = [d["net_ntd"] for d in daily_summaries]
+    cum_daily_ntd = np.cumsum(daily_ntds)
+
+    # 上圖：10 日累積淨損益曲線
+    ax1.plot(dates_short, cum_daily_ntd, marker='o', color='#8e44ad', linewidth=2.5, markersize=8, label='Cumulative Net PnL (NTD)')
+    ax1.fill_between(range(len(dates_short)), cum_daily_ntd, 0, color='#8e44ad', alpha=0.15)
+    for i, val in enumerate(cum_daily_ntd):
+        ax1.annotate(f"${val:+,.0f}", (i, val), textcoords="offset points", xytext=(0, 10), ha='center', fontsize=9, fontweight='bold')
+    ax1.axhline(0, color='black', linestyle='--', linewidth=0.8)
+    ax1.set_title("TMF Micro Taiwan Index - 10-Day ORB Strategy Cumulative Equity Curve (2026-10-15 ~ 2026-10-30)", fontsize=13, fontweight='bold', pad=12)
+    ax1.set_ylabel("Cumulative Net PnL (NTD)", fontsize=11)
+    ax1.legend(loc='upper left')
+    ax1.grid(True, linestyle=':', alpha=0.6)
+
+    # 下圖：每日單日損益長條圖
+    bar_colors = ['#27ae60' if v >= 0 else '#e74c3c' for v in daily_ntds]
+    bars = ax2.bar(dates_short, daily_ntds, color=bar_colors, alpha=0.85, width=0.55)
+    for bar, val in zip(bars, daily_ntds):
+        y_pos = val + (40 if val >= 0 else -110)
+        ax2.annotate(f"{val:+,.0f}", (bar.get_x() + bar.get_width()/2, y_pos), ha='center', fontsize=9, fontweight='bold')
+    ax2.axhline(0, color='black', linewidth=0.8)
+    ax2.set_title("Daily Net Profit / Loss (NTD)", fontsize=12, fontweight='bold')
+    ax2.set_ylabel("Daily Net PnL (NTD)", fontsize=11)
+    ax2.set_xlabel("Trading Date (2026)", fontsize=11)
+    ax2.set_ylim(min(daily_ntds) - 300, max(daily_ntds) + 300)
+    ax2.grid(True, linestyle=':', alpha=0.6)
+
+    plt.tight_layout()
+    chart_path = os.path.join(base_dir, "tmf_backtest_10days.png")
+    plt.savefig(chart_path, dpi=200)
+    plt.close()
+
+    artifact_dir = "/Users/willhuang/.gemini/antigravity/brain/b8b63ccf-f85f-4e1c-88b5-ed46261f6ae5"
+    if os.path.exists(artifact_dir):
+        shutil.copy(chart_path, os.path.join(artifact_dir, "tmf_backtest_10days.png"))
+
+if __name__ == "__main__":
+    main()
