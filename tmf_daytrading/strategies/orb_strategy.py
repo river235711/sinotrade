@@ -143,6 +143,25 @@ class ORBStrategy:
                     self.position = 0
                     return {"action": "EXIT", "record": trade_record}
 
+                # (B2) 1.5階：中階鎖利 (獲利曾達 +110 點，拉回時鎖住 +75 點，補齊 80~200 點真空區)
+                t15_trig = getattr(self.config, "tier1_5_trigger_pts", 110.0)
+                t15_lock = getattr(self.config, "tier1_5_lock_pts", 75.0)
+                if (self.highest_profit >= t15_trig and 
+                    l <= (self.entry_price + t15_lock)):
+                    exit_p = self.entry_price + t15_lock
+                    trade_record = {
+                        "entry_time": self.entry_time,
+                        "exit_time": ts,
+                        "action": "BUY",
+                        "entry_price": self.entry_price,
+                        "exit_price": exit_p,
+                        "pnl_pts": t15_lock,
+                        "reason": f"中階保本鎖利 (曾獲利+{self.highest_profit:.0f}點, 鎖定+{t15_lock:.0f}點)"
+                    }
+                    self.trades.append(trade_record)
+                    self.position = 0
+                    return {"action": "EXIT", "record": trade_record}
+
                 # (C) 一階：保本鎖利機制 (獲利曾達 +80 點，拉回時鎖住 +30 點)
                 if (self.highest_profit >= self.config.breakeven_trigger_pts and 
                     l <= (self.entry_price + self.config.breakeven_lock_pts)):
@@ -228,6 +247,25 @@ class ORBStrategy:
                     self.position = 0
                     return {"action": "EXIT", "record": trade_record}
 
+                # (B2) 1.5階：中階鎖利 (獲利曾達 +110 點，拉回時鎖住 +75 點，補齊 80~200 點真空區)
+                t15_trig = getattr(self.config, "tier1_5_trigger_pts", 110.0)
+                t15_lock = getattr(self.config, "tier1_5_lock_pts", 75.0)
+                if (self.highest_profit >= t15_trig and 
+                    h >= (self.entry_price - t15_lock)):
+                    exit_p = self.entry_price - t15_lock
+                    trade_record = {
+                        "entry_time": self.entry_time,
+                        "exit_time": ts,
+                        "action": "SELL",
+                        "entry_price": self.entry_price,
+                        "exit_price": exit_p,
+                        "pnl_pts": t15_lock,
+                        "reason": f"中階保本鎖利 (曾獲利+{self.highest_profit:.0f}點, 鎖定+{t15_lock:.0f}點)"
+                    }
+                    self.trades.append(trade_record)
+                    self.position = 0
+                    return {"action": "EXIT", "record": trade_record}
+
                 # (C) 一階：保本鎖利機制 (獲利曾達 +80 點，拉回時鎖住 +30 點)
                 if (self.highest_profit >= self.config.breakeven_trigger_pts and 
                     h >= (self.entry_price - self.config.breakeven_lock_pts)):
@@ -308,17 +346,22 @@ class ORBStrategy:
                     "detail": f"早盤強勢跳水突破 ({self.pre_orb_low}-{sb:.0f}點) + VWAP/EMA 空頭確認"
                 }
 
-        # 3B. 09:16 ~ 11:30 標準現貨開盤區間突破 + VWAP & EMA 濾網進場信號
+        # 3B. 09:16 ~ 11:30 標準現貨開盤區間突破 + ORB 寬度空間保護 + VWAP & EMA 延遲共振進場
+        orb_range = (self.orb_high - self.orb_low) if self.orb_calculated else 0.0
+        max_orb_range = getattr(self.config, "max_orb_range_pts", 320.0)
+        max_chase = getattr(self.config, "max_breakout_chase_pts", 60.0)
+
         if (self.position == 0 and 
             self.orb_calculated and 
+            orb_range <= max_orb_range and
             self.trade_count < self.config.max_initial_trades and
             self.config.entry_start_time <= t_str <= self.config.entry_end_time):
 
             long_filter = (not self.config.use_vwap_ema_filter) or (c > vwap and ema9 > ema21)
             short_filter = (not self.config.use_vwap_ema_filter) or (c < vwap and ema9 < ema21)
 
-            # 向上突破開盤高點 + 站上 VWAP 且均線多頭 -> 做多
-            if prev_c <= self.orb_high and c > self.orb_high and long_filter:
+            # 向上突破開盤高點 (含突破後等待 EMA 共振確認，只要未超過追價上限 max_chase 皆可進場)
+            if self.orb_high < c <= (self.orb_high + max_chase) and long_filter:
                 self.position = 1
                 self.entry_price = c
                 self.entry_time = ts
@@ -328,11 +371,11 @@ class ORBStrategy:
                     "action": "BUY", 
                     "price": c, 
                     "time": ts,
-                    "detail": f"突破現貨開盤高點 ({self.orb_high}) + VWAP/EMA 多頭確認"
+                    "detail": f"突破現貨開盤高點 ({self.orb_high:.0f}) + VWAP/EMA 多頭確認"
                 }
 
-            # 向下跌破開盤低點 + 跌破 VWAP 且均線空頭 -> 做空
-            elif prev_c >= self.orb_low and c < self.orb_low and short_filter:
+            # 向下跌破開盤低點 (含跌破後等待 EMA 共振確認，只要未超過追價上限 max_chase 皆可進場)
+            elif (self.orb_low - max_chase) <= c < self.orb_low and short_filter:
                 self.position = -1
                 self.entry_price = c
                 self.entry_time = ts
@@ -342,7 +385,7 @@ class ORBStrategy:
                     "action": "SELL", 
                     "price": c, 
                     "time": ts,
-                    "detail": f"跌破現貨開盤低點 ({self.orb_low}) + VWAP/EMA 空頭確認"
+                    "detail": f"跌破現貨開盤低點 ({self.orb_low:.0f}) + VWAP/EMA 空頭確認"
                 }
 
         return action_result

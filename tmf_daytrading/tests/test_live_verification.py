@@ -255,6 +255,28 @@ daily_hist = load_daily_history(data_dir)
 atr_val, n_days = compute_atr(daily_hist, "2026-11-03", period=20, min_days=20)
 check("永久日 K 歷史檔 (daily_bars.csv) 已累積滿 20 日可計算 ATR", atr_val is not None and n_days == 20)
 
+# 20. 中階 (1.5階) 鎖利、ORB 過寬過濾與延遲均線共振驗證
+s_mid = make_strategy(position=1, entry=45000.0, trade_count=1)
+s_mid.highest_profit = 175.0
+res_mid = s_mid.execute_bar(pd.Timestamp("2026-11-02 10:00:00"), pd.Series({"open": 45120.0, "high": 45120.0, "low": 45095.0, "close": 45098.0}))
+check("中階鎖利 (1.5階): 曾賺+175點拉回時鎖住+100點 (不再掉回+30點)", res_mid["action"] == "EXIT" and res_mid["record"]["pnl_pts"] == 100.0)
+
+s_wide = make_strategy(position=0, entry=0.0, trade_count=0)
+s_wide.orb_high = 45400.0
+s_wide.orb_low = 45000.0   # 寬度 400 點 > max_orb_range_pts (320 點)
+s_wide.orb_calculated = True
+res_wide = s_wide.execute_bar(pd.Timestamp("2026-11-02 09:20:00"), pd.Series({"open": 45405.0, "high": 45420.0, "low": 45400.0, "close": 45415.0, "vwap": 45200.0, "ema9": 45350.0, "ema21": 45300.0}))
+check("ORB 過寬保護: 開盤振幅 400點 > 320點上限時不追高進場", res_wide["action"] == "HOLD")
+
+s_delay = make_strategy(position=0, entry=0.0, trade_count=0)
+s_delay.orb_high = 45200.0
+s_delay.orb_low = 45050.0  # 寬度 150 點 <= 320 點
+s_delay.orb_calculated = True
+prev_b = pd.Series({"close": 45215.0})  # 前一根已突破 45200 但當時均線未過
+cur_b = pd.Series({"open": 45215.0, "high": 45230.0, "low": 45210.0, "close": 45225.0, "vwap": 45150.0, "ema9": 45180.0, "ema21": 45160.0})
+res_delay = s_delay.execute_bar(pd.Timestamp("2026-11-02 09:20:00"), cur_b, prev_b)
+check("突破延遲共振: 前根突破後本根 EMA 轉多仍可順勢進場不漏單", res_delay["action"] == "BUY")
+
 print()
 print("全部通過" if check.failed == 0 else f"有 {check.failed} 項失敗")
 sys.exit(1 if check.failed else 0)

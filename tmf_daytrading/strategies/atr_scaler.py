@@ -21,11 +21,15 @@ SCALED_FIELDS = (
     "stop_loss_pts",
     "breakeven_trigger_pts",
     "breakeven_lock_pts",
+    "tier1_5_trigger_pts",
+    "tier1_5_lock_pts",
     "tier2_trigger_pts",
     "tier2_lock_pts",
     "trailing_activation_pts",
     "trailing_distance_pts",
     "early_super_breakout_pts",
+    "max_breakout_chase_pts",
+    "max_orb_range_pts",
 )
 
 DAILY_HISTORY_FILE = "daily_bars.csv"     # 永久累積的日盤日 K (不滾動刪除，供 ATR 計算)
@@ -148,6 +152,7 @@ def describe(cfg, info: Dict) -> str:
     else:
         head = "ATR 縮放未啟用，使用固定參數"
     return (f"{head} → 停損 -{cfg.stop_loss_pts:.0f} | 一階 +{cfg.breakeven_trigger_pts:.0f}→+{cfg.breakeven_lock_pts:.0f} | "
+            f"中階 +{cfg.tier1_5_trigger_pts:.0f}→+{cfg.tier1_5_lock_pts:.0f} | "
             f"二階 +{cfg.tier2_trigger_pts:.0f}→+{cfg.tier2_lock_pts:.0f} | "
             f"移動停利 +{cfg.trailing_activation_pts:.0f}(回撤{cfg.trailing_distance_pts:.0f}) | "
-            f"早盤爆發 {cfg.early_super_breakout_pts:.0f}")
+            f"ORB上限 {cfg.max_orb_range_pts:.0f}")

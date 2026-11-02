@@ -23,6 +23,7 @@ import pandas as pd
 from config import InstrumentConfig, ORBStrategyConfig, ShioajiConfig
 from strategies.orb_strategy import ORBStrategy
 from strategies.atr_scaler import config_for_date, describe
+from live.notifier import TradeNotifier
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger("ShioajiTrader")
@@ -57,6 +58,9 @@ class ShioajiTMFTrader:
         self.quantity = quantity
         self.api = None
         self.contract = None
+        self._contract_code = "TMFR1"
+        self.notifier = TradeNotifier()
+        self._last_reconnect_time = 0.0
         self._realtime_bars = {}                # 即時 Tick 聚合之 1分K 快取: {pd.Timestamp: dict}
         self._history_loaded = False            # 是否已完成當日早盤歷史 1分K 初始載入
         self._kbars_disabled = bool(simulation) # 模擬環境直接使用 Tick+Snapshot+高速回補，避開 kbars 30s 逾時
@@ -120,6 +124,7 @@ class ShioajiTMFTrader:
 
     def load_tmf_contract(self, code: str = "TMFR1"):
         """獲取 TMF 微型臺指期近月合約"""
+        self._contract_code = code or "TMFR1"
         if self.api is None:
             logger.error("API 尚未登入")
             return None
@@ -177,6 +182,27 @@ class ShioajiTMFTrader:
         except Exception as e:
             logger.error(f"獲取合約失敗: {e}")
             return None
+
+    def reconnect(self) -> bool:
+        """盤中斷線自動重連機制 (含 15 秒冷卻保護，避免頻繁重登)"""
+        if time.time() - self._last_reconnect_time < 15.0:
+            return False
+        self._last_reconnect_time = time.time()
+        logger.warning("🔄 [自動重連] 偵測到 Shioaji 連線中斷，正在重新登入並恢復即時行情訂閱...")
+        try:
+            if self.api is not None:
+                try:
+                    self.api.logout()
+                except Exception:
+                    pass
+            if self.initialize() and self.load_tmf_contract(self._contract_code):
+                msg = f"✅ [自動重連成功] Shioaji 已恢復連線與 Tick 訂閱 ({self._contract_code})"
+                logger.info(msg)
+                self.notifier.send(msg)
+                return True
+        except Exception as e:
+            logger.error(f"自動重連失敗: {e}")
+        return False
 
     # ------------------------------------------------------------------
     # 送單
@@ -664,8 +690,10 @@ class ShioajiTMFTrader:
                             b["high"] = max(b["high"], price)
                             b["low"] = min(b["low"], price)
                             b["close"] = price
-            except Exception:
-                pass
+            except Exception as snap_err:
+                err_str = str(snap_err)
+                if "SessionNotEstablished" in err_str or "Token" in err_str or "disconnect" in err_str.lower():
+                    self.reconnect()
 
         if not self._realtime_bars:
             return pd.DataFrame()
@@ -699,21 +727,31 @@ class ShioajiTMFTrader:
             return
 
         if act == "BUY":
-            logger.info(f"🟢 [訊號觸發] {ts.strftime('%H:%M')} 做多進場 @ {bar['close']:.0f} ({res.get('detail')})")
+            msg = f"🟢 [訊號觸發] {ts.strftime('%H:%M')} 做多進場 @ {bar['close']:.0f} ({res.get('detail')})"
+            logger.info(msg)
             result = self._send_and_verify("BUY", q, price=bar['close'])
+            self.notifier.send(f"{msg}\n成交均價: {result.avg_price:.0f} ({result.status})")
         elif act == "SELL":
-            logger.info(f"🔴 [訊號觸發] {ts.strftime('%H:%M')} 做空進場 @ {bar['close']:.0f} ({res.get('detail')})")
+            msg = f"🔴 [訊號觸發] {ts.strftime('%H:%M')} 做空進場 @ {bar['close']:.0f} ({res.get('detail')})"
+            logger.info(msg)
             result = self._send_and_verify("SELL", q, price=bar['close'])
+            self.notifier.send(f"{msg}\n成交均價: {result.avg_price:.0f} ({result.status})")
         elif act == "EXIT":
             close_action = "SELL" if prev_pos == 1 else "BUY"
-            logger.info(f"🏁 [平倉回補] {ts.strftime('%H:%M')} {rec.get('reason')} @ {rec.get('exit_price'):.0f} (損益: {rec.get('pnl_pts'):+.0f}點)")
+            msg = f"🏁 [平倉回補] {ts.strftime('%H:%M')} {rec.get('reason')} @ {rec.get('exit_price'):.0f} (損益: {rec.get('pnl_pts'):+.0f}點)"
+            logger.info(msg)
             result = self._send_and_verify(close_action, q, octype="Cover", price=rec.get('exit_price', 0))
+            self.notifier.send(msg)
         elif act == "SAR_SELL":
-            logger.info(f"🔄 [假突破反手做空 SAR] {ts.strftime('%H:%M')} 多單停損並反手做空 @ {rec.get('exit_price'):.0f}")
+            msg = f"🔄 [假突破反手做空 SAR] {ts.strftime('%H:%M')} 多單停損並反手做空 @ {rec.get('exit_price'):.0f}"
+            logger.info(msg)
             result = self._send_and_verify("SELL", q * 2, price=rec.get('exit_price', 0))
+            self.notifier.send(msg)
         elif act == "SAR_BUY":
-            logger.info(f"🔄 [假跌破反手做多 SAR] {ts.strftime('%H:%M')} 空單停損並反手做多 @ {rec.get('exit_price'):.0f}")
+            msg = f"🔄 [假跌破反手做多 SAR] {ts.strftime('%H:%M')} 空單停損並反手做多 @ {rec.get('exit_price'):.0f}"
+            logger.info(msg)
             result = self._send_and_verify("BUY", q * 2, price=rec.get('exit_price', 0))
+            self.notifier.send(msg)
         else:
             return
 
@@ -753,6 +791,7 @@ class ShioajiTMFTrader:
         logger.info("• 每張單都會確認成交並與帳上部位對帳，稽核紀錄寫入 logs/orders_YYYYMMDD.csv")
         logger.info("• 按下 Ctrl+C 可隨時安全停止程式。")
         logger.info("=" * 75)
+        self.notifier.send(f"🤖 TMF 自動當沖機器人已啟動 ({today_str})\n口數: {self.quantity}口 | {describe(strat_cfg, atr_info)}")
 
         # 1. 抓取今日日盤 K 棒，計算指標與 ORB 區間 (若已過 09:15)
         kbars = self.fetch_today_day_kbars()
