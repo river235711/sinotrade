@@ -15,28 +15,23 @@ from config import InstrumentConfig, ORBStrategyConfig
 from backtester.engine import BacktestEngine
 
 def main():
-    trading_days = [
-        ("2026_09_30", "20260930"),
-        ("2026_10_01", "20261001"),
-        ("2026_10_02", "20261002"),
-        ("2026_10_05", "20261005"),
-        ("2026_10_06", "20261006"),
-        ("2026_10_07", "20261007"),
-        ("2026_10_08", "20261008"),
-        ("2026_10_12", "20261012"),
-        ("2026_10_13", "20261013"),
-        ("2026_10_14", "20261014"),
-        ("2026_10_15", "20261015"),
-        ("2026_10_16", "20261016"),
-        ("2026_10_19", "20261019"),
-        ("2026_10_20", "20261020"),
-        ("2026_10_21", "20261021"),
-        ("2026_10_22", "20261022"),
-        ("2026_10_27", "20261027"),
-        ("2026_10_28", "20261028"),
-        ("2026_10_29", "20261029"),
-        ("2026_10_30", "20261030"),
-    ]
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    cache_path = os.path.join(base_dir, "data", "tmf_20days_1m_kbars.csv")
+    if os.path.exists(cache_path):
+        cached_df = pd.read_csv(cache_path)
+        all_dates = sorted(cached_df['date'].unique())
+        target_dates = all_dates[-20:]
+    else:
+        target_dates = [
+            "2026-09-30", "2026-10-01", "2026-10-02", "2026-10-05", "2026-10-06",
+            "2026-10-07", "2026-10-08", "2026-10-12", "2026-10-13", "2026-10-14",
+            "2026-10-15", "2026-10-16", "2026-10-19", "2026-10-20", "2026-10-21",
+            "2026-10-22", "2026-10-27", "2026-10-28", "2026-10-29", "2026-10-30"
+        ]
+
+    trading_days = [(d.replace('-', '_'), d.replace('-', '')) for d in target_dates]
+    start_date_str = target_dates[0]
+    end_date_str = target_dates[-1]
 
     inst_cfg = InstrumentConfig(
         symbol="TMF",
@@ -48,12 +43,11 @@ def main():
 
     strat_cfg = ORBStrategyConfig()
 
-    base_dir = os.path.dirname(os.path.abspath(__file__))
     all_trades = []
     daily_summaries = []
 
     print("=" * 95)
-    print("🚀 TMF 微型臺指期貨 - 前 20 個交易日當沖回測報告 (2026-09-30 ~ 2026-10-30)")
+    print(f"🚀 TMF 微型臺指期貨 - 前 20 個交易日當沖回測報告 ({start_date_str} ~ {end_date_str})")
     print("=" * 95)
 
     for file_date, target_date in trading_days:
@@ -146,14 +140,14 @@ def main():
     print("\n" + "=" * 95)
     print("📈 【前 20 個交易日整體績效統計 (20-Day Performance Summary)】")
     print("=" * 95)
-    print(f"• 回測期間:                 2026-09-30 ~ 2026-10-30 (共 20 個交易日)")
-    print(f"• 獲利天數 / 虧損天數:      {win_days} 天獲利 / {loss_days} 天虧損 / {flat_days} 天無交易 (有交易日勝率: {win_days/(win_days+loss_days)*100:.1f}%)")
-    print(f"• 總交易筆數:               {total_trades} 筆 (做多 {(all_df['action']=='BUY').sum()} 筆 / 做空 {(all_df['action']=='SELL').sum()} 筆)")
+    print(f"• 回測期間:                 {start_date_str} ~ {end_date_str} (共 {len(daily_summaries)} 個交易日)")
+    print(f"• 獲利天數 / 虧損天數:      {win_days} 天獲利 / {loss_days} 天虧損 / {flat_days} 天無交易 (有交易日勝率: {win_days/(win_days+loss_days)*100:.1f}%)" if (win_days+loss_days)>0 else "• 獲利天數 / 虧損天數: 0")
+    print(f"• 總交易筆數:               {total_trades} 筆 (做多 {(all_df['action']=='BUY').sum() if not all_df.empty else 0} 筆 / 做空 {(all_df['action']=='SELL').sum() if not all_df.empty else 0} 筆)")
     print(f"• 單筆交易勝率 (Win Rate):  {win_rate:.1f}% ({len(wins)} 勝 / {len(losses)} 負)")
     print(f"• 累積總獲利點數:           {total_pts:+.0f} 點")
     print(f"• 扣除成本總淨損益 (NTD):   NT$ {total_ntd:+,.0f} 元")
     print(f"• 獲利因子 (Profit Factor): {pf:.2f}")
-    print(f"• 平均每筆淨損益:           NT$ {total_ntd/total_trades:+,.0f} 元")
+    print(f"• 平均每筆淨損益:           NT$ {(total_ntd/total_trades) if total_trades>0 else 0:+,.0f} 元")
     print(f"• 最大區間回撤 (MDD):       NT$ {mdd_ntd:,.0f} 元")
     print("=" * 95)
 
@@ -171,7 +165,7 @@ def main():
     for i, val in enumerate(cum_daily_ntd):
         ax1.annotate(f"{val:+,.0f}", (i, val), textcoords="offset points", xytext=(0, 8), ha='center', fontsize=7.5, fontweight='bold')
     ax1.axhline(0, color='black', linestyle='--', linewidth=0.8)
-    ax1.set_title("TMF Micro Taiwan Index - 20-Day ORB Strategy Cumulative Equity Curve (2026-09-30 ~ 2026-10-30)", fontsize=13, fontweight='bold', pad=12)
+    ax1.set_title(f"TMF Micro Taiwan Index - 20-Day ORB Strategy Cumulative Equity Curve ({start_date_str} ~ {end_date_str})", fontsize=13, fontweight='bold', pad=12)
     ax1.set_ylabel("Cumulative Net PnL (NTD)", fontsize=11)
     ax1.legend(loc='upper left')
     ax1.grid(True, linestyle=':', alpha=0.6)
@@ -195,9 +189,14 @@ def main():
     plt.savefig(chart_path, dpi=200)
     plt.close()
 
-    artifact_dir = "/Users/willhuang/.gemini/antigravity/brain/b8b63ccf-f85f-4e1c-88b5-ed46261f6ae5"
-    if os.path.exists(artifact_dir):
-        shutil.copy(chart_path, os.path.join(artifact_dir, "tmf_backtest_20days.png"))
+    artifact_dir = r"C:\Users\ting0\.gemini\antigravity\brain\0eeb3784-cd73-4675-a9e0-4753b8b0afaf"
+    wsl_artifact_dir = "/mnt/c/Users/ting0/.gemini/antigravity/brain/0eeb3784-cd73-4675-a9e0-4753b8b0afaf"
+    for ad in [wsl_artifact_dir, artifact_dir]:
+        if os.path.exists(ad):
+            try:
+                shutil.copy(chart_path, os.path.join(ad, "tmf_backtest_20days.png"))
+            except Exception:
+                pass
 
 if __name__ == "__main__":
     main()

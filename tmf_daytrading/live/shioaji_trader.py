@@ -779,6 +779,12 @@ class ShioajiTMFTrader:
                         logger.critical(f"🚨 收盤檢查: 帳上仍有 TMF 部位 {final_pos:+d} 口，請立刻手動處理！")
                     else:
                         logger.info("🏁 收盤檢查通過，帳上無未平倉部位，今日自動交易順利結束。")
+                        # 每日收盤後自動滾動更新最新 20 個交易日資料集、重新回測並 Push 至 GitHub
+                        try:
+                            from update_20days import roll_20days
+                            roll_20days(push_git=True)
+                        except Exception as roll_err:
+                            logger.warning(f"自動滾動更新 20 日資料略過: {roll_err}")
                     break
 
                 # 平時定期對帳
