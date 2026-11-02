@@ -805,30 +805,59 @@ class ShioajiTMFTrader:
 
         # 2. 帳上部位對帳與狀態恢復 / 部位接管
         processed_timestamps = self._reconcile_and_recover_on_startup(strategy, kbars)
+        active_date_str = today_str
+        eod_done_date = None
+        last_standby_log = 0.0
 
         try:
             while True:
                 now = datetime.datetime.now()
+                cur_date_str = now.strftime("%Y-%m-%d")
                 now_str = now.strftime("%H:%M:%S")
+
+                # 跨日自動換日重置 (00:00 過後自動載入新交易日 ATR 參數並清空前日快取)
+                if cur_date_str != active_date_str:
+                    active_date_str = cur_date_str
+                    self._realtime_bars.clear()
+                    self._history_loaded = False
+                    processed_timestamps.clear()
+                    self.entries_halted = False
+                    self.order_failures = 0
+                    strat_cfg, atr_info = config_for_date(base_cfg, data_dir, active_date_str)
+                    strategy = ORBStrategy(config=strat_cfg, inst_config=InstrumentConfig())
+                    logger.info("=" * 75)
+                    logger.info(f"🌅 [跨日自動換日] 進入新交易日 {active_date_str}，已重新載入今日 20日 ATR 動態參數：")
+                    logger.info(f"• 波動自適應: {describe(strat_cfg, atr_info)}")
+                    logger.info("=" * 75)
 
                 # 第二道防線：13:22:00 後帳上仍有部位，不等待 K 棒直接強制平倉
                 if now_str >= failsafe_time:
                     self._force_flatten_all(strategy)
 
-                # 第三道防線：13:24:00 前完成所有檢查並安全退出
+                # 第三道防線：13:24:00 後完成當日收盤檢查、滾動更新 20 日資料庫，並進入跨日待機模式 (不中斷程式)
                 if now_str >= shutdown_time:
-                    final_pos = self.get_real_position()
-                    if final_pos:
-                        logger.critical(f"🚨 收盤檢查: 帳上仍有 TMF 部位 {final_pos:+d} 口，請立刻手動處理！")
-                    else:
-                        logger.info("🏁 收盤檢查通過，帳上無未平倉部位，今日自動交易順利結束。")
-                        # 每日收盤後自動滾動更新最新 20 個交易日資料集、重新回測並 Push 至 GitHub
-                        try:
-                            from update_20days import roll_20days
-                            roll_20days(push_git=True)
-                        except Exception as roll_err:
-                            logger.warning(f"自動滾動更新 20 日資料略過: {roll_err}")
-                    break
+                    if eod_done_date != cur_date_str:
+                        eod_done_date = cur_date_str
+                        final_pos = self.get_real_position()
+                        if final_pos:
+                            logger.critical(f"🚨 收盤檢查: 帳上仍有 TMF 部位 {final_pos:+d} 口，請立刻手動處理！")
+                        else:
+                            logger.info(f"🏁 收盤檢查通過，帳上無未平倉部位，今日 ({cur_date_str}) 日盤自動交易已順利完成。")
+                            try:
+                                from update_20days import roll_20days
+                                roll_20days(push_git=True)
+                            except Exception as roll_err:
+                                logger.warning(f"自動滾動更新 20 日資料略過: {roll_err}")
+                            next_cfg, next_info = config_for_date(base_cfg, data_dir, "9999-12-31")
+                            logger.info("=" * 75)
+                            logger.info("🌙 [跨日待機模式] 已進入盤後待命狀態，程式持續於背景守護，將於下一交易日 08:45:00 自動開盤運作！")
+                            logger.info(f"📐 下一交易日預載參數: {describe(next_cfg, next_info)}")
+                            logger.info("=" * 75)
+                    if time.time() - last_standby_log >= 600.0:
+                        last_standby_log = time.time()
+                        logger.info(f"🌙 [{now_str}] 盤後待機守護中 (帳上零部位)，等待下一交易日 08:45:00 日盤開盤...")
+                    time.sleep(5.0)
+                    continue
 
                 # 平時定期對帳
                 if time.time() - last_reconcile >= self.reconcile_interval:
