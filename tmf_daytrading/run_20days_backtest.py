@@ -68,6 +68,9 @@ def main():
 
         day_pts = metrics["total_points"] if not tdf.empty else 0.0
         day_ntd = metrics["net_profit_ntd"] if not tdf.empty else 0.0
+        atr_info = metrics.get("atr_info", {})
+        eff_cfg = metrics.get("effective_config", strat_cfg)
+        scale_str = f"{atr_info.get('ratio', 1.0):.2f}x(-{eff_cfg.stop_loss_pts:.0f})"
 
         daily_summaries.append({
             "date": day_date_fmt,
@@ -80,6 +83,7 @@ def main():
             "orb_high": orb_h,
             "orb_low": orb_l,
             "orb_range": orb_h - orb_l,
+            "atr_scale": scale_str,
             "trades": metrics["total_trades"],
             "win_count": metrics.get("win_count", 0),
             "loss_count": metrics.get("loss_count", 0),
@@ -95,15 +99,15 @@ def main():
                 all_trades.append(r_dict)
 
     # 印出每日摘要表
-    print("\n📅 【20 個交易日每日行情與損益總覽】")
-    print("-" * 95)
-    print(f"{'日期':<12} {'合約':<8} {'開盤':<7} {'最高':<7} {'最低':<7} {'收盤':<7} {'全日振幅':<8} {'ORB上界':<8} {'ORB下界':<8} {'筆數':<4} {'點數損益':<8} {'淨損益(NTD)':<10}")
-    print("-" * 95)
+    print("\n📅 【20 個交易日每日行情與損益總覽 (含 20日 ATR 動態波動自適應)】")
+    print("-" * 108)
+    print(f"{'日期':<12} {'合約':<8} {'開盤':<7} {'最高':<7} {'最低':<7} {'收盤':<7} {'全日振幅':<8} {'ORB上界':<8} {'ORB下界':<8} {'ATR縮放(停損)':<14} {'筆數':<4} {'點數損益':<8} {'淨損益(NTD)':<10}")
+    print("-" * 108)
     for d in daily_summaries:
         pts_str = f"{d['points_pnl']:+.0f}"
         ntd_str = f"{d['net_ntd']:+,.0f}"
-        print(f"{d['date']:<12} {d['contract']:<8} {d['open']:<7.0f} {d['high']:<7.0f} {d['low']:<7.0f} {d['close']:<7.0f} {d['range']:<8.0f} {d['orb_high']:<8.0f} {d['orb_low']:<8.0f} {d['trades']:<4} {pts_str:<8} {ntd_str:<10}")
-    print("-" * 95)
+        print(f"{d['date']:<12} {d['contract']:<8} {d['open']:<7.0f} {d['high']:<7.0f} {d['low']:<7.0f} {d['close']:<7.0f} {d['range']:<8.0f} {d['orb_high']:<8.0f} {d['orb_low']:<8.0f} {d['atr_scale']:<14} {d['trades']:<4} {pts_str:<8} {ntd_str:<10}")
+    print("-" * 108)
 
     # 印出所有逐筆交易明細
     print("\n📋 【20 個交易日完整逐筆交易時間與回補明細】")

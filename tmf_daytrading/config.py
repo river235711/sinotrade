@@ -62,3 +62,12 @@ class ORBStrategyConfig:
     use_vwap_ema_filter: bool = True         # 啟用 VWAP + EMA9/EMA21 順勢濾網
     enable_sar: bool = True                  # 啟用早盤假突破停損反手 (Stop & Reverse)
     max_initial_trades: int = 1              # 每日首次突破進場上限 (1 次，若假突破可反手 1 次)
+
+    # ATR 動態尺度調整 (依前 N 日日盤平均真實振幅，自動放大/縮小上方所有「點數」參數)
+    # 今日參數 = 上方固定點數 × (今日 ATR / atr_reference)，比例限制在 atr_scale_min ~ atr_scale_max
+    use_atr_scaling: bool = True             # 啟用 ATR 動態縮放 (False = 完全使用上方固定點數)
+    atr_period: int = 20                     # ATR 計算天數 (前 20 個交易日)
+    atr_min_days: int = 20                   # 需滿 20 個交易日歷史日 K 才啟動動態縮放，避免短期樣本失真
+    atr_reference: float = 880.0             # 基準 ATR：今日 ATR 等於此值時，參數 = 上方固定點數 (對應 45,000~50,000 點區間 20 日均 ATR ~880 點)
+    atr_scale_min: float = 0.6               # 最小縮放倍數 (避免極低波動時停損過窄被雜訊掃出)
+    atr_scale_max: float = 1.8               # 最大縮放倍數 (避免極端行情時單筆風險過大)

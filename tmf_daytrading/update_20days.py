@@ -7,6 +7,8 @@ import urllib.request
 import datetime
 import subprocess
 import pandas as pd
+from strategies.atr_scaler import update_daily_history, compute_atr, scale_strategy_config
+from config import ORBStrategyConfig
 
 def fetch_intraday_kbars_cnyes(today_str: str) -> pd.DataFrame:
     """從高速台指期行情接口獲取指定日期的完整 1分K 資料 (08:45 ~ 13:45)"""
@@ -83,6 +85,13 @@ def roll_20days(target_date: str = None, push_git: bool = True):
     combined_df.to_csv(cache_path, index=False)
     print(f"💾 已成功覆蓋儲存至: {cache_path}")
     print(f"📅 最新 20 日區間: {kept_dates[0]} ~ {kept_dates[-1]} (共 {len(kept_dates)} 天，總計 {len(combined_df)} 根 K 棒)")
+
+    # 3b. 同步更新永久日 K 歷史檔 (daily_bars.csv)，並預告下一交易日的 ATR 動態參數
+    daily_hist = update_daily_history(data_dir, today_kbars)
+    base_cfg = ORBStrategyConfig()
+    next_atr, n_days = compute_atr(daily_hist, "9999-12-31", period=base_cfg.atr_period, min_days=base_cfg.atr_min_days)
+    next_cfg, next_info = scale_strategy_config(base_cfg, next_atr)
+    print(f"📐 永久日 K 歷史已更新 ({len(daily_hist)} 日) | 下一交易日 20日ATR={next_atr:.0f}點 (比例 {next_info['ratio']:.2f}x) -> 停損 -{next_cfg.stop_loss_pts:.0f}點 / 一階 +{next_cfg.breakeven_trigger_pts:.0f}→+{next_cfg.breakeven_lock_pts:.0f}點 / 二階 +{next_cfg.tier2_trigger_pts:.0f}→+{next_cfg.tier2_lock_pts:.0f}點")
 
     # 4. 自動重新執行 20 日回測並產出績效圖表
     print("\n📊 正在自動重新執行最新 20 日回測並產出報表圖表...")

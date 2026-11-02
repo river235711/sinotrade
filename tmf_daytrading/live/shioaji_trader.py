@@ -22,6 +22,7 @@ from typing import Optional
 import pandas as pd
 from config import InstrumentConfig, ORBStrategyConfig, ShioajiConfig
 from strategies.orb_strategy import ORBStrategy
+from strategies.atr_scaler import config_for_date, describe
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger("ShioajiTrader")
@@ -731,7 +732,10 @@ class ShioajiTMFTrader:
         每分鐘自動更新 1分K、計算 ORB 高低點與 VWAP/EMA 指標，觸發訊號時自動下單並確認成交
         支援中途斷線 / 重啟無縫接管帳上真實部位與狀態恢復
         """
-        strat_cfg = strat_cfg or ORBStrategyConfig()
+        base_cfg = strat_cfg or ORBStrategyConfig()
+        data_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
+        today_str = datetime.date.today().strftime("%Y-%m-%d")
+        strat_cfg, atr_info = config_for_date(base_cfg, data_dir, today_str)
         strategy = ORBStrategy(config=strat_cfg, inst_config=InstrumentConfig())
         last_reconcile = time.time()
         last_state_save = time.time()
@@ -740,9 +744,9 @@ class ShioajiTMFTrader:
         shutdown_time = getattr(strat_cfg, "shutdown_time", "13:24:00")
 
         logger.info("=" * 75)
-        logger.info("🤖 TMF 微台指 ORB Pro 自動當沖機器人 (雙速極速版) 已啟動！")
+        logger.info("🤖 TMF 微台指 ORB Pro 自動當沖機器人 (雙速極速版 + ATR 動態波動自適應) 已啟動！")
         logger.info(f"• 下單口數: {self.quantity} 口 | 開盤區間: {strat_cfg.orb_start_time} ~ {strat_cfg.orb_end_time}")
-        logger.info(f"• 風控設定: 停損 -{strat_cfg.stop_loss_pts:.0f}點 | 一階鎖利 +{strat_cfg.breakeven_trigger_pts:.0f}->+{strat_cfg.breakeven_lock_pts:.0f}點 | 二階鎖利 +{strat_cfg.tier2_trigger_pts:.0f}->+{strat_cfg.tier2_lock_pts:.0f}點")
+        logger.info(f"• 波動自適應: {describe(strat_cfg, atr_info)}")
         logger.info("• 雙速引擎: 換分 0.2 秒極速確認突破進場 | 持倉期間每 1 秒即時檢查停損/鎖利 | 每 3 秒更新報價")
         logger.info(f"• 收盤安全時程: {strat_cfg.force_close_time[:5]} 策略平倉 | {failsafe_time[:5]} 底線強制補平 | {shutdown_time[:5]} 零部位安全退出")
         logger.info("• 重啟保護: 自動偵測帳上未平倉部位並無縫接管風控；歷史 K 棒不重播下單")

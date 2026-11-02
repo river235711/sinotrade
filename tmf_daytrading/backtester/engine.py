@@ -11,6 +11,7 @@ from typing import Dict, Any, Optional
 
 from config import InstrumentConfig, ORBStrategyConfig
 from strategies.orb_strategy import ORBStrategy
+from strategies.atr_scaler import config_for_date
 from backtester.metrics import BacktestMetrics
 
 class BacktestEngine:
@@ -19,11 +20,13 @@ class BacktestEngine:
         self.inst_config = inst_config or InstrumentConfig()
         self.kbars = None
         self.day_df = None
+        self.target_date_fmt = None
 
     def load_taifex_csv(self, target_date: str = "20261030", contract_month: str = "AUTO") -> pd.DataFrame:
         """載入期交所 CSV 檔案並合成日盤 1分K (若存在快取則優先讀取快取加速)"""
         cache_path = os.path.join(os.path.dirname(self.data_path), "tmf_20days_1m_kbars.csv")
         day_date_fmt = f"{target_date[:4]}-{target_date[4:6]}-{target_date[6:]}"
+        self.target_date_fmt = day_date_fmt
         if os.path.exists(cache_path):
             cached_df = pd.read_csv(cache_path, index_col=0, parse_dates=True)
             sub = cached_df[cached_df['date'] == day_date_fmt].copy()
@@ -86,11 +89,18 @@ class BacktestEngine:
         return kbars
 
     def run_orb_strategy(self, strategy_config: ORBStrategyConfig = None) -> Dict[str, Any]:
-        """執行 ORB 策略回測 (含 VWAP + EMA 指標)"""
+        """執行 ORB 策略回測 (含 VWAP + EMA 指標與 20日 ATR 動態波動率縮放)"""
         if self.kbars is None:
             raise ValueError("請先執行 load_taifex_csv() 載入行情數據")
 
-        strategy = ORBStrategy(config=strategy_config, inst_config=self.inst_config)
+        base_cfg = strategy_config or ORBStrategyConfig()
+        atr_info = {"atr": None, "ratio": 1.0, "applied": False, "atr_days": 0}
+        eff_cfg = base_cfg
+        if getattr(base_cfg, "use_atr_scaling", False) and self.target_date_fmt:
+            data_dir = os.path.dirname(os.path.abspath(self.data_path))
+            eff_cfg, atr_info = config_for_date(base_cfg, data_dir, self.target_date_fmt)
+
+        strategy = ORBStrategy(config=eff_cfg, inst_config=self.inst_config)
         self.kbars = strategy.prepare_indicators(self.kbars)
         orb_high, orb_low = strategy.calculate_orb_levels(self.kbars)
 
@@ -103,6 +113,8 @@ class BacktestEngine:
         metrics["orb_high"] = orb_high
         metrics["orb_low"] = orb_low
         metrics["kbars"] = self.kbars
+        metrics["atr_info"] = atr_info
+        metrics["effective_config"] = eff_cfg
         return metrics
 
     def plot_results(self, metrics: Dict[str, Any], output_path: str = "backtest_result.png"):

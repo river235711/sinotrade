@@ -68,7 +68,7 @@ class FakeAPI:
 
 
 def make_trader(modes, start_net=0):
-    t = ShioajiTMFTrader(simulation=True, quantity=1)
+    t = ShioajiTMFTrader(simulation=False, quantity=1)
     t.api = FakeAPI(modes, start_net)
     t.contract = SimpleNamespace(code="TMFR1", symbol="TMFR1", name="fake")
     t.fill_timeout = 0.3
@@ -240,6 +240,20 @@ t._reconcile_and_recover_on_startup(s, pd.DataFrame())
 t._force_flatten_all(s)
 check("接管後強制平倉: 帳上多單已成功賣出平倉", t.api.net == 0)
 check("接管後強制平倉: 策略維持空手", s.position == 0)
+
+# 19. 20日 ATR 動態波動自適應縮放驗證
+from strategies.atr_scaler import compute_atr, scale_strategy_config, load_daily_history
+base_cfg = ORBStrategyConfig()
+cfg_high, info_high = scale_strategy_config(base_cfg, base_cfg.atr_reference * 1.5)
+check("ATR 1.5倍高波動: 停損自動放大為 135點", cfg_high.stop_loss_pts == 135.0 and info_high["applied"])
+check("ATR 1.5倍高波動: 二階鎖利門檻放大為 300點", cfg_high.tier2_trigger_pts == 300.0)
+cfg_low, info_low = scale_strategy_config(base_cfg, base_cfg.atr_reference * 0.5)
+check("ATR 最小倍數保護 (0.6x): 停損不低於 54點", cfg_low.stop_loss_pts == 54.0)
+
+data_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
+daily_hist = load_daily_history(data_dir)
+atr_val, n_days = compute_atr(daily_hist, "2026-11-03", period=20, min_days=20)
+check("永久日 K 歷史檔 (daily_bars.csv) 已累積滿 20 日可計算 ATR", atr_val is not None and n_days == 20)
 
 print()
 print("全部通過" if check.failed == 0 else f"有 {check.failed} 項失敗")
