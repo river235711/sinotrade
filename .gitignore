@@ -13,3 +13,6 @@ __pycache__/
 *$py.class
 .DS_Store
 *.log
+
+# 實盤委託稽核紀錄
+logs/

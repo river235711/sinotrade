@@ -13,7 +13,7 @@ def main():
     parser = argparse.ArgumentParser(description="TMF 微型臺指期 ORB Pro 當沖交易系統")
     parser.add_argument("--mode", choices=["backtest", "paper", "live"], default="backtest",
                         help="執行模式: backtest (歷史回測), paper (Shioaji模擬自動下單), live (正式實盤自動下單)")
-    parser.add_argument("--contract", default="202611", help="期貨合約月份 (預設 202611)")
+    parser.add_argument("--contract", default="TMFR1", help="期貨合約代碼或月份 (預設 TMFR1 近月連續合約)")
     parser.add_argument("--qty", type=int, default=1, help="每次下單口數 (預設 1 口)")
     
     args = parser.parse_args()
