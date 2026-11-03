@@ -527,7 +527,7 @@ class ShioajiTMFTrader:
 
     def _post_trade_check(self, strategy: ORBStrategy, act: str, result: FillResult):
         """送單後以帳上真實部位對帳，並把策略狀態拉回與現實一致"""
-        expected = strategy.position * self.quantity
+        expected = 0 if act == "EXIT" else (strategy.position * self.quantity)
         real = self.get_real_position()
 
         if real is None:
@@ -835,6 +835,7 @@ class ShioajiTMFTrader:
             result = self._send_and_verify("SELL", q, price=bar['close'])
             self.notifier.send(f"{msg}\n成交均價: {result.avg_price:.0f} ({result.status})")
         elif act == "EXIT":
+            strategy.position = 0
             close_action = "SELL" if prev_pos == 1 else "BUY"
             msg = f"🏁 [平倉回補] {ts.strftime('%H:%M')} {rec.get('reason')} @ {rec.get('exit_price'):.0f} (損益: {rec.get('pnl_pts'):+.0f}點)"
             logger.info(msg)
