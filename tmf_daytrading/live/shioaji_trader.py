@@ -583,23 +583,56 @@ class ShioajiTMFTrader:
         self._halt_entries("帳上部位與策略不一致，需人工確認")
         self._save_state(strategy)
 
-    def _force_flatten_all(self, strategy: ORBStrategy):
-        """收盤前強制平倉：以帳上真實部位為準，查不到才退回用策略部位"""
+    def _force_flatten_all(self, strategy: ORBStrategy, cur_price: float = 0.0):
+        """強制平倉：以帳上真實部位為準，查不到才退回用策略部位"""
         real = self.get_real_position()
         if real is None:
             if strategy.position == 0:
                 return
             action = "SELL" if strategy.position == 1 else "BUY"
-            logger.warning("無法查詢帳上部位，改依策略部位平倉")
-            self._send_and_verify(action, self.quantity, octype="Cover")
+            logger.warning("依策略部位執行平倉回補")
+            self._send_and_verify(action, self.quantity, octype="Cover", price=cur_price)
         elif real != 0:
-            logger.warning(f"⏰ 收盤前安全底線，帳上有 {real:+d} 口，強制平倉！")
+            logger.warning(f"⏰ 帳上有 {real:+d} 口，執行強制平倉！")
             if not self.flatten_real_position():
-                logger.critical("🚨 收盤前平倉失敗，帳上仍有部位，請立刻手動處理！")
+                logger.critical("🚨 平倉失敗，帳上仍有部位，請立刻手動處理！")
                 return
         strategy.position = 0
         strategy.highest_profit = 0.0
         self._save_state(strategy)
+
+    def _check_external_command(self, strategy: ORBStrategy, cur_price: float = 0.0):
+        """每秒檢查 logs/command.json 外部即時指令 (支援對話框或 CLI 隨時下令秒級平倉)"""
+        cmd_path = os.path.join(self.log_dir, "command.json")
+        if not os.path.exists(cmd_path):
+            return
+        try:
+            with open(cmd_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            os.remove(cmd_path)
+        except Exception as e:
+            logger.warning(f"讀取外部指令檔失敗: {e}")
+            return
+
+        cmd = str(data.get("cmd", "")).lower().strip()
+        if cmd in ("close", "close_and_halt", "flatten"):
+            had_pos = (strategy.position != 0) or bool(self.get_real_position())
+            pnl_str = ""
+            if strategy.position != 0 and strategy.entry_price > 0 and cur_price > 0:
+                pnl = (cur_price - strategy.entry_price) if strategy.position == 1 else (strategy.entry_price - cur_price)
+                pnl_str = f" @ {cur_price:.0f} (約 {pnl:+.0f}點)"
+            self._force_flatten_all(strategy, cur_price=cur_price)
+            if cmd == "close_and_halt":
+                self._halt_entries("收到手動平倉並停開新倉指令")
+            if had_pos:
+                msg = f"⚡ [手動指令平倉完成] 已立即平倉回補部位{pnl_str}！"
+            else:
+                msg = "ℹ️ [手動指令平倉] 收到平倉指令，目前帳上與策略皆無部位 (空手)。"
+            logger.info(msg)
+            self.notifier.send(msg)
+        elif cmd == "resume":
+            self.entries_halted = False
+            logger.info("▶️ [外部指令] 已恢復允許開新倉。")
 
     # ------------------------------------------------------------------
     # K 棒與主迴圈
@@ -879,6 +912,8 @@ class ShioajiTMFTrader:
                     last_state_save = time.time()
 
                 kbars = self.fetch_today_day_kbars()
+                cur_quote = float(kbars.iloc[-1]["close"]) if not kbars.empty else 0.0
+                self._check_external_command(strategy, cur_price=cur_quote)
                 if not kbars.empty and len(kbars) >= 2:
                     # 準備 VWAP 與 EMA9/EMA21 指標
                     kbars = strategy.prepare_indicators(kbars)
