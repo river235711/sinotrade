@@ -235,8 +235,12 @@ class ShioajiTMFTrader:
 
         import shioaji as sj
         sj_action = sj.Action.Buy if action == "BUY" else sj.Action.Sell
-        sj_price_type = (sj.FuturesPriceType.MKP if price_type == "MKP"
-                         else sj.FuturesPriceType.LMT)
+        if price_type == "MKT":
+            sj_price_type = sj.FuturesPriceType.MKT
+        elif price_type == "MKP":
+            sj_price_type = sj.FuturesPriceType.MKP
+        else:
+            sj_price_type = sj.FuturesPriceType.LMT
         sj_octype = getattr(sj.FuturesOCType, octype, sj.FuturesOCType.Auto)
 
         try:
@@ -292,9 +296,9 @@ class ShioajiTMFTrader:
             filled = qty    # 狀態已是 Filled 但成交明細尚未更新
         return FillResult(ok=filled >= qty, filled_qty=filled, avg_price=avg_price, status=status)
 
-    def _send_and_verify(self, action: str, qty: int, octype: str = "Auto", price: float = 0.0) -> FillResult:
+    def _send_and_verify(self, action: str, qty: int, octype: str = "Auto", price: float = 0.0, price_type: str = "MKP") -> FillResult:
         """送單並確認成交結果，同時寫入稽核紀錄"""
-        trade = self.place_order(action, price, qty, "MKP", octype)
+        trade = self.place_order(action, price, qty, price_type, octype)
         if trade is None:
             result = FillResult(False, 0, 0.0, "Rejected")
         elif isinstance(trade, dict):      # 乾跑模式：沒有真正的券商回報
@@ -500,7 +504,7 @@ class ShioajiTMFTrader:
         return processed_timestamps
 
     def flatten_real_position(self, retries: int = 3) -> bool:
-        """依帳上真實部位反向平倉，最多重試 retries 次；成功回傳 True"""
+        """依帳上真實部位反向平倉，前幾次用 MKP 防滑價，最後一次保底自動升級為 MKT 純市價必平；成功回傳 True"""
         for i in range(retries):
             real = self.get_real_position()
             if real is None:
@@ -509,8 +513,9 @@ class ShioajiTMFTrader:
             if real == 0:
                 return True
             action = "SELL" if real > 0 else "BUY"
-            logger.warning(f"🧹 平倉嘗試 {i + 1}/{retries}: 帳上 {real:+d} 口，送出 {action} {abs(real)}口")
-            self._send_and_verify(action, abs(real), octype="Cover")
+            ptype = "MKT" if (i == retries - 1 and retries > 1) else "MKP"
+            logger.warning(f"🧹 平倉嘗試 {i + 1}/{retries} ({ptype}+IOC): 帳上 {real:+d} 口，送出 {action} {abs(real)}口")
+            self._send_and_verify(action, abs(real), octype="Cover", price_type=ptype)
             time.sleep(self.retry_pause)
         return self.get_real_position() == 0
 

@@ -29,6 +29,7 @@ class FakeAPI:
         self.net = start_net
         self.futopt_account = object()
         self.sent = []
+        self.sent_price_types = []
 
     def Order(self, **kw):
         return SimpleNamespace(**kw)
@@ -38,6 +39,7 @@ class FakeAPI:
         qty = order.quantity
         sign = 1 if order.action == sj.constant.Action.Buy else -1
         self.sent.append((order.action, qty, mode))
+        self.sent_price_types.append(getattr(order, "price_type", None))
         status = SimpleNamespace(status=Status.Submitted, deals=[], deal_quantity=0)
         trade = SimpleNamespace(status=status, _mode=mode, _qty=qty, _sign=sign)
         if mode == "fill":
@@ -276,6 +278,14 @@ prev_b = pd.Series({"close": 45215.0})  # 前一根已突破 45200 但當時均�
 cur_b = pd.Series({"open": 45215.0, "high": 45230.0, "low": 45210.0, "close": 45225.0, "vwap": 45150.0, "ema9": 45180.0, "ema21": 45160.0})
 res_delay = s_delay.execute_bar(pd.Timestamp("2026-11-02 09:20:00"), cur_b, prev_b)
 check("突破延遲共振: 前根突破後本根 EMA 轉多仍可順勢進場不漏單", res_delay["action"] == "BUY")
+
+# 21. 兩段式升級平倉法驗證: 前 2 發用 MKP+IOC 防滑價，第 3 發保底自動升級為 MKT+IOC 暴力必平
+t_esc = make_trader(["cancel", "cancel", "fill"], start_net=1)
+ok_esc = t_esc.flatten_real_position(retries=3)
+check("兩段式平倉升級: 前 2 發為 MKP，第 3 發自動升級為 MKT 並清倉成功",
+      ok_esc and t_esc.api.net == 0 and t_esc.api.sent_price_types == [
+          sj.FuturesPriceType.MKP, sj.FuturesPriceType.MKP, sj.FuturesPriceType.MKT
+      ])
 
 print()
 print("全部通過" if check.failed == 0 else f"有 {check.failed} 項失敗")
