@@ -820,8 +820,8 @@ class ShioajiTMFTrader:
         last_reconcile = time.time()
         last_state_save = time.time()
         last_log_time = 0.0
-        failsafe_time = getattr(strat_cfg, "failsafe_close_time", "13:22:00")
-        shutdown_time = getattr(strat_cfg, "shutdown_time", "13:24:00")
+        failsafe_time = getattr(strat_cfg, "failsafe_close_time", "13:09:00")
+        shutdown_time = getattr(strat_cfg, "shutdown_time", "13:10:00")
 
         logger.info("=" * 75)
         logger.info("🤖 TMF 微台指 ORB Pro 自動當沖機器人 (雙速極速版 + ATR 動態波動自適應) 已啟動！")
@@ -872,11 +872,11 @@ class ShioajiTMFTrader:
                     logger.info(f"• 波動自適應: {describe(strat_cfg, atr_info)}")
                     logger.info("=" * 75)
 
-                # 第二道防線：13:22:00 後帳上仍有部位，不等待 K 棒直接強制平倉
+                # 第二道防線：13:09:00 後帳上仍有部位，不等待 K 棒直接強制平倉
                 if now_str >= failsafe_time:
                     self._force_flatten_all(strategy)
 
-                # 第三道防線：13:24:00 後完成當日收盤檢查、滾動更新 20 日資料庫，並進入跨日待機模式 (不中斷程式)
+                # 第三道防線：13:10:00 後完成當日收盤檢查、滾動更新 20 日資料庫，並進入跨日待機模式 (不中斷程式)
                 if now_str >= shutdown_time:
                     if eod_done_date != cur_date_str:
                         eod_done_date = cur_date_str
