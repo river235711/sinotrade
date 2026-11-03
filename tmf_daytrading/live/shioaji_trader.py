@@ -142,6 +142,15 @@ class ShioajiTMFTrader:
                         self.contract = c
                         break
 
+            # 若選到連續合約 (如 TMFR1，其 target_code 為實際交易月份 TMFK6)，自動解析為實際可下單之月份合約
+            target_code = getattr(self.contract, "target_code", None)
+            if target_code:
+                for c in self.api.Contracts.Futures.TMF:
+                    if c.code == target_code:
+                        logger.info(f"自動將連續合約 {self.contract.code} 解析為當月主力可下單合約: {c.code} ({c.name})")
+                        self.contract = c
+                        break
+
             logger.info(f"已綁定交易合約: {self.contract.code} - {self.contract.name}")
 
             # 訂閱即時逐筆 Tick 報價，直接於本地記憶體即時合成 1分K (零延遲、防 kbars 逾時)
