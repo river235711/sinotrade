@@ -70,6 +70,7 @@ class ShioajiTMFTrader:
         # 風控狀態
         self.is_kill_switch_triggered = False   # True 時拒絕所有委託 (含平倉)，僅供緊急手動使用
         self.entries_halted = False             # True 時只允許平倉，不再開新倉
+        self.pending_flatten = False            # True 時代表已觸發平倉但帳上尚未歸零，每秒持續以 MKT+IOC 追殺直到 0 口
         self.order_failures = 0                 # 開倉單連續未成交次數
         self.max_order_failures = 3
 
@@ -537,6 +538,8 @@ class ShioajiTMFTrader:
 
         if real == expected:
             logger.info(f"📒 對帳通過: 帳上部位 {real:+d} 口 = 策略預期 {expected:+d} 口")
+            if real == 0:
+                self.pending_flatten = False
             self.order_failures = 0
             return
 
@@ -546,9 +549,11 @@ class ShioajiTMFTrader:
             # 策略認為已平倉，但帳上還有部位 -> 一定要平掉
             if not self.flatten_real_position():
                 strategy.position = 1 if real > 0 else -1
+                self.pending_flatten = True
                 self._halt_entries("平倉失敗，帳上仍有部位")
-                logger.critical("🚨 帳上仍有未平倉部位，請立刻手動處理！")
+                logger.critical("🚨 帳上仍有未平倉部位，啟動【不死鳥追平機制】每秒持續以 MKT+IOC 強制追殺直到 0 口！")
             else:
+                self.pending_flatten = False
                 logger.info("✅ 已補平帳上殘留部位")
             return
 
@@ -565,9 +570,13 @@ class ShioajiTMFTrader:
 
         # 其他不一致 (方向相反、口數不對、部分成交)：為安全起見全部平掉
         logger.error("部位方向或口數與預期不符，為安全起見全部平倉")
-        self.flatten_real_position()
-        strategy.position = 0
-        strategy.highest_profit = 0.0
+        if not self.flatten_real_position():
+            self.pending_flatten = True
+            strategy.position = 1 if real > 0 else -1
+        else:
+            self.pending_flatten = False
+            strategy.position = 0
+            strategy.highest_profit = 0.0
         self._halt_entries("成交結果與預期不符")
         self._save_state(strategy)
 
@@ -583,6 +592,7 @@ class ShioajiTMFTrader:
         if real == 0:
             strategy.position = 0
             strategy.highest_profit = 0.0
+            self.pending_flatten = False
         elif strategy.position != 0:
             strategy.position = 1 if real > 0 else -1
         self._halt_entries("帳上部位與策略不一致，需人工確認")
@@ -592,7 +602,7 @@ class ShioajiTMFTrader:
         """強制平倉：以帳上真實部位為準，查不到才退回用策略部位"""
         real = self.get_real_position()
         if real is None:
-            if strategy.position == 0:
+            if strategy.position == 0 and not self.pending_flatten:
                 return
             action = "SELL" if strategy.position == 1 else "BUY"
             logger.warning("依策略部位執行平倉回補")
@@ -600,11 +610,52 @@ class ShioajiTMFTrader:
         elif real != 0:
             logger.warning(f"⏰ 帳上有 {real:+d} 口，執行強制平倉！")
             if not self.flatten_real_position():
-                logger.critical("🚨 平倉失敗，帳上仍有部位，請立刻手動處理！")
+                self.pending_flatten = True
+                logger.critical("🚨 平倉失敗，帳上仍有部位，啟動【不死鳥追平機制】持續以 MKT+IOC 追殺直到 0 口！")
                 return
+            self.pending_flatten = False
         strategy.position = 0
         strategy.highest_profit = 0.0
         self._save_state(strategy)
+
+    def _relentless_flatten_step(self, strategy: ORBStrategy) -> bool:
+        """
+        不死鳥追平單步執行：
+        當盤中平倉未果 (pending_flatten=True) 或已過收盤時間仍有殘留部位時，
+        不需等待下一根 1 分 K，每隔 1~2 秒自動檢測連線並以 MKT+IOC 持續追殺直到帳上歸零 (0 口)。
+        """
+        real = self.get_real_position()
+        if real is None:
+            if self.api is not None and not self.simulation:
+                self.reconnect()
+                real = self.get_real_position()
+            if real is None:
+                return False
+
+        if real == 0:
+            if self.pending_flatten or strategy.position != 0:
+                logger.info("🦅 [不死鳥追平完成] 確認券商帳上部位已歸零 (0 口)！")
+                self.pending_flatten = False
+                strategy.position = 0
+                strategy.highest_profit = 0.0
+                self._save_state(strategy)
+            return True
+
+        action = "SELL" if real > 0 else "BUY"
+        logger.warning(f"🦅 [不死鳥持續追平] 帳上仍有 {real:+d} 口，立即補送 MKT+IOC 強制平倉 ({action} {abs(real)}口)...")
+        res = self._send_and_verify(action, abs(real), octype="Cover", price_type="MKT")
+        if res.status == "Rejected" and self.api is not None and not self.simulation:
+            self.reconnect()
+
+        after_real = self.get_real_position()
+        if after_real == 0:
+            logger.info("🦅 [不死鳥追平成功] 帳上殘留部位已全數清零 (0 口)！")
+            self.pending_flatten = False
+            strategy.position = 0
+            strategy.highest_profit = 0.0
+            self._save_state(strategy)
+            return True
+        return False
 
     def _check_external_command(self, strategy: ORBStrategy, cur_price: float = 0.0):
         """每秒檢查 logs/command.json 外部即時指令 (支援對話框或 CLI 隨時下令秒級平倉)"""
@@ -869,6 +920,7 @@ class ShioajiTMFTrader:
                     self._history_loaded = False
                     processed_timestamps.clear()
                     self.entries_halted = False
+                    self.pending_flatten = False
                     self.order_failures = 0
                     strat_cfg, atr_info = config_for_date(base_cfg, data_dir, active_date_str)
                     strategy = ORBStrategy(config=strat_cfg, inst_config=InstrumentConfig())
@@ -877,29 +929,39 @@ class ShioajiTMFTrader:
                     logger.info(f"• 波動自適應: {describe(strat_cfg, atr_info)}")
                     logger.info("=" * 75)
 
+                # 盤中不死鳥追平：若前一秒平倉未果 (pending_flatten=True)，不等待下一根 K 棒，每秒持續以 MKT+IOC 追殺直到 0 口
+                if self.pending_flatten:
+                    self._relentless_flatten_step(strategy)
+
                 # 第二道防線：13:09:00 後帳上仍有部位，不等待 K 棒直接強制平倉
                 if now_str >= failsafe_time:
                     self._force_flatten_all(strategy)
 
-                # 第三道防線：13:10:00 後完成當日收盤檢查、滾動更新 20 日資料庫，並進入跨日待機模式 (不中斷程式)
+                # 第三道防線：13:10:00 後完成當日收盤檢查；若帳上仍有殘留部位，絕不進入待機，每隔 2 秒持續自動重連並以 MKT+IOC 追殺直到 0 口！
                 if now_str >= shutdown_time:
+                    final_pos = self.get_real_position()
+                    if final_pos is None and self.api is not None and not self.simulation:
+                        self.reconnect()
+                        final_pos = self.get_real_position()
+                    if final_pos or self.pending_flatten:
+                        logger.critical(f"🚨 [收盤後不死鳥追平] 已過 {shutdown_time} 帳上仍有殘留部位 ({final_pos})，拒絕進入待機，每 2 秒持續以 MKT+IOC 強制追平直到 0 口！")
+                        self._relentless_flatten_step(strategy)
+                        time.sleep(2.0)
+                        continue
+
                     if eod_done_date != cur_date_str:
                         eod_done_date = cur_date_str
-                        final_pos = self.get_real_position()
-                        if final_pos:
-                            logger.critical(f"🚨 收盤檢查: 帳上仍有 TMF 部位 {final_pos:+d} 口，請立刻手動處理！")
-                        else:
-                            logger.info(f"🏁 收盤檢查通過，帳上無未平倉部位，今日 ({cur_date_str}) 日盤自動交易已順利完成。")
-                            try:
-                                from update_20days import roll_20days
-                                roll_20days(push_git=True)
-                            except Exception as roll_err:
-                                logger.warning(f"自動滾動更新 20 日資料略過: {roll_err}")
-                            next_cfg, next_info = config_for_date(base_cfg, data_dir, "9999-12-31")
-                            logger.info("=" * 75)
-                            logger.info("🌙 [跨日待機模式] 已進入盤後待命狀態，程式持續於背景守護，將於下一交易日 08:45:00 自動開盤運作！")
-                            logger.info(f"📐 下一交易日預載參數: {describe(next_cfg, next_info)}")
-                            logger.info("=" * 75)
+                        logger.info(f"🏁 收盤檢查通過，帳上無未平倉部位，今日 ({cur_date_str}) 日盤自動交易已順利完成。")
+                        try:
+                            from update_20days import roll_20days
+                            roll_20days(push_git=True)
+                        except Exception as roll_err:
+                            logger.warning(f"自動滾動更新 20 日資料略過: {roll_err}")
+                        next_cfg, next_info = config_for_date(base_cfg, data_dir, "9999-12-31")
+                        logger.info("=" * 75)
+                        logger.info("🌙 [跨日待機模式] 已進入盤後待命狀態，程式持續於背景守護，將於下一交易日 08:45:00 自動開盤運作！")
+                        logger.info(f"📐 下一交易日預載參數: {describe(next_cfg, next_info)}")
+                        logger.info("=" * 75)
                     if time.time() - last_standby_log >= 600.0:
                         last_standby_log = time.time()
                         logger.info(f"🌙 [{now_str}] 盤後待機守護中 (帳上零部位)，等待下一交易日 08:45:00 日盤開盤...")

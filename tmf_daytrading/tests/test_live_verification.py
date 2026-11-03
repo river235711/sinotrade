@@ -287,6 +287,18 @@ check("兩段式平倉升級: 前 2 發為 MKP，第 3 發自動升級為 MKT �
           sj.FuturesPriceType.MKP, sj.FuturesPriceType.MKP, sj.FuturesPriceType.MKT
       ])
 
+# 22. 不死鳥追平機制 (Relentless Flatten): 當首輪 4 發全因斷線/快市失敗後，pending_flatten 自動啟動並每秒持續以 MKT+IOC 追殺直到 0 口
+t_rel = make_trader(["cancel", "cancel", "cancel", "cancel", "cancel", "fill"], start_net=1)
+s_rel = make_strategy(position=0)
+t_rel._handle_action(s_rel, {"action": "EXIT", "record": rec}, TS, BAR, 1)
+check("不死鳥追平啟動: 首輪全失敗後 pending_flatten 設為 True 且帳上仍有 +1 口", t_rel.pending_flatten and t_rel.api.net == 1)
+# 第 5 發仍失敗 (網路尚未恢復)
+step1_ok = t_rel._relentless_flatten_step(s_rel)
+check("不死鳥追平持續中: 第 5 發 MKT 未過，維持 pending_flatten=True 繼續追殺", (not step1_ok) and t_rel.pending_flatten and t_rel.api.net == 1)
+# 第 6 發成功 (網路恢復，MKT+IOC 清零)
+step2_ok = t_rel._relentless_flatten_step(s_rel)
+check("不死鳥追平完成: 第 6 發 MKT 成功清零，pending_flatten 解除且部位歸 0", step2_ok and (not t_rel.pending_flatten) and t_rel.api.net == 0 and s_rel.position == 0)
+
 print()
 print("全部通過" if check.failed == 0 else f"有 {check.failed} 項失敗")
 sys.exit(1 if check.failed else 0)
