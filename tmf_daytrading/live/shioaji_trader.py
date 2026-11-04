@@ -440,6 +440,15 @@ class ShioajiTMFTrader:
                     strategy.entry_price = float(saved_state.get("entry_price", 0.0))
                     strategy.trade_count = int(saved_state.get("trade_count", 0))
                     strategy.highest_profit = float(saved_state.get("highest_profit", 0.0))
+                    if saved_state.get("orb_calculated", False) and saved_state.get("orb_high") is not None:
+                        strategy.orb_high = float(saved_state["orb_high"])
+                        strategy.orb_low = float(saved_state["orb_low"])
+                        strategy.orb_calculated = True
+                    max_trades = getattr(strategy.config, "max_trades_per_day", None)
+                    if max_trades is None:
+                        max_trades = getattr(strategy.config, "max_initial_trades", 1) + (1 if getattr(strategy.config, "enable_sar", False) else 0)
+                    if strategy.trade_count >= max_trades or saved_state.get("entries_halted", False):
+                        self._halt_entries(f"今日交易次數已達上限 ({strategy.trade_count}次)")
                 else:
                     logger.info("✅ [模擬模式] 啟動檢查完成，使用本地策略狀態追蹤部位 (略過券商帳務查詢)。")
             elif self.api is not None:
