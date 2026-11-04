@@ -931,6 +931,7 @@ class ShioajiTMFTrader:
                     processed_timestamps.clear()
                     self.entries_halted = False
                     self.pending_flatten = False
+                    self._morning_wake_logged = False
                     self.order_failures = 0
                     strat_cfg, atr_info = config_for_date(base_cfg, data_dir, active_date_str)
                     strategy = ORBStrategy(config=strat_cfg, inst_config=InstrumentConfig())
@@ -959,9 +960,11 @@ class ShioajiTMFTrader:
                         time.sleep(2.0)
                         continue
 
-                    if eod_done_date != cur_date_str:
+                    # 13:10:00 嚴格當沖平倉已完成 (帳上保證 0 口部位)
+                    # 檢查是否到達 13:45:15 (台指日盤正式收盤)，抓取今日完整 300 根 K 棒執行滾動回測與日總結
+                    if now_str >= "13:45:15" and eod_done_date != cur_date_str:
                         eod_done_date = cur_date_str
-                        logger.info(f"🏁 收盤檢查通過，帳上無未平倉部位，今日 ({cur_date_str}) 日盤自動交易已順利完成。")
+                        logger.info(f"🏁 日盤正式收盤 (13:45)！帳上確認 0 部位，開始執行今日 ({cur_date_str}) 盤後總結與數據滾動...")
                         try:
                             from update_20days import roll_20days
                             roll_20days(push_git=True)
@@ -969,12 +972,38 @@ class ShioajiTMFTrader:
                             logger.warning(f"自動滾動更新 20 日資料略過: {roll_err}")
                         next_cfg, next_info = config_for_date(base_cfg, data_dir, "9999-12-31")
                         logger.info("=" * 75)
-                        logger.info("🌙 [跨日待機模式] 已進入盤後待命狀態，程式持續於背景守護，將於下一交易日 08:45:00 自動開盤運作！")
+                        logger.info("🌙 [跨日待機模式] 今日日報表與 20 日回測已更新，進入盤後低耗待命守護！")
                         logger.info(f"📐 下一交易日預載參數: {describe(next_cfg, next_info)}")
                         logger.info("=" * 75)
+                    elif now_str < "13:45:15" and eod_done_date != cur_date_str:
+                        if time.time() - last_standby_log >= 300.0:
+                            last_standby_log = time.time()
+                            logger.info(f"☕ [{now_str}] 今日當沖交易已完成 (0部位)，等待 13:45:15 台指日盤正式收盤後執行滾動回測與日總結...")
+                        time.sleep(5.0)
+                        continue
+
                     if time.time() - last_standby_log >= 600.0:
                         last_standby_log = time.time()
                         logger.info(f"🌙 [{now_str}] 盤後待機守護中 (帳上零部位)，等待下一交易日 08:45:00 日盤開盤...")
+                    time.sleep(5.0)
+                    continue
+
+                # 週末休市待機 (週六、週日)
+                if now.weekday() >= 5:
+                    if time.time() - last_standby_log >= 1800.0:
+                        last_standby_log = time.time()
+                        logger.info(f"☕ [{now_str}] 週末休市待命守護中 (週六/週日)，等待週一 08:45:00 日盤開盤...")
+                    time.sleep(10.0)
+                    continue
+
+                # 交易日清晨開盤前待機 (00:00:00 ~ 08:44:59)
+                if now_str < "08:45:00":
+                    if now_str >= "08:40:00" and not getattr(self, "_morning_wake_logged", False):
+                        self._morning_wake_logged = True
+                        logger.info(f"🌅 [{now_str}] 早盤開盤倒數中！Shioaji 連線正常，準備迎接 08:45:00 首根 K 棒！")
+                    elif time.time() - last_standby_log >= 1800.0:
+                        last_standby_log = time.time()
+                        logger.info(f"🌙 [{now_str}] 開盤前待命守護中 (帳上零部位)，等待今日 08:45:00 日盤開盤...")
                     time.sleep(5.0)
                     continue
 
