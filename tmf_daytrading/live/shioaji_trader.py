@@ -932,6 +932,8 @@ class ShioajiTMFTrader:
                     self.entries_halted = False
                     self.pending_flatten = False
                     self._morning_wake_logged = False
+                    self._noon_cutoff_sent = False
+                    self._eod_close_notified = False
                     self.order_failures = 0
                     strat_cfg, atr_info = config_for_date(base_cfg, data_dir, active_date_str)
                     strategy = ORBStrategy(config=strat_cfg, inst_config=InstrumentConfig())
@@ -961,6 +963,15 @@ class ShioajiTMFTrader:
                         continue
 
                     # 13:10:00 嚴格當沖平倉已完成 (帳上保證 0 口部位)
+                    if not getattr(self, "_eod_close_notified", False):
+                        self._eod_close_notified = True
+                        self.notifier.send(
+                            f"🛡️ [13:10 當沖平倉完成]\n"
+                            f"收盤風控稽核通過，帳上部位確認為 0 口！\n"
+                            f"• 今日無留倉、零過夜風險。\n"
+                            f"• 等待 13:45 台指日盤收盤數據結算..."
+                        )
+
                     # 檢查是否到達 13:45:15 (台指日盤正式收盤)，抓取今日完整 300 根 K 棒執行滾動回測與日總結
                     if now_str >= "13:45:15" and eod_done_date != cur_date_str:
                         eod_done_date = cur_date_str
@@ -975,6 +986,13 @@ class ShioajiTMFTrader:
                         logger.info("🌙 [跨日待機模式] 今日日報表與 20 日回測已更新，進入盤後低耗待命守護！")
                         logger.info(f"📐 下一交易日預載參數: {describe(next_cfg, next_info)}")
                         logger.info("=" * 75)
+                        self.notifier.send(
+                            f"🏁 [13:45 日盤正式收盤總結]\n"
+                            f"今日 ({cur_date_str}) 日盤正式收盤！\n"
+                            f"• 完整 300 根 1分K 已歸檔\n"
+                            f"• 20 日滾動資料集已更新並推送到 GitHub\n"
+                            f"• 下一交易日預載 ATR 參數已生效：\n  {describe(next_cfg, next_info)}"
+                        )
                     elif now_str < "13:45:15" and eod_done_date != cur_date_str:
                         if time.time() - last_standby_log >= 300.0:
                             last_standby_log = time.time()
@@ -1001,6 +1019,13 @@ class ShioajiTMFTrader:
                     if now_str >= "08:40:00" and not getattr(self, "_morning_wake_logged", False):
                         self._morning_wake_logged = True
                         logger.info(f"🌅 [{now_str}] 早盤開盤倒數中！Shioaji 連線正常，準備迎接 08:45:00 首根 K 棒！")
+                        self.notifier.send(
+                            f"🌅 [08:40 早盤喚醒自檢完成]\n"
+                            f"TMF 自動當沖系統已就緒，等待 08:45:00 日盤開盤！\n"
+                            f"• 交易模式: {'模擬 (Paper)' if self.simulation else '實盤 (Live)'}\n"
+                            f"• 下單口數: {self.quantity} 口\n"
+                            f"• 參數配置: {describe(strat_cfg, atr_info)}"
+                        )
                     elif time.time() - last_standby_log >= 1800.0:
                         last_standby_log = time.time()
                         logger.info(f"🌙 [{now_str}] 開盤前待命守護中 (帳上零部位)，等待今日 08:45:00 日盤開盤...")
@@ -1029,6 +1054,25 @@ class ShioajiTMFTrader:
                         orb_h, orb_l = strategy.calculate_orb_levels(kbars)
                         if orb_h and orb_l:
                             logger.info(f"📌 今日現貨開盤區間 ({strat_cfg.orb_start_time}~{strat_cfg.orb_end_time}) 已鎖定: 上界={orb_h:.0f}, 下界={orb_l:.0f} (振幅={orb_h-orb_l:.0f}點)")
+                            self.notifier.send(
+                                f"📌 [09:15 ORB 區間確立]\n"
+                                f"現貨開盤 15 分鐘關鍵區間已鎖定！\n"
+                                f"• 突破做多界線: {orb_h:.0f}\n"
+                                f"• 跌破做空界線: {orb_l:.0f}\n"
+                                f"• 今日開盤振幅: {orb_h - orb_l:.0f} 點\n"
+                                f"• 09:16 起啟動順勢突破監控！"
+                            )
+
+                    # 11:30 首次進場截止通知
+                    if now_str >= "11:30:00" and not getattr(self, "_noon_cutoff_sent", False):
+                        self._noon_cutoff_sent = True
+                        pos_txt = "空手 (無部位)" if strategy.position == 0 else f"{'🟢多單' if strategy.position == 1 else '🔴空單'} (抱單守護中)"
+                        self.notifier.send(
+                            f"🛑 [11:30 首次進場截止]\n"
+                            f"午盤關門點已過，今日不再開任何新單！\n"
+                            f"• 當前持倉狀態: {pos_txt}\n"
+                            f"• 今日累計交易: {strategy.trade_count} 次"
+                        )
 
                     # (A) 逐根處理已收完的 K 棒 (換分 0.2~1 秒內立即確認突破進場)
                     completed_bars = kbars.iloc[:-1]
