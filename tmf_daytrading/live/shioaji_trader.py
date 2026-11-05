@@ -345,6 +345,9 @@ class ShioajiTMFTrader:
             positions = self.api.list_positions(self.api.futopt_account)
         except Exception as e:
             logger.error(f"查詢帳上部位詳細資訊失敗: {e}")
+            err_str = str(e).lower()
+            if any(k in err_str for k in ("authenticated", "session", "token", "disconnect", "connect")):
+                self.reconnect()
             return {"net": None, "avg_price": 0.0, "direction": "None", "positions": []}
 
         net = 0
@@ -798,8 +801,8 @@ class ShioajiTMFTrader:
                             b["low"] = min(b["low"], price)
                             b["close"] = price
             except Exception as snap_err:
-                err_str = str(snap_err)
-                if "SessionNotEstablished" in err_str or "Token" in err_str or "disconnect" in err_str.lower():
+                err_str = str(snap_err).lower()
+                if any(k in err_str for k in ("authenticated", "session", "token", "disconnect", "connect")):
                     self.reconnect()
 
         if not self._realtime_bars:
