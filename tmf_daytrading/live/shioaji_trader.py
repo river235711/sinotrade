@@ -214,6 +214,22 @@ class ShioajiTMFTrader:
             logger.error(f"自動重連失敗: {e}")
         return False
 
+    def keep_alive_heartbeat(self):
+        """主動向券商主機發送輕量保活查詢 (Ping)，維持 TCP Session 熱連線，防閒置逾時"""
+        if self.api is None or self.simulation:
+            return
+        try:
+            acc = getattr(self.api, "futopt_account", None)
+            if acc:
+                m = self.api.margin(acc)
+                eq = float(getattr(m, "equity", 0.0) or 0.0)
+                logger.debug(f"💓 [心跳保活] Shioaji 熱連線正常 (帳戶權益數: {eq:.0f}元)")
+        except Exception as e:
+            err_str = str(e).lower()
+            logger.warning(f"⚠️ [心跳保活發現異常] {e}，立即啟動自動重連...")
+            if any(k in err_str for k in ("authenticated", "session", "token", "disconnect", "connect", "timeout")):
+                self.reconnect()
+
     # ------------------------------------------------------------------
     # 送單
     # ------------------------------------------------------------------
@@ -888,6 +904,7 @@ class ShioajiTMFTrader:
         strategy = ORBStrategy(config=strat_cfg, inst_config=InstrumentConfig())
         last_reconcile = time.time()
         last_state_save = time.time()
+        last_heartbeat_time = time.time()
         last_log_time = 0.0
         failsafe_time = getattr(strat_cfg, "failsafe_close_time", "13:09:00")
         shutdown_time = getattr(strat_cfg, "shutdown_time", "13:10:00")
@@ -1039,6 +1056,11 @@ class ShioajiTMFTrader:
                 if time.time() - last_reconcile >= self.reconcile_interval:
                     self._periodic_reconcile(strategy)
                     last_reconcile = time.time()
+
+                # Item 5: 主動心跳保活 (每 15 分鐘向券商發送一次輕量保活 Ping，維持熱連線防逾時)
+                if time.time() - last_heartbeat_time >= 900.0:
+                    self.keep_alive_heartbeat()
+                    last_heartbeat_time = time.time()
 
                 # 定期更新策略狀態存檔
                 if time.time() - last_state_save >= 30.0:

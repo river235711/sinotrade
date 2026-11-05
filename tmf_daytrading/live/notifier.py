@@ -26,10 +26,25 @@ logger = logging.getLogger("Notifier")
 
 class TradeNotifier:
     def __init__(self):
+        # 確保環境變數載入最新 .env
+        env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
+        if os.path.exists(env_path):
+            with open(env_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    os.environ[k.strip()] = v.strip().strip('"').strip("'")
+
         self.tg_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
         self.tg_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
         self.discord_webhook = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
         self.line_token = os.environ.get("LINE_NOTIFY_TOKEN", "").strip()
+
+        # LINE Messaging API (LINE 官方帳號)
+        self.line_channel_access_token = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
+        self.line_user_id = os.environ.get("LINE_USER_ID", "").strip()
 
         # Gmail 設定
         self.notify_email = os.environ.get("NOTIFY_EMAIL", "").strip() or "river235711@gmail.com"
@@ -41,11 +56,16 @@ class TradeNotifier:
         return bool(self.gmail_user and self.gmail_app_password and self.notify_email)
 
     @property
+    def line_messaging_enabled(self) -> bool:
+        return bool(self.line_channel_access_token and self.line_user_id)
+
+    @property
     def enabled(self) -> bool:
         return bool(
             (self.tg_token and self.tg_chat_id)
             or self.discord_webhook
             or self.line_token
+            or self.line_messaging_enabled
             or self.email_enabled
         )
 
@@ -94,7 +114,29 @@ class TradeNotifier:
             except Exception as e:
                 logger.debug(f"Discord 推播失敗: {e}")
 
-        # 4. LINE Notify
+        # 4. LINE Messaging API (LINE 官方帳號 Push Message)
+        if self.line_messaging_enabled:
+            try:
+                url = "https://api.line.me/v2/bot/message/push"
+                payload = json.dumps({
+                    "to": self.line_user_id,
+                    "messages": [{"type": "text", "text": text}]
+                }).encode("utf-8")
+                req = urllib.request.Request(
+                    url,
+                    data=payload,
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {self.line_channel_access_token}"
+                    }
+                )
+                with urllib.request.urlopen(req, timeout=8) as _:
+                    pass
+                logger.info("📱 LINE 推播通知已成功送達")
+            except Exception as e:
+                logger.error(f"❌ LINE 推播發送異常: {e}")
+
+        # 5. LINE Notify (舊版備援)
         if self.line_token:
             try:
                 url = "https://notify-api.line.me/api/notify"
