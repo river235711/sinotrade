@@ -1036,16 +1036,16 @@ class ShioajiTMFTrader:
 
                 # 交易日清晨開盤前待機 (00:00:00 ~ 08:44:59)
                 if now_str < "08:45:00":
-                    if now_str >= "08:40:00" and not getattr(self, "_morning_wake_logged", False):
+                    if now_str >= "08:35:00" and not getattr(self, "_morning_wake_logged", False):
                         self._morning_wake_logged = True
-                        logger.info(f"🌅 [{now_str}] 早盤開盤倒數中！Shioaji 連線正常，準備迎接 08:45:00 首根 K 棒！")
-                        self.notifier.send(
-                            f"🌅 [08:40 早盤喚醒自檢完成]\n"
-                            f"TMF 自動當沖系統已就緒，等待 08:45:00 日盤開盤！\n"
-                            f"• 交易模式: {'模擬 (Paper)' if self.simulation else '實盤 (Live)'}\n"
-                            f"• 下單口數: {self.quantity} 口\n"
-                            f"• 參數配置: {describe(strat_cfg, atr_info)}"
-                        )
+                        logger.info(f"🌅 [{now_str}] 執行開盤前全系統自動健康巡檢 (Pre-Market Health Check)...")
+                        try:
+                            from health_check import run_health_check
+                            mode_str = "paper" if self.simulation else "live"
+                            run_health_check(mode=mode_str, qty=self.quantity, send_notify=True)
+                        except Exception as hc_err:
+                            logger.error(f"健康巡檢執行異常: {hc_err}")
+                            self.notifier.send(f"⚠️ [08:35 開盤前健檢異常] {hc_err}")
                     elif time.time() - last_standby_log >= 1800.0:
                         last_standby_log = time.time()
                         logger.info(f"🌙 [{now_str}] 開盤前待命守護中 (帳上零部位)，等待今日 08:45:00 日盤開盤...")
