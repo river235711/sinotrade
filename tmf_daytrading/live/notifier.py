@@ -45,6 +45,7 @@ class TradeNotifier:
         # LINE Messaging API (LINE 官方帳號)
         self.line_channel_access_token = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
         self.line_user_id = os.environ.get("LINE_USER_ID", "").strip()
+        self._line_cooldown_until = 0.0  # 額度用盡或認證失敗時的冷卻時間戳 (秒)
 
         # Gmail 設定
         self.notify_email = os.environ.get("NOTIFY_EMAIL", "").strip() or "river235711@gmail.com"
@@ -70,19 +71,30 @@ class TradeNotifier:
         )
 
     def send(self, text: str, subject: str = None, async_send: bool = True):
-        """發送推播通知 (預設背景執行緒非阻塞發送，0ms 延遲不卡下單迴圈)"""
+        """
+        發送推播通知 (預設背景守護執行緒非阻塞發送，0ms 延遲不卡下單迴圈)
+        具備全隔離防護：即使外部推播服務掛掉或超額，也絕不影響交易主程序
+        """
         if not self.enabled:
             return
-        if async_send:
-            t = threading.Thread(target=self._send_sync, args=(text, subject), daemon=True)
-            t.start()
-        else:
-            self._send_sync(text, subject)
+        try:
+            if async_send:
+                t = threading.Thread(target=self._send_sync, args=(text, subject), daemon=True)
+                t.start()
+            else:
+                self._send_sync(text, subject)
+        except Exception as e:
+            # 極端防護：即使建立執行緒失敗，也絕不向上拋出例外中斷交易主迴圈
+            logger.error(f"⚠️ [通知模組背景調度異常] {e} (已安全略過，交易正常進行)")
 
     def _send_sync(self, text: str, subject: str = None):
-        # 1. Gmail Email 發送
-        if self.email_enabled:
-            self._send_email_sync(text, subject)
+        """同步發送通知 (各通知通道完全獨立隔離，單一通道失敗絕不波及其他通道)"""
+        try:
+            # 1. Gmail Email 發送
+            if self.email_enabled:
+                self._send_email_sync(text, subject)
+        except Exception as e:
+            logger.error(f"Gmail 發送異常 (已隔離): {e}")
 
         # 2. Telegram Bot
         if self.tg_token and self.tg_chat_id:
@@ -95,7 +107,7 @@ class TradeNotifier:
                 req = urllib.request.Request(
                     url, data=payload, headers={"Content-Type": "application/json"}
                 )
-                with urllib.request.urlopen(req, timeout=5) as _:
+                with urllib.request.urlopen(req, timeout=4) as _:
                     pass
             except Exception as e:
                 logger.debug(f"Telegram 推播失敗: {e}")
@@ -109,13 +121,18 @@ class TradeNotifier:
                     data=payload,
                     headers={"Content-Type": "application/json", "User-Agent": "TMFBot/1.0"},
                 )
-                with urllib.request.urlopen(req, timeout=5) as _:
+                with urllib.request.urlopen(req, timeout=4) as _:
                     pass
             except Exception as e:
                 logger.debug(f"Discord 推播失敗: {e}")
 
-        # 4. LINE Messaging API (LINE 官方帳號 Push Message)
+        # 4. LINE Messaging API (LINE 官方帳號 Push Message，具備熔斷降級機制)
         if self.line_messaging_enabled:
+            import time
+            if time.time() < self._line_cooldown_until:
+                # 處於額度用盡或錯誤冷卻期，靜默略過避免無效消耗網路資源
+                return
+
             try:
                 url = "https://api.line.me/v2/bot/message/push"
                 payload = json.dumps({
@@ -130,11 +147,26 @@ class TradeNotifier:
                         "Authorization": f"Bearer {self.line_channel_access_token}"
                     }
                 )
-                with urllib.request.urlopen(req, timeout=8) as _:
+                with urllib.request.urlopen(req, timeout=4) as _:
                     pass
                 logger.info("📱 LINE 推播通知已成功送達")
+            except urllib.error.HTTPError as http_err:
+                err_body = ""
+                try:
+                    err_body = http_err.read().decode("utf-8")
+                except Exception:
+                    pass
+                # 429 額度用盡或 401 憑證失效：啟動 1 小時自動熔斷冷卻，不頻繁撞牆
+                if http_err.code in (429, 403):
+                    self._line_cooldown_until = time.time() + 3600.0
+                    logger.warning(f"⚠️ [LINE 推播額度已滿或被限制 (HTTP {http_err.code})] 已啟動自動熔斷保護 (冷卻 1 小時)，期間由 Gmail 正常接管通知！")
+                elif http_err.code == 401:
+                    self._line_cooldown_until = time.time() + 7200.0
+                    logger.warning(f"⚠️ [LINE Token 認證失效 (HTTP 401)] 請檢查 LINE_CHANNEL_ACCESS_TOKEN。由 Gmail 正常接管通知。")
+                else:
+                    logger.error(f"❌ LINE 推播 HTTP 異常 (代碼 {http_err.code}): {err_body}")
             except Exception as e:
-                logger.error(f"❌ LINE 推播發送異常: {e}")
+                logger.error(f"❌ LINE 推播發送異常 (已安全隔離): {e}")
 
         # 5. LINE Notify (舊版備援)
         if self.line_token:
