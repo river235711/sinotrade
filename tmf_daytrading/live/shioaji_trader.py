@@ -957,8 +957,13 @@ class ShioajiTMFTrader:
                     self.order_failures = 0
                     strat_cfg, atr_info = config_for_date(base_cfg, data_dir, active_date_str)
                     strategy = ORBStrategy(config=strat_cfg, inst_config=InstrumentConfig())
+                    
+                    # 結算日跨月自動換約檢查：重新解析 TMFR1 當前主力月份合約 (例如 11月 TMFK6 -> 12月 TMFL6)
+                    self.load_tmf_contract(self._contract_code)
+
                     logger.info("=" * 75)
                     logger.info(f"🌅 [跨日自動換日] 進入新交易日 {active_date_str}，已重新載入今日 20日 ATR 動態參數：")
+                    logger.info(f"• 當前主力合約: {self.contract.code} - {self.contract.name}")
                     logger.info(f"• 波動自適應: {describe(strat_cfg, atr_info)}")
                     logger.info("=" * 75)
 
