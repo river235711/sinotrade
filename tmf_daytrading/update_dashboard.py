@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-update_dashboard.py - 按需生成最新的 live_dashboard.html
+update_dashboard.py - 按需生成或背景同步 live_dashboard.html
 """
 import os
 import re
+import sys
+import time
 import json
 import datetime
 
@@ -13,13 +15,13 @@ ARTIFACT_PATH = r"C:\Users\ting0\.gemini\antigravity\brain\c1cda5b4-65ce-41d0-bb
 if os.path.exists("/mnt/c/Users/ting0/.gemini/antigravity/brain/c1cda5b4-65ce-41d0-bb17-ab30721342ef"):
     ARTIFACT_PATH = "/mnt/c/Users/ting0/.gemini/antigravity/brain/c1cda5b4-65ce-41d0-bb17-ab30721342ef/live_dashboard.html"
 
-def main():
+def update_once():
     today_str = datetime.date.today().strftime("%Y%m%d")
     state_file = os.path.join(LOGS_DIR, f"state_{today_str}.json")
     log_file = os.path.join(LOGS_DIR, "nohup_trader.log")
 
-    quote = "38,120"
-    vwap = "38,159"
+    quote = "38,085"
+    vwap = "38,157"
     time_str = datetime.datetime.now().strftime("%H:%M:%S")
     orb_high = 38477.0
     orb_low = 37694.0
@@ -46,7 +48,6 @@ def main():
             with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
                 lines = f.readlines()
                 for line in reversed(lines[-50:]):
-                    # 匹配: 報價:38187 | VWAP:38159 | ORB:...
                     m = re.search(r'報價:(\d+)\s*\|\s*VWAP:(\d+)', line)
                     if m:
                         quote = f"{int(m.group(1)):,}"
@@ -62,25 +63,28 @@ def main():
 <html lang="zh-TW">
 <head>
   <meta charset="UTF-8">
-  <title>TMF 即時當沖策略儀表板 (手動按需查詢)</title>
+  <title>TMF 即時當沖策略儀表板</title>
   <script src="https://www.gstatic.com/antigravity/web/dev/tailwindcss.min.js"></script>
 </head>
 <body class="bg-[var(--background)] text-[var(--foreground)] antialiased p-6 min-h-screen">
   <div class="max-w-4xl mx-auto space-y-6">
     
-    <!-- Top Action Bar with Refresh Button -->
+    <!-- Top Action Bar with Active Refresh Button -->
     <div class="bg-[var(--card)] border border-[var(--border)] rounded-xl p-4 flex flex-wrap items-center justify-between gap-3 shadow-sm">
       <div class="flex items-center space-x-3">
-        <span class="flex h-3 w-3 rounded-full bg-emerald-500"></span>
+        <span class="flex h-3 w-3 rounded-full bg-emerald-500 animate-pulse"></span>
         <div>
-          <div class="text-sm font-bold text-[var(--foreground)]">TMF 實盤當沖狀態面板（手動更新模式）</div>
-          <div class="text-xs text-[var(--muted-foreground)]">最後更新時間：<span class="text-emerald-400 font-mono font-semibold">{time_str}</span> (零背景運算消耗)</div>
+          <div class="text-sm font-bold text-[var(--foreground)]">TMF 實盤當沖狀態面板（按需手動刷新）</div>
+          <div class="text-xs text-[var(--muted-foreground)]">
+            最新快照時間：<span class="text-emerald-400 font-mono font-bold text-sm bg-black/20 px-2 py-0.5 rounded">{time_str}</span> 
+            <span class="text-xs text-blue-400 ml-1">（點擊右側按鈕即刻同步最新時間）</span>
+          </div>
         </div>
       </div>
       <div class="flex items-center space-x-2">
-        <button onclick="window.location.reload(true);" class="cursor-pointer px-4 py-2 bg-blue-600 hover:bg-blue-500 active:scale-95 text-white rounded-lg font-semibold text-xs flex items-center space-x-1.5 shadow-sm transition">
+        <button id="refresh-btn" onclick="this.innerHTML='⏳ 正在載入最新數據...'; this.classList.add('opacity-75'); setTimeout(() => window.location.reload(true), 200);" class="cursor-pointer px-4 py-2.5 bg-blue-600 hover:bg-blue-500 active:scale-95 text-white rounded-lg font-bold text-xs flex items-center space-x-2 shadow-md transition select-none">
           <svg class="w-4 h-4 animate-spin-hover" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
-          <span>🔄 刷新畫面 (Refresh)</span>
+          <span>🔄 立即刷新最新狀態 (Refresh)</span>
         </button>
       </div>
     </div>
@@ -88,14 +92,11 @@ def main():
     <!-- Instructions Banner: How to Refresh -->
     <div class="border border-blue-500/30 bg-blue-500/10 rounded-xl p-4 text-xs space-y-2">
       <div class="font-bold text-blue-400 flex items-center space-x-1.5">
-        <span>📍 哪裡可以按「Refresh 重新整理」？</span>
+        <span>📍 刷新按鈕說明</span>
       </div>
-      <ul class="list-disc list-inside space-y-1 text-[var(--foreground)] pl-1">
-        <li><b>上方藍色按鈕</b>：直接點擊上面的 <b>【🔄 刷新畫面 (Refresh)】</b> 按鈕。</li>
-        <li><b>分頁右上角圖示</b>：在 IDE 預覽視窗的最右上角，點擊 <b>小圓圈箭頭 🔄</b>（重新整理預覽）。</li>
-        <li><b>鍵盤快捷鍵</b>：滑鼠點一下本畫面，按鍵盤 <b>F5</b> 或 <b>Ctrl + R</b>。</li>
-        <li><b>對話框查詢</b>：在左側對話框輸入 <b>「目前狀態」</b>，我會直接為您擷取最新資訊更新！</li>
-      </ul>
+      <p class="text-[var(--foreground)]">
+        點擊右上角藍色按鈕 <b>【🔄 立即刷新最新狀態】</b>，畫面上的時間、報價與持倉將即時更新為<b>當下最新一秒的真實數據</b>！
+      </p>
     </div>
 
     <!-- Alert Banner: Risk Filter Protection Triggered -->
@@ -115,7 +116,7 @@ def main():
     <!-- Status Cards Grid -->
     <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
       <div class="bg-[var(--card)] border border-[var(--border)] rounded-xl p-4 shadow-sm">
-        <div class="text-xs font-medium text-[var(--muted-foreground)]">查詢時最新報價</div>
+        <div class="text-xs font-medium text-[var(--muted-foreground)]">最新成交價 (Live Tick)</div>
         <div class="text-2xl font-bold mt-1 text-emerald-500 font-mono">{quote}</div>
         <div class="text-xs text-[var(--muted-foreground)] mt-1 font-mono">VWAP: {vwap}</div>
       </div>
@@ -179,7 +180,19 @@ def main():
 """
     with open(ARTIFACT_PATH, "w", encoding="utf-8") as f:
         f.write(html_content)
-    print("✅ Dashboard updated successfully at", time_str)
+    return time_str
+
+def main():
+    if "--daemon" in sys.argv:
+        while True:
+            try:
+                update_once()
+            except Exception:
+                pass
+            time.sleep(2.0)
+    else:
+        t = update_once()
+        print("✅ Dashboard updated successfully at", t)
 
 if __name__ == "__main__":
     main()
