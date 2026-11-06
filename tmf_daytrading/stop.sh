@@ -34,5 +34,4 @@ if [ -n "$PIDS_LEFT" ]; then
 fi
 
 echo "✅ 機器人程序已成功停止！"
-pkill -f "update_dashboard.py" 2>/dev/null
 echo "================================================================="
