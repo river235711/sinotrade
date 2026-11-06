@@ -64,6 +64,8 @@ class ORBStrategyConfig:
     max_breakout_chase_pts: float = 60.0     # 突破後等待 VWAP/EMA 均線共振允許的最大追價距離 (60 點，防漏單同時不追高)
     max_orb_range_pts: float = 320.0         # 09:00~09:15 ORB 區間最大允許寬度 (超過 320 點代表早盤空間耗盡，09:16 後不追突破)
     use_vwap_ema_filter: bool = True         # 啟用 VWAP + EMA9/EMA21 順勢濾網
+    use_overnight_wall_filter: bool = True   # 啟用機制二：夜盤高低點防撞牆保護濾網 (Overnight Wall Filter)
+    overnight_wall_threshold_pts: float = 40.0 # 防撞牆保護門檻：當 ORB 上/下界距離夜高/夜低 <= 40 點時，需實質突破夜盤極值才進場
     enable_sar: bool = True                  # 啟用早盤假突破停損反手 (Stop & Reverse)
     max_initial_trades: int = 1              # 每日首次突破進場上限 (1 次，若假突破可反手 1 次)
 

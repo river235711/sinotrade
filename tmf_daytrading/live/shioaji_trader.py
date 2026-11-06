@@ -891,6 +891,57 @@ class ShioajiTMFTrader:
         self._post_trade_check(strategy, act, result)
         self._save_state(strategy)
 
+    def load_overnight_levels_for_strategy(self, strategy: ORBStrategy, target_date_str: str):
+        """讀取或查詢指定交易日所對應的前一日夜盤 (15:00~05:00) 極值並注入策略 (防撞牆保護 Wall Filter)"""
+        if not getattr(strategy.config, "use_overnight_wall_filter", False):
+            return
+
+        data_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
+        # 1. 優先從本地高低點彙整表讀取
+        for fn in ["overnight_levels_30days.csv", "overnight_levels_summary.csv"]:
+            lvl_path = os.path.join(data_dir, fn)
+            if os.path.exists(lvl_path):
+                try:
+                    df_lvl = pd.read_csv(lvl_path)
+                    match_row = df_lvl[df_lvl["trading_date"] == target_date_str]
+                    if not match_row.empty:
+                        o_h = float(match_row.iloc[0]["night_high"])
+                        o_l = float(match_row.iloc[0]["night_low"])
+                        strategy.set_overnight_levels(o_h, o_l)
+                        logger.info(f"🌙 [夜盤防撞牆] 已載入 {target_date_str} 夜盤極值: 夜高={o_h:.0f}, 夜低={o_l:.0f} (門檻={getattr(strategy.config, 'overnight_wall_threshold_pts', 40.0):.0f}點)")
+                        return
+                except Exception as e:
+                    logger.debug(f"讀取 {fn} 失敗: {e}")
+
+        # 2. 若本地無紀錄且 API 可用，即時從 Shioaji 抓取前一日夜盤 15:00~05:00
+        if self.api is not None and not self.simulation:
+            try:
+                cur_d = datetime.datetime.strptime(target_date_str, "%Y-%m-%d").date()
+                prev_4d = (cur_d - datetime.timedelta(days=4)).strftime("%Y-%m-%d")
+                kbs = self.api.kbars(self.contract, start=prev_4d, end=target_date_str, timeout=5000)
+                df_k = pd.DataFrame({**kbs})
+                if not df_k.empty:
+                    df_k.columns = [c.lower() for c in df_k.columns]
+                    df_k["ts"] = pd.to_datetime(df_k["ts"])
+                    end_night = datetime.datetime.combine(cur_d, datetime.time(5, 0, 0))
+                    start_night = datetime.datetime.combine(cur_d - datetime.timedelta(days=4), datetime.time(15, 0, 0))
+                    subset = df_k[(df_k["ts"] >= start_night) & (df_k["ts"] <= end_night)]
+                    evening_bars = subset[subset["ts"].dt.hour >= 15]
+                    if not evening_bars.empty:
+                        last_ev_date = evening_bars["ts"].dt.date.max()
+                        night_start_exact = datetime.datetime.combine(last_ev_date, datetime.time(15, 0, 0))
+                        night_bars = df_k[(df_k["ts"] >= night_start_exact) & (df_k["ts"] <= end_night)]
+                        if not night_bars.empty:
+                            o_h = float(night_bars["high"].max())
+                            o_l = float(night_bars["low"].min())
+                            strategy.set_overnight_levels(o_h, o_l)
+                            logger.info(f"🌙 [夜盤防撞牆] 從 API 即時取得 {target_date_str} 夜盤極值: 夜高={o_h:.0f}, 夜低={o_l:.0f}")
+                            return
+            except Exception as api_err:
+                logger.warning(f"從 API 抓取夜盤極值略過: {api_err}")
+
+        logger.info(f"ℹ️ {target_date_str} 未取得前一日夜盤極值 (或前日休市無夜盤)，維持標準 ORB 模式運作")
+
     def run_intraday_bot(self, strat_cfg: ORBStrategyConfig = None):
         """
         啟動日盤全自動監控與下單迴圈 (08:45 ~ 13:24)
@@ -902,6 +953,7 @@ class ShioajiTMFTrader:
         today_str = datetime.date.today().strftime("%Y-%m-%d")
         strat_cfg, atr_info = config_for_date(base_cfg, data_dir, today_str)
         strategy = ORBStrategy(config=strat_cfg, inst_config=InstrumentConfig())
+        self.load_overnight_levels_for_strategy(strategy, today_str)
         last_reconcile = time.time()
         last_state_save = time.time()
         last_heartbeat_time = time.time()
@@ -957,6 +1009,7 @@ class ShioajiTMFTrader:
                     self.order_failures = 0
                     strat_cfg, atr_info = config_for_date(base_cfg, data_dir, active_date_str)
                     strategy = ORBStrategy(config=strat_cfg, inst_config=InstrumentConfig())
+                    self.load_overnight_levels_for_strategy(strategy, active_date_str)
                     
                     # 結算日跨月自動換約檢查：重新解析 TMFR1 當前主力月份合約 (例如 11月 TMFK6 -> 12月 TMFL6)
                     self.load_tmf_contract(self._contract_code)
@@ -1084,12 +1137,24 @@ class ShioajiTMFTrader:
                         orb_h, orb_l = strategy.calculate_orb_levels(kbars)
                         if orb_h and orb_l:
                             logger.info(f"📌 今日現貨開盤區間 ({strat_cfg.orb_start_time}~{strat_cfg.orb_end_time}) 已鎖定: 上界={orb_h:.0f}, 下界={orb_l:.0f} (振幅={orb_h-orb_l:.0f}點)")
+                            
+                            # 檢查夜盤防撞牆狀態
+                            wall_msg = ""
+                            if getattr(strategy.config, "use_overnight_wall_filter", False):
+                                thresh_pts = getattr(strategy.config, "overnight_wall_threshold_pts", 40.0)
+                                if strategy.overnight_high is not None and strategy.orb_high < strategy.overnight_high and (strategy.overnight_high - strategy.orb_high) <= thresh_pts:
+                                    wall_msg += f"\n• 🛡️ 啟動做多防撞牆: ORB上界距夜高僅 {strategy.overnight_high - strategy.orb_high:.0f} 點，需突破夜高 {strategy.overnight_high:.0f} 才開多！"
+                                if strategy.overnight_low is not None and strategy.orb_low > strategy.overnight_low and (strategy.orb_low - strategy.overnight_low) <= thresh_pts:
+                                    wall_msg += f"\n• 🛡️ 啟動做空防撞地: ORB下界距夜低僅 {strategy.orb_low - strategy.overnight_low:.0f} 點，需跌破夜低 {strategy.overnight_low:.0f} 才開空！"
+                                if not wall_msg and strategy.overnight_high is not None and strategy.overnight_low is not None:
+                                    wall_msg += f"\n• 🌙 夜盤參考水位: 夜高 {strategy.overnight_high:.0f} / 夜低 {strategy.overnight_low:.0f} (距離安全)"
+
                             self.notifier.send(
                                 f"📌 [09:15 ORB 區間確立]\n"
                                 f"現貨開盤 15 分鐘關鍵區間已鎖定！\n"
                                 f"• 突破做多界線: {orb_h:.0f}\n"
                                 f"• 跌破做空界線: {orb_l:.0f}\n"
-                                f"• 今日開盤振幅: {orb_h - orb_l:.0f} 點\n"
+                                f"• 今日開盤振幅: {orb_h - orb_l:.0f} 點{wall_msg}\n"
                                 f"• 09:16 起啟動順勢突破監控！"
                             )
 

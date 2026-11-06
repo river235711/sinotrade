@@ -32,6 +32,8 @@ class ORBStrategy:
         self.orb_high = None
         self.orb_low = None
         self.orb_calculated = False
+        self.overnight_high = None
+        self.overnight_low = None
         
         self.position = 0             # 0: 無部位, 1: 多單, -1: 空單
         self.entry_price = 0.0
@@ -39,6 +41,11 @@ class ORBStrategy:
         self.highest_profit = 0.0     # 用於保本鎖利與移動停利計算
         self.trade_count = 0
         self.trades: List[Dict[str, Any]] = []
+
+    def set_overnight_levels(self, overnight_high: float = None, overnight_low: float = None):
+        """設定當日對應之前一日夜盤 (15:00~05:00) 最高價與最低價，供防撞牆保護濾網使用"""
+        self.overnight_high = float(overnight_high) if overnight_high is not None and pd.notna(overnight_high) else None
+        self.overnight_low = float(overnight_low) if overnight_low is not None and pd.notna(overnight_low) else None
 
     def prepare_indicators(self, kbars: pd.DataFrame) -> pd.DataFrame:
         """計算日內 VWAP 與 EMA9 / EMA21 指標"""
@@ -360,32 +367,61 @@ class ORBStrategy:
             long_filter = (not self.config.use_vwap_ema_filter) or (c > vwap and ema9 > ema21)
             short_filter = (not self.config.use_vwap_ema_filter) or (c < vwap and ema9 < ema21)
 
-            # 向上突破開盤高點 (含突破後等待 EMA 共振確認，只要未超過追價上限 max_chase 皆可進場)
-            if self.orb_high < c <= (self.orb_high + max_chase) and long_filter:
+            # 計算進場門檻 (含夜盤防撞牆保護 Wall Filter)
+            buy_threshold = self.orb_high
+            sell_threshold = self.orb_low
+            wall_filter_active_long = False
+            wall_filter_active_short = False
+
+            if getattr(self.config, "use_overnight_wall_filter", False):
+                thresh_pts = getattr(self.config, "overnight_wall_threshold_pts", 40.0)
+                # 做多防撞牆：若 ORB 上界在夜高下方且距離 <= 門檻點數，需突破夜高才進場
+                if (self.overnight_high is not None and 
+                    self.orb_high < self.overnight_high and 
+                    (self.overnight_high - self.orb_high) <= thresh_pts):
+                    buy_threshold = self.overnight_high
+                    wall_filter_active_long = True
+
+                # 做空防撞地：若 ORB 下界在夜檔上方且距離 <= 門檻點數，需跌破夜低才進場
+                if (self.overnight_low is not None and 
+                    self.orb_low > self.overnight_low and 
+                    (self.orb_low - self.overnight_low) <= thresh_pts):
+                    sell_threshold = self.overnight_low
+                    wall_filter_active_short = True
+
+            can_buy = (buy_threshold < c <= (buy_threshold + max_chase)) and long_filter
+            can_sell = ((sell_threshold - max_chase) <= c < sell_threshold) and short_filter
+
+            if can_buy:
                 self.position = 1
                 self.entry_price = c
                 self.entry_time = ts
                 self.trade_count += 1
                 self.highest_profit = 0.0
+                detail_str = f"突破現貨開盤高點 ({self.orb_high:.0f})"
+                if wall_filter_active_long:
+                    detail_str = f"突破夜高防撞牆 ({self.overnight_high:.0f}，原ORB上界{self.orb_high:.0f})"
                 return {
                     "action": "BUY", 
                     "price": c, 
                     "time": ts,
-                    "detail": f"突破現貨開盤高點 ({self.orb_high:.0f}) + VWAP/EMA 多頭確認"
+                    "detail": f"{detail_str} + VWAP/EMA 多頭確認"
                 }
 
-            # 向下跌破開盤低點 (含跌破後等待 EMA 共振確認，只要未超過追價上限 max_chase 皆可進場)
-            elif (self.orb_low - max_chase) <= c < self.orb_low and short_filter:
+            elif can_sell:
                 self.position = -1
                 self.entry_price = c
                 self.entry_time = ts
                 self.trade_count += 1
                 self.highest_profit = 0.0
+                detail_str = f"跌破現貨開盤低點 ({self.orb_low:.0f})"
+                if wall_filter_active_short:
+                    detail_str = f"跌破夜低防撞牆 ({self.overnight_low:.0f}，原ORB下界{self.orb_low:.0f})"
                 return {
                     "action": "SELL", 
                     "price": c, 
                     "time": ts,
-                    "detail": f"跌破現貨開盤低點 ({self.orb_low:.0f}) + VWAP/EMA 空頭確認"
+                    "detail": f"{detail_str} + VWAP/EMA 空頭確認"
                 }
 
         return action_result

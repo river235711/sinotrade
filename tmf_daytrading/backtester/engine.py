@@ -101,6 +101,25 @@ class BacktestEngine:
             eff_cfg, atr_info = config_for_date(base_cfg, data_dir, self.target_date_fmt)
 
         strategy = ORBStrategy(config=eff_cfg, inst_config=self.inst_config)
+
+        # 若啟用夜盤防撞牆濾網，載入該日對應之前一日夜盤極值
+        if getattr(eff_cfg, "use_overnight_wall_filter", False) and self.target_date_fmt:
+            data_dir = os.path.dirname(os.path.abspath(self.data_path))
+            for fn in ["overnight_levels_30days.csv", "overnight_levels_summary.csv"]:
+                levels_file = os.path.join(data_dir, fn)
+                if os.path.exists(levels_file):
+                    try:
+                        df_lvl = pd.read_csv(levels_file)
+                        match_row = df_lvl[df_lvl["trading_date"] == self.target_date_fmt]
+                        if not match_row.empty:
+                            strategy.set_overnight_levels(
+                                overnight_high=match_row.iloc[0]["night_high"],
+                                overnight_low=match_row.iloc[0]["night_low"]
+                            )
+                            break
+                    except Exception:
+                        pass
+
         self.kbars = strategy.prepare_indicators(self.kbars)
         orb_high, orb_low = strategy.calculate_orb_levels(self.kbars)
 
