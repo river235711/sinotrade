@@ -3,7 +3,7 @@
 BASE_DIR="/mnt/c/Users/ting0/.gemini/antigravity/scratch/tmf_daytrading"
 cd "$BASE_DIR"
 
-PID=$(pgrep -f "python.*main.py" | head -n 1)
+PID=$(pgrep -f "main\.py --mode" | head -n 1)
 
 echo "================================================================="
 echo "📊 TMF 微型臺指期當沖機器人 - 運行狀態巡檢"

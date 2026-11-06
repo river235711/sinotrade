@@ -3,7 +3,7 @@
 BASE_DIR="/mnt/c/Users/ting0/.gemini/antigravity/scratch/tmf_daytrading"
 cd "$BASE_DIR"
 
-PIDS=$(pgrep -f "python.*main.py")
+PIDS=$(pgrep -f "main\.py --mode")
 
 echo "================================================================="
 echo "🛑 安全停止 TMF 微型臺指期當沖機器人"
@@ -20,13 +20,13 @@ kill -INT $PIDS 2>/dev/null
 
 for i in {1..5}; do
     sleep 1
-    PIDS_LEFT=$(pgrep -f "python.*main.py")
+    PIDS_LEFT=$(pgrep -f "main\.py --mode")
     if [ -z "$PIDS_LEFT" ]; then
         break
     fi
 done
 
-PIDS_LEFT=$(pgrep -f "python.*main.py")
+PIDS_LEFT=$(pgrep -f "main\.py --mode")
 if [ -n "$PIDS_LEFT" ]; then
     echo "⚠️ 程式未於 5 秒內優雅退出，強制終止 (PID: $PIDS_LEFT)..."
     kill -9 $PIDS_LEFT 2>/dev/null
