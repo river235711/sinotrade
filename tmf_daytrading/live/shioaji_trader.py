@@ -24,6 +24,8 @@ from config import InstrumentConfig, ORBStrategyConfig, ShioajiConfig
 from strategies.orb_strategy import ORBStrategy
 from strategies.atr_scaler import config_for_date, describe
 from live.notifier import TradeNotifier
+from live.bar_aggregator import BarAggregator
+from live.state_manager import StateManager
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger("ShioajiTrader")
@@ -61,11 +63,17 @@ class ShioajiTMFTrader:
         self._contract_code = "TMFR1"
         self.notifier = TradeNotifier()
         self._last_reconnect_time = 0.0
-        self._realtime_bars = {}                # 即時 Tick 聚合之 1分K 快取: {pd.Timestamp: dict}
-        self._history_loaded = False            # 是否已完成當日早盤歷史 1分K 初始載入
-        self._kbars_disabled = bool(simulation) # 模擬環境直接使用 Tick+Snapshot+高速回補，避開 kbars 30s 逾時
-        self._last_tick_time = 0.0              # 最近一次收到即時 Tick 的時間戳 (秒)
-        self._last_snap_time = 0.0              # 最近一次呼叫 Snapshot 的時間戳 (秒)
+
+        # 成交確認參數
+        self.fill_timeout = 10.0                # 等待成交的秒數
+        self.fill_poll_interval = 0.5           # 輪詢委託狀態的間隔秒數
+        self.retry_pause = 1.0                  # 平倉重試之間的等待秒數
+        self.reconcile_interval = 30.0          # 平時對帳間隔秒數
+        self.log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
+
+        # 核心解耦模組：K 棒聚合器與狀態持久化管理器
+        self.bar_aggregator = BarAggregator(kbars_disabled=bool(simulation))
+        self.state_manager = StateManager(log_dir=self.log_dir)
 
         # 風控狀態
         self.is_kill_switch_triggered = False   # True 時拒絕所有委託 (含平倉)，僅供緊急手動使用
@@ -74,12 +82,48 @@ class ShioajiTMFTrader:
         self.order_failures = 0                 # 開倉單連續未成交次數
         self.max_order_failures = 3
 
-        # 成交確認參數
-        self.fill_timeout = 10.0                # 等待成交的秒數
-        self.fill_poll_interval = 0.5           # 輪詢委託狀態的間隔秒數
-        self.retry_pause = 1.0                  # 平倉重試之間的等待秒數
-        self.reconcile_interval = 30.0          # 平時對帳間隔秒數
-        self.log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
+    # ------------------------------------------------------------------
+    # 向後相容屬性映射 (保持對既有私有屬性之存取相容)
+    # ------------------------------------------------------------------
+    @property
+    def _realtime_bars(self):
+        return self.bar_aggregator._bars
+
+    @_realtime_bars.setter
+    def _realtime_bars(self, val):
+        self.bar_aggregator._bars = val
+
+    @property
+    def _history_loaded(self) -> bool:
+        return self.bar_aggregator.history_loaded
+
+    @_history_loaded.setter
+    def _history_loaded(self, val: bool):
+        self.bar_aggregator.history_loaded = val
+
+    @property
+    def _kbars_disabled(self) -> bool:
+        return self.bar_aggregator.kbars_disabled
+
+    @_kbars_disabled.setter
+    def _kbars_disabled(self, val: bool):
+        self.bar_aggregator.kbars_disabled = val
+
+    @property
+    def _last_tick_time(self) -> float:
+        return self.bar_aggregator.last_tick_time
+
+    @_last_tick_time.setter
+    def _last_tick_time(self, val: float):
+        self.bar_aggregator.last_tick_time = val
+
+    @property
+    def _last_snap_time(self) -> float:
+        return self.bar_aggregator.last_snap_time
+
+    @_last_snap_time.setter
+    def _last_snap_time(self, val: float):
+        self.bar_aggregator.last_snap_time = val
 
     # ------------------------------------------------------------------
     # 連線與合約
@@ -154,7 +198,7 @@ class ShioajiTMFTrader:
 
             logger.info(f"已綁定交易合約: {self.contract.code} - {self.contract.name}")
 
-            # 訂閱即時逐筆 Tick 報價，直接於本地記憶體即時合成 1分K (零延遲、防 kbars 逾時)
+            # 訂閱即時逐筆 Tick 報價，委由 BarAggregator 零延遲即時合成 1分K
             try:
                 import shioaji as sj
                 @self.api.on_tick_fop_v1()
@@ -165,21 +209,8 @@ class ShioajiTMFTrader:
                         vol = int(tick.volume)
                         if price <= 0:
                             return
-                        self._last_tick_time = time.time()
                         dt = datetime.datetime.combine(tick.date, tick.time)
-                        bar_ts = pd.Timestamp(dt.replace(second=0, microsecond=0))
-                        b = self._realtime_bars.get(bar_ts)
-                        if b is None:
-                            self._realtime_bars[bar_ts] = {
-                                "open": price, "high": price, "low": price, "close": price, "volume": vol
-                            }
-                        else:
-                            if price > b["high"]:
-                                b["high"] = price
-                            if price < b["low"]:
-                                b["low"] = price
-                            b["close"] = price
-                            b["volume"] += vol
+                        self.bar_aggregator.update_tick(price, vol, dt)
                     except Exception:
                         pass
 
@@ -395,44 +426,16 @@ class ShioajiTMFTrader:
         return self.get_real_position_details()["net"]
 
     def _get_state_path(self) -> str:
-        today_str = datetime.date.today().strftime("%Y%m%d")
-        return os.path.join(self.log_dir, f"state_{today_str}.json")
+        """取得當日策略狀態檔路徑 (委由 StateManager 管理)"""
+        return self.state_manager.get_state_path()
 
     def _save_state(self, strategy: ORBStrategy):
-        """將當日策略即時狀態保存至 logs/state_YYYYMMDD.json"""
-        try:
-            os.makedirs(self.log_dir, exist_ok=True)
-            path = self._get_state_path()
-            state = {
-                "date": datetime.date.today().strftime("%Y-%m-%d"),
-                "updated_at": datetime.datetime.now().strftime("%H:%M:%S"),
-                "position": int(strategy.position),
-                "entry_price": float(strategy.entry_price),
-                "entry_time": str(strategy.entry_time) if strategy.entry_time is not None else None,
-                "highest_profit": float(strategy.highest_profit),
-                "trade_count": int(strategy.trade_count),
-                "orb_high": float(strategy.orb_high) if strategy.orb_high is not None else None,
-                "orb_low": float(strategy.orb_low) if strategy.orb_low is not None else None,
-                "orb_calculated": bool(strategy.orb_calculated),
-                "entries_halted": bool(self.entries_halted),
-            }
-            tmp_path = path + ".tmp"
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(state, f, ensure_ascii=False, indent=2)
-            os.replace(tmp_path, path)
-        except Exception as e:
-            logger.warning(f"保存策略狀態失敗: {e}")
+        """將當日策略即時狀態保存至 logs/state_YYYYMMDD.json (委由 StateManager 管理)"""
+        return self.state_manager.save_state(strategy, entries_halted=self.entries_halted)
 
     def _load_state(self) -> Optional[dict]:
-        """讀取當日策略狀態檔 logs/state_YYYYMMDD.json"""
-        try:
-            path = self._get_state_path()
-            if os.path.exists(path):
-                with open(path, "r", encoding="utf-8") as f:
-                    return json.load(f)
-        except Exception as e:
-            logger.warning(f"讀取策略狀態失敗: {e}")
-        return None
+        """讀取當日策略狀態檔 logs/state_YYYYMMDD.json (委由 StateManager 管理)"""
+        return self.state_manager.load_state()
 
     def _reconcile_and_recover_on_startup(self, strategy: ORBStrategy, kbars: pd.DataFrame) -> set:
         """
@@ -749,13 +752,13 @@ class ShioajiTMFTrader:
             return pd.DataFrame()
 
     def fetch_today_day_kbars(self) -> pd.DataFrame:
-        """從 Shioaji 抓取今日日盤 (08:45 ~ 13:45) 1分K 資料 (支援即時 Tick 串流合成 + Snapshot 快照防逾時)"""
+        """從 Shioaji 抓取今日日盤 (08:45 ~ 13:45) 1分K 資料 (委由 BarAggregator 管理即時 Tick 串流合成 + Snapshot 快照防逾時)"""
         if self.api is None or self.contract is None:
             return pd.DataFrame()
         today_str = datetime.date.today().strftime("%Y-%m-%d")
 
         # 1. 若尚未載入早盤歷史 K 棒，先嘗試 Shioaji kbars (限時 5 秒避免卡死)
-        if not self._history_loaded and not self._kbars_disabled:
+        if not self.bar_aggregator.history_loaded and not self.bar_aggregator.kbars_disabled:
             try:
                 kbars = self.api.kbars(self.contract, start=today_str, end=today_str, timeout=5000)
                 df = pd.DataFrame({**kbars})
@@ -763,71 +766,39 @@ class ShioajiTMFTrader:
                     df["ts"] = pd.to_datetime(df["ts"])
                     df = df.set_index("ts")
                     df.columns = [c.lower() for c in df.columns]
-                    day_df = df[df.index.strftime("%Y-%m-%d") == today_str].between_time("08:45", "13:45")
-                    for ts, row in day_df.iterrows():
-                        if ts not in self._realtime_bars:
-                            self._realtime_bars[ts] = {
-                                "open": float(row["open"]),
-                                "high": float(row["high"]),
-                                "low": float(row["low"]),
-                                "close": float(row["close"]),
-                                "volume": int(row["volume"]),
-                            }
-                    if len(day_df) > 0:
-                        self._history_loaded = True
+                    self.bar_aggregator.load_history_kbars(df, today_str=today_str)
             except Exception:
-                self._kbars_disabled = True
+                self.bar_aggregator.kbars_disabled = True
                 logger.info("⚡ [高速模式] 永豐模擬環境 kbars 歷史查詢壅塞，已自動切換為「Shioaji 即時 Tick 串流 + Snapshot 快照 + 高速歷史回補」模式！")
 
         # 2. 若模擬環境 kbars 壅塞且尚未載入今日早盤歷史 K 棒，從備援通道一次性補齊
-        if self._kbars_disabled and not self._history_loaded:
+        if self.bar_aggregator.kbars_disabled and not self.bar_aggregator.history_loaded:
             backup_df = self._fetch_backup_intraday_kbars(today_str)
             if not backup_df.empty:
                 now_min = pd.Timestamp(datetime.datetime.now().replace(second=0, microsecond=0))
-                for ts, row in backup_df.iterrows():
-                    if ts not in self._realtime_bars or ts < now_min:
-                        self._realtime_bars[ts] = {
-                            "open": float(row["open"]),
-                            "high": float(row["high"]),
-                            "low": float(row["low"]),
-                            "close": float(row["close"]),
-                            "volume": max(int(row["volume"]), self._realtime_bars.get(ts, {}).get("volume", 0)),
-                        }
-                self._history_loaded = True
+                self.bar_aggregator.load_backup_bars(backup_df, now_min=now_min)
                 logger.info(f"⚡ [高速回補完成] 已載入今日 08:45 至今共 {len(backup_df)} 根 1分K，後續由 Shioaji 即時 Tick 串流與 Snapshot 零延遲更新！")
 
         # 3. 若超過 3 秒未收到新 Tick (或尚未有當分鐘 Bar)，才透過 Shioaji Snapshot 同步報價，平時直接由記憶體 Tick 0ms 合成
         now_dt = datetime.datetime.now()
         now_ts = pd.Timestamp(now_dt.replace(second=0, microsecond=0))
-        if (time.time() - self._last_tick_time >= 3.0 or now_ts not in self._realtime_bars) and (time.time() - self._last_snap_time >= 2.0):
+        if self.bar_aggregator.needs_snapshot_sync(now_ts):
             try:
-                self._last_snap_time = time.time()
                 snaps = self.api.snapshots([self.contract])
                 if snaps:
                     s = snaps[0]
                     price = float(getattr(s, "close", 0.0) or 0.0)
+                    vol = int(getattr(s, "volume", 1) or 1)
                     if price > 0:
-                        b = self._realtime_bars.get(now_ts)
-                        if b is None:
-                            self._realtime_bars[now_ts] = {
-                                "open": price, "high": price, "low": price, "close": price, "volume": int(getattr(s, "volume", 1) or 1)
-                            }
-                        else:
-                            b["high"] = max(b["high"], price)
-                            b["low"] = min(b["low"], price)
-                            b["close"] = price
+                        self.bar_aggregator.update_snapshot(price, volume=vol, dt=now_dt)
             except Exception as snap_err:
                 err_str = str(snap_err).lower()
                 if any(k in err_str for k in ("authenticated", "session", "token", "disconnect", "connect")):
                     self.reconnect()
 
-        if not self._realtime_bars:
+        day_df = self.bar_aggregator.to_dataframe(today_str=today_str, start_time="08:45", end_time="13:45")
+        if day_df.empty:
             return pd.DataFrame()
-
-        out_df = pd.DataFrame.from_dict(self._realtime_bars, orient="index")
-        out_df.index.name = "ts"
-        out_df = out_df.sort_index()
-        day_df = out_df[out_df.index.strftime("%Y-%m-%d") == today_str].between_time("08:45", "13:45")
         return day_df[["open", "high", "low", "close", "volume"]].copy()
 
     def _handle_action(self, strategy: ORBStrategy, res: dict, ts: pd.Timestamp, bar: pd.Series, prev_pos: int):
@@ -998,8 +969,7 @@ class ShioajiTMFTrader:
                 # 跨日自動換日重置 (00:00 過後自動載入新交易日 ATR 參數並清空前日快取)
                 if cur_date_str != active_date_str:
                     active_date_str = cur_date_str
-                    self._realtime_bars.clear()
-                    self._history_loaded = False
+                    self.bar_aggregator.clear()
                     processed_timestamps.clear()
                     self.entries_halted = False
                     self.pending_flatten = False
