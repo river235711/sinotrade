@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/usr/bin/env python3
 # update_20days.py - 每日收盤後自動滾動更新最新 20 個交易日數據集
 import os
 import sys
@@ -11,23 +11,38 @@ from strategies.atr_scaler import update_daily_history, compute_atr, scale_strat
 from config import ORBStrategyConfig
 
 def fetch_intraday_kbars_shioaji(today_str: str) -> pd.DataFrame:
-    """從永豐金 Shioaji API 獲取今日完整日盤 1分K 資料 (08:45 ~ 13:45) 並對齊起始時間戳"""
+    """
+    從永豐金 Shioaji 原生 API 獲取今日完整日盤 1分K 資料 (08:45 ~ 13:45) 並對齊起始時間戳。
+    作為第一優先數據源，具備 100% 原生期貨精度，不依賴外部爬蟲或第三方接口。
+    """
+    api = None
     try:
         import shioaji as sj
         from config import ShioajiConfig
         cfg = ShioajiConfig()
         api = sj.Shioaji()
         api.login(api_key=cfg.api_key, secret_key=cfg.secret_key)
-        tmfr1 = [c for c in api.Contracts.Futures.TMF if c.code == 'TMFR1'][0]
+        
+        # 優先支援 contracts v2，相容 v1
+        try:
+            futures_tmf = api.contracts.futures.TMF
+        except AttributeError:
+            futures_tmf = api.Contracts.Futures.TMF
+        
+        tmfr1 = next(c for c in futures_tmf if c.code == 'TMFR1')
         kb = api.kbars(tmfr1, start=today_str, end=today_str, timeout=10000)
-        api.logout()
+        
         df = pd.DataFrame({**kb})
         if df.empty:
             return pd.DataFrame()
         df.columns = [c.lower() for c in df.columns]
-        # Shioaji 結束時間戳轉起始時間戳
+        
+        # 重要轉換：Shioaji K 棒時間戳為收盤時間 (Close Timestamp，如 08:46:00 代表 08:45~08:46 該根 K 棒)
+        # 本系統策略核心與回測皆採用起始時間戳 (Start Timestamp，即 08:45:00 代表 08:45~08:46)，精準減去 1 分鐘
         df['ts'] = pd.to_datetime(df['ts']) - pd.Timedelta(minutes=1)
         df = df.sort_values('ts').reset_index(drop=True)
+        
+        # 嚴格篩選台指期日盤完整時段 (08:45:00 ~ 13:44:00 共 300 根)
         df_day = df[(df['ts'].dt.time >= datetime.time(8, 45)) & (df['ts'].dt.time <= datetime.time(13, 44))].copy()
         if df_day.empty:
             return pd.DataFrame()
@@ -37,8 +52,14 @@ def fetch_intraday_kbars_shioaji(today_str: str) -> pd.DataFrame:
         cols = ["timestamp", "open", "high", "low", "close", "volume", "date", "contract"]
         return df_day[cols].reset_index(drop=True)
     except Exception as e:
-        print(f"⚠️ 從 Shioaji 抓取今日 K 棒異常: {e}")
+        print(f"⚠️ 從 Shioaji 原生 API 獲取今日 K 棒異常: {e}")
         return pd.DataFrame()
+    finally:
+        if api is not None:
+            try:
+                api.logout()
+            except Exception:
+                pass
 
 def fetch_intraday_kbars_cnyes(today_str: str) -> pd.DataFrame:
     """從高速台指期行情接口獲取指定日期的完整 1分K 資料 (08:45 ~ 13:45)"""
