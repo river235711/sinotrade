@@ -81,6 +81,7 @@ class ORBStrategy:
         """處理單根 1分K 棒"""
         t_str = ts.strftime('%H:%M:%S')
         c = float(bar['close'])
+        o = float(bar.get('open', c))
         h = float(bar['high'])
         l = float(bar['low'])
         vwap = float(bar.get('vwap', c))
@@ -318,7 +319,7 @@ class ORBStrategy:
                         self.position = 0
                         return {"action": "EXIT", "record": trade_record}
 
-        # 3A. 09:01 ~ 09:15 早盤強勢爆發突破進場 (防止如 10/30 現貨一開盤直接崩跌 500 點而錯失行情)
+        # 3A. 09:01 ~ 09:15 早盤強勢爆發突破進場 (方案 B 精準改良版：空間未過度耗盡 + 蓄勢二次突破位置濾網)
         if (getattr(self.config, "enable_early_super_breakout", True) and
             self.position == 0 and
             self.pre_orb_high is not None and
@@ -329,7 +330,21 @@ class ORBStrategy:
             short_filter = (not self.config.use_vwap_ema_filter) or (c < vwap and ema9 < ema21)
             sb = self.config.early_super_breakout_pts
 
-            if c >= (self.pre_orb_high + sb) and long_filter:
+            # 方案 B 位置與動能保護濾網 (當 09:15 ORB 已鎖定時生效):
+            # 1. 空間未過度耗盡: orb_range <= max_orb_range * 1.25 (過濾如 10/30, 11/05 已狂瀉 500~840 點之地板衰竭追空)
+            # 2. 蓄勢位置確認: 緊貼 ORB 突破邊緣 (<= max_chase)，且當根非急拉/急殺極值棒 (h < orb_high / l > orb_low)，且 K 棒實體順勢
+            pos_long_ok = True
+            pos_short_ok = True
+            if self.orb_calculated and self.orb_high is not None and self.orb_low is not None:
+                orb_range_3a = self.orb_high - self.orb_low
+                max_orb_3a = getattr(self.config, "max_orb_range_pts", 320.0)
+                max_ratio_3a = getattr(self.config, "early_breakout_max_range_ratio", 1.25)
+                max_chase_3a = getattr(self.config, "max_breakout_chase_pts", 60.0)
+                range_ok = (orb_range_3a <= max_orb_3a * max_ratio_3a)
+                pos_long_ok = range_ok and ((self.orb_high - c) <= max_chase_3a) and (h < self.orb_high) and (c > o)
+                pos_short_ok = range_ok and ((c - self.orb_low) <= max_chase_3a) and (l > self.orb_low) and (c < o)
+
+            if c >= (self.pre_orb_high + sb) and long_filter and pos_long_ok:
                 self.position = 1
                 self.entry_price = c
                 self.entry_time = ts
@@ -339,9 +354,9 @@ class ORBStrategy:
                     "action": "BUY",
                     "price": c,
                     "time": ts,
-                    "detail": f"早盤強勢爆發突破 ({self.pre_orb_high}+{sb:.0f}點) + VWAP/EMA 多頭確認"
+                    "detail": f"早盤強勢蓄勢突破 ({self.pre_orb_high}+{sb:.0f}點) + 位置/VWAP/EMA 多頭確認"
                 }
-            elif c <= (self.pre_orb_low - sb) and short_filter:
+            elif c <= (self.pre_orb_low - sb) and short_filter and pos_short_ok:
                 self.position = -1
                 self.entry_price = c
                 self.entry_time = ts
@@ -351,7 +366,7 @@ class ORBStrategy:
                     "action": "SELL",
                     "price": c,
                     "time": ts,
-                    "detail": f"早盤強勢跳水突破 ({self.pre_orb_low}-{sb:.0f}點) + VWAP/EMA 空頭確認"
+                    "detail": f"早盤強勢蓄勢跳水 ({self.pre_orb_low}-{sb:.0f}點) + 位置/VWAP/EMA 空頭確認"
                 }
 
         # 3B. 09:16 ~ 11:30 標準現貨開盤區間突破 + ORB 寬度空間保護 + VWAP & EMA 延遲共振進場

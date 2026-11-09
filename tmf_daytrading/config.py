@@ -43,8 +43,9 @@ class InstrumentConfig:
 class ORBStrategyConfig:
     pre_orb_start_time: str = "08:45:00"     # 期貨早盤區間開始時間
     pre_orb_end_time: str = "09:00:00"       # 期貨早盤區間結束時間
-    enable_early_super_breakout: bool = True # 是否啟用 09:01~09:15 早盤強勢爆發突破進場 (True: 抓住急拉/急殺波段並拉高勝率至 73.3%)
+    enable_early_super_breakout: bool = True # 是否啟用 09:01~09:15 早盤強勢爆發突破進場 (方案 B 精準改良版: 勝率 66.7%, 20日淨利 +3,000元)
     early_super_breakout_pts: float = 85.0   # 09:01~09:15 強勢爆發突破門檻 (超越早盤高低點達 85 點立即順勢進場，不漏掉早盤急殺/急拉行情)
+    early_breakout_max_range_ratio: float = 1.25 # 09:15 鎖定時允許之 ORB 空間倍率上限 (1.25x max_orb_range，過濾動能已耗盡之地板追空/追高)
     orb_start_time: str = "09:00:00"         # 現貨開盤區間開始時間 (09:00 台股現貨開盤)
     orb_end_time: str = "09:15:00"           # 現貨開盤區間結束時間 (09:00~09:15 關鍵區間)
     entry_start_time: str = "09:16:00"       # 允許突破進場開始時間
