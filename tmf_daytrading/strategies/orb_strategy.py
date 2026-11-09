@@ -319,7 +319,8 @@ class ORBStrategy:
                         return {"action": "EXIT", "record": trade_record}
 
         # 3A. 09:01 ~ 09:15 早盤強勢爆發突破進場 (防止如 10/30 現貨一開盤直接崩跌 500 點而錯失行情)
-        if (self.position == 0 and
+        if (getattr(self.config, "enable_early_super_breakout", True) and
+            self.position == 0 and
             self.pre_orb_high is not None and
             self.trade_count < self.config.max_initial_trades and
             "09:01:00" <= t_str <= self.config.orb_end_time):
