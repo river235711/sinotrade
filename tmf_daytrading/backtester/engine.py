@@ -121,12 +121,23 @@ class BacktestEngine:
                         pass
 
         self.kbars = strategy.prepare_indicators(self.kbars)
-        orb_high, orb_low = strategy.calculate_orb_levels(self.kbars)
 
+        # 實盤時序嚴格同步 (09:15 鎖定 ORB):
+        # 實盤機器人 (shioaji_trader.py) 在 now_str >= orb_end_time (09:15:00) 才鎖定 ORB，
+        # 在此之前 pre_orb_high 為 None，避開 09:01~09:14 現貨剛開盤的假突破雜訊。
+        orb_high, orb_low = None, None
         prev_bar = None
         for ts, bar in self.kbars.iterrows():
+            t_str = ts.strftime('%H:%M:%S')
+            if t_str >= eff_cfg.orb_end_time and not strategy.orb_calculated:
+                orb_high, orb_low = strategy.calculate_orb_levels(self.kbars.loc[:ts])
+
             strategy.execute_bar(ts, bar, prev_bar)
             prev_bar = bar
+
+        # 若資料未達 orb_end_time，補算以防 orb_high/low 為 None
+        if not strategy.orb_calculated:
+            orb_high, orb_low = strategy.calculate_orb_levels(self.kbars)
 
         metrics = BacktestMetrics.calculate(strategy.trades, self.inst_config)
         metrics["orb_high"] = orb_high

@@ -193,9 +193,13 @@ def main():
     plt.savefig(chart_path, dpi=200)
     plt.close()
 
-    artifact_dir = r"C:\Users\ting0\.gemini\antigravity\brain\0eeb3784-cd73-4675-a9e0-4753b8b0afaf"
-    wsl_artifact_dir = "/mnt/c/Users/ting0/.gemini/antigravity/brain/0eeb3784-cd73-4675-a9e0-4753b8b0afaf"
-    for ad in [wsl_artifact_dir, artifact_dir]:
+    artifact_dirs = [
+        r"C:\Users\ting0\.gemini\antigravity\brain\c1cda5b4-65ce-41d0-bb17-ab30721342ef",
+        "/mnt/c/Users/ting0/.gemini/antigravity/brain/c1cda5b4-65ce-41d0-bb17-ab30721342ef",
+        r"C:\Users\ting0\.gemini\antigravity\brain\0eeb3784-cd73-4675-a9e0-4753b8b0afaf",
+        "/mnt/c/Users/ting0/.gemini/antigravity/brain/0eeb3784-cd73-4675-a9e0-4753b8b0afaf",
+    ]
+    for ad in artifact_dirs:
         if os.path.exists(ad):
             try:
                 shutil.copy(chart_path, os.path.join(ad, "tmf_backtest_20days.png"))
