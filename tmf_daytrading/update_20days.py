@@ -23,13 +23,14 @@ def fetch_intraday_kbars_shioaji(today_str: str) -> pd.DataFrame:
         api = sj.Shioaji()
         api.login(api_key=cfg.api_key, secret_key=cfg.secret_key)
         
-        # 優先支援 contracts v2，相容 v1
+        # 優先使用 contracts v2 原生 API 獲取 TMFR1 連續合約
         try:
-            futures_tmf = api.contracts.futures.TMF
-        except AttributeError:
-            futures_tmf = api.Contracts.Futures.TMF
+            futures_tmf = api.contracts.futures('TMF')
+            tmfr1_info = next(c for c in futures_tmf if getattr(c, 'code', '') == 'TMFR1')
+            tmfr1 = getattr(tmfr1_info, 'contract', tmfr1_info)
+        except Exception:
+            tmfr1 = next(c for c in api.Contracts.Futures.TMF if c.code == 'TMFR1')
         
-        tmfr1 = next(c for c in futures_tmf if c.code == 'TMFR1')
         kb = api.kbars(tmfr1, start=today_str, end=today_str, timeout=10000)
         
         df = pd.DataFrame({**kb})
