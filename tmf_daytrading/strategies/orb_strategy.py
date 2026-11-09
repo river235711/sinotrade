@@ -39,6 +39,8 @@ class ORBStrategy:
         self.entry_price = 0.0
         self.entry_time = None
         self.highest_profit = 0.0     # 用於保本鎖利與移動停利計算
+        self._hp_before_bar_ts = None # 記錄當根 K 棒開始前的最高浮盈時戳 (防同K開盤高低點誤觸)
+        self._hp_before_bar_val = 0.0 # 記錄當根 K 棒開始前的最高浮盈數值
         self.trade_count = 0
         self.trades: List[Dict[str, Any]] = []
 
@@ -111,14 +113,36 @@ class ORBStrategy:
 
         # 2. 如果已有部位，依序檢查：大波段移動停利 -> 保本鎖利 -> 初始停損 (含假突破反手 SAR)
         if self.position != 0:
+            if self._hp_before_bar_ts != ts:
+                self._hp_before_bar_ts = ts
+                self._hp_before_bar_val = self.highest_profit
+            prev_hp = self._hp_before_bar_val
+
             if self.position == 1:
                 cur_profit = h - self.entry_price
                 if cur_profit > self.highest_profit:
                     self.highest_profit = cur_profit
 
+                t15_trig = getattr(self.config, "tier1_5_trigger_pts", 110.0)
+                t15_lock = getattr(self.config, "tier1_5_lock_pts", 75.0)
+
+                # 同K棒高低點時序保護 (真實拉回才出場)：
+                # 若本根 K 棒為順勢創高紅 K (cur_profit > prev_hp 且 c > o)，代表低點 l 發生在創高 h 之前（開盤起漲點）。
+                # 除非本根 K 棒開始前的 prev_hp 已經能讓 l 觸發鎖利/停損，否則新跨過門檻的鎖利判定以當前價格 c 為準。
+                pullback_l = l
+                if cur_profit > prev_hp and c > o:
+                    already_trig = (
+                        (prev_hp >= self.config.trailing_activation_pts and l <= (self.entry_price + prev_hp - self.config.trailing_distance_pts)) or
+                        (prev_hp >= self.config.tier2_trigger_pts and l <= (self.entry_price + self.config.tier2_lock_pts)) or
+                        (prev_hp >= t15_trig and l <= (self.entry_price + t15_lock)) or
+                        (prev_hp >= self.config.breakeven_trigger_pts and l <= (self.entry_price + self.config.breakeven_lock_pts))
+                    )
+                    if not already_trig:
+                        pullback_l = c
+
                 # (A) 三階：大波段移動停利 (+400點啟動)
                 if (self.highest_profit >= self.config.trailing_activation_pts and 
-                    l <= (self.entry_price + self.highest_profit - self.config.trailing_distance_pts)):
+                    pullback_l <= (self.entry_price + self.highest_profit - self.config.trailing_distance_pts)):
                     exit_p = self.entry_price + self.highest_profit - self.config.trailing_distance_pts
                     pnl_pts = exit_p - self.entry_price
                     trade_record = {
@@ -136,7 +160,7 @@ class ORBStrategy:
 
                 # (B) 二階：中波段鎖利 (獲利曾達 +200 點，拉回時鎖住 +120 點)
                 if (self.highest_profit >= self.config.tier2_trigger_pts and 
-                    l <= (self.entry_price + self.config.tier2_lock_pts)):
+                    pullback_l <= (self.entry_price + self.config.tier2_lock_pts)):
                     exit_p = self.entry_price + self.config.tier2_lock_pts
                     trade_record = {
                         "entry_time": self.entry_time,
@@ -152,10 +176,8 @@ class ORBStrategy:
                     return {"action": "EXIT", "record": trade_record}
 
                 # (B2) 1.5階：中階鎖利 (獲利曾達 +110 點，拉回時鎖住 +75 點，補齊 80~200 點真空區)
-                t15_trig = getattr(self.config, "tier1_5_trigger_pts", 110.0)
-                t15_lock = getattr(self.config, "tier1_5_lock_pts", 75.0)
                 if (self.highest_profit >= t15_trig and 
-                    l <= (self.entry_price + t15_lock)):
+                    pullback_l <= (self.entry_price + t15_lock)):
                     exit_p = self.entry_price + t15_lock
                     trade_record = {
                         "entry_time": self.entry_time,
@@ -172,7 +194,7 @@ class ORBStrategy:
 
                 # (C) 一階：保本鎖利機制 (獲利曾達 +80 點，拉回時鎖住 +30 點)
                 if (self.highest_profit >= self.config.breakeven_trigger_pts and 
-                    l <= (self.entry_price + self.config.breakeven_lock_pts)):
+                    pullback_l <= (self.entry_price + self.config.breakeven_lock_pts)):
                     exit_p = self.entry_price + self.config.breakeven_lock_pts
                     trade_record = {
                         "entry_time": self.entry_time,
@@ -210,6 +232,8 @@ class ORBStrategy:
                         self.entry_time = ts
                         self.trade_count += 1
                         self.highest_profit = 0.0
+                        self._hp_before_bar_ts = None
+                        self._hp_before_bar_val = 0.0
                         return {"action": "SAR_SELL", "record": trade_record}
                     else:
                         self.position = 0
@@ -220,9 +244,26 @@ class ORBStrategy:
                 if cur_profit > self.highest_profit:
                     self.highest_profit = cur_profit
 
+                t15_trig = getattr(self.config, "tier1_5_trigger_pts", 110.0)
+                t15_lock = getattr(self.config, "tier1_5_lock_pts", 75.0)
+
+                # 同K棒高低點時序保護 (真實拉回才出場)：
+                # 若本根 K 棒為順勢破底黑 K (cur_profit > prev_hp 且 c < o)，代表高點 h 發生在破底 l 之前（開盤起跌點）。
+                # 除非本根 K 棒開始前的 prev_hp 已經能讓 h 觸發鎖利/停損，否則新跨過門檻的鎖利判定以當前價格 c 為準。
+                pullback_h = h
+                if cur_profit > prev_hp and c < o:
+                    already_trig = (
+                        (prev_hp >= self.config.trailing_activation_pts and h >= (self.entry_price - prev_hp + self.config.trailing_distance_pts)) or
+                        (prev_hp >= self.config.tier2_trigger_pts and h >= (self.entry_price - self.config.tier2_lock_pts)) or
+                        (prev_hp >= t15_trig and h >= (self.entry_price - t15_lock)) or
+                        (prev_hp >= self.config.breakeven_trigger_pts and h >= (self.entry_price - self.config.breakeven_lock_pts))
+                    )
+                    if not already_trig:
+                        pullback_h = c
+
                 # (A) 三階：大波段移動停利 (+400點啟動)
                 if (self.highest_profit >= self.config.trailing_activation_pts and 
-                    h >= (self.entry_price - self.highest_profit + self.config.trailing_distance_pts)):
+                    pullback_h >= (self.entry_price - self.highest_profit + self.config.trailing_distance_pts)):
                     exit_p = self.entry_price - self.highest_profit + self.config.trailing_distance_pts
                     pnl_pts = self.entry_price - exit_p
                     trade_record = {
@@ -240,7 +281,7 @@ class ORBStrategy:
 
                 # (B) 二階：中波段鎖利 (獲利曾達 +200 點，拉回時鎖住 +120 點)
                 if (self.highest_profit >= self.config.tier2_trigger_pts and 
-                    h >= (self.entry_price - self.config.tier2_lock_pts)):
+                    pullback_h >= (self.entry_price - self.config.tier2_lock_pts)):
                     exit_p = self.entry_price - self.config.tier2_lock_pts
                     trade_record = {
                         "entry_time": self.entry_time,
@@ -256,10 +297,8 @@ class ORBStrategy:
                     return {"action": "EXIT", "record": trade_record}
 
                 # (B2) 1.5階：中階鎖利 (獲利曾達 +110 點，拉回時鎖住 +75 點，補齊 80~200 點真空區)
-                t15_trig = getattr(self.config, "tier1_5_trigger_pts", 110.0)
-                t15_lock = getattr(self.config, "tier1_5_lock_pts", 75.0)
                 if (self.highest_profit >= t15_trig and 
-                    h >= (self.entry_price - t15_lock)):
+                    pullback_h >= (self.entry_price - t15_lock)):
                     exit_p = self.entry_price - t15_lock
                     trade_record = {
                         "entry_time": self.entry_time,
@@ -276,7 +315,7 @@ class ORBStrategy:
 
                 # (C) 一階：保本鎖利機制 (獲利曾達 +80 點，拉回時鎖住 +30 點)
                 if (self.highest_profit >= self.config.breakeven_trigger_pts and 
-                    h >= (self.entry_price - self.config.breakeven_lock_pts)):
+                    pullback_h >= (self.entry_price - self.config.breakeven_lock_pts)):
                     exit_p = self.entry_price - self.config.breakeven_lock_pts
                     trade_record = {
                         "entry_time": self.entry_time,
@@ -314,6 +353,8 @@ class ORBStrategy:
                         self.entry_time = ts
                         self.trade_count += 1
                         self.highest_profit = 0.0
+                        self._hp_before_bar_ts = None
+                        self._hp_before_bar_val = 0.0
                         return {"action": "SAR_BUY", "record": trade_record}
                     else:
                         self.position = 0

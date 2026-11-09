@@ -126,7 +126,11 @@ def scale_strategy_config(base_cfg, atr: Optional[float]) -> Tuple[object, Dict]
     changes = {}
     for f in SCALED_FIELDS:
         base_val = getattr(base_cfg, f)
-        changes[f] = float(max(1.0, round(base_val * ratio)))
+        scaled_val = float(max(1.0, round(base_val * ratio)))
+        if f == "stop_loss_pts":
+            # 停損保底原始基準 (90點)：高波動 (ratio > 1) 放大停損保護，低波動 (ratio < 1) 不縮小停損，避免正常均線回測被洗出
+            scaled_val = max(float(base_val), scaled_val)
+        changes[f] = scaled_val
     new_cfg = dataclasses.replace(base_cfg, **changes)
     info.update({"ratio": ratio, "raw_ratio": raw_ratio, "applied": True})
     return new_cfg, info
