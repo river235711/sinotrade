@@ -16,8 +16,32 @@ if [ -n "$PID" ]; then
     exit 0
 fi
 
-MODE="${1:-paper}"
-QTY="${2:-1}"
+MODE="paper"
+QTY="1"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --mode|-m)
+            MODE="$2"
+            shift 2
+            ;;
+        --qty|-q)
+            QTY="$2"
+            shift 2
+            ;;
+        live|paper|backtest)
+            MODE="$1"
+            shift
+            ;;
+        [0-9]*)
+            QTY="$1"
+            shift
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
 
 echo "啟動參數: 模式=[$MODE], 下單口數=[$QTY]"
 mkdir -p logs

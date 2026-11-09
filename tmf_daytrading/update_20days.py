@@ -10,30 +10,63 @@ import pandas as pd
 from strategies.atr_scaler import update_daily_history, compute_atr, scale_strategy_config
 from config import ORBStrategyConfig
 
+def fetch_intraday_kbars_shioaji(today_str: str) -> pd.DataFrame:
+    """從永豐金 Shioaji API 獲取今日完整日盤 1分K 資料 (08:45 ~ 13:45) 並對齊起始時間戳"""
+    try:
+        import shioaji as sj
+        from config import ShioajiConfig
+        cfg = ShioajiConfig()
+        api = sj.Shioaji()
+        api.login(api_key=cfg.api_key, secret_key=cfg.secret_key)
+        tmfr1 = [c for c in api.Contracts.Futures.TMF if c.code == 'TMFR1'][0]
+        kb = api.kbars(tmfr1, start=today_str, end=today_str, timeout=10000)
+        api.logout()
+        df = pd.DataFrame({**kb})
+        if df.empty:
+            return pd.DataFrame()
+        df.columns = [c.lower() for c in df.columns]
+        # Shioaji 結束時間戳轉起始時間戳
+        df['ts'] = pd.to_datetime(df['ts']) - pd.Timedelta(minutes=1)
+        df = df.sort_values('ts').reset_index(drop=True)
+        df_day = df[(df['ts'].dt.time >= datetime.time(8, 45)) & (df['ts'].dt.time <= datetime.time(13, 44))].copy()
+        if df_day.empty:
+            return pd.DataFrame()
+        df_day["timestamp"] = df_day["ts"].dt.strftime("%Y-%m-%d %H:%M:%S")
+        df_day["date"] = today_str
+        df_day["contract"] = "TMFR1"
+        cols = ["timestamp", "open", "high", "low", "close", "volume", "date", "contract"]
+        return df_day[cols].reset_index(drop=True)
+    except Exception as e:
+        print(f"⚠️ 從 Shioaji 抓取今日 K 棒異常: {e}")
+        return pd.DataFrame()
+
 def fetch_intraday_kbars_cnyes(today_str: str) -> pd.DataFrame:
     """從高速台指期行情接口獲取指定日期的完整 1分K 資料 (08:45 ~ 13:45)"""
-    url = "https://ws.api.cnyes.com/ws/api/v1/charting/history?symbol=TWF:TXF:FUTURES&resolution=1&quote=1"
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=8) as r:
-        payload = json.loads(r.read().decode("utf-8"))
-    data = payload.get("data", {})
-    t_list = data.get("t", [])
-    if not t_list:
+    try:
+        url = "https://ws.api.cnyes.com/ws/api/v1/charting/history?symbol=TWF:TXF:FUTURES&resolution=1&quote=1"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            payload = json.loads(r.read().decode("utf-8"))
+        data = payload.get("data", {})
+        t_list = data.get("t", [])
+        if not t_list:
+            return pd.DataFrame()
+        df = pd.DataFrame({
+            "timestamp": [datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S") for ts in t_list],
+            "open": data.get("o", []),
+            "high": data.get("h", []),
+            "low": data.get("l", []),
+            "close": data.get("c", []),
+            "volume": data.get("v", []),
+            "date": today_str,
+            "contract": "AUTO"
+        })
+        df["ts"] = pd.to_datetime(df["timestamp"])
+        df = df.set_index("ts").sort_index()
+        day_df = df[df.index.strftime("%Y-%m-%d") == today_str].between_time("08:45", "13:45")
+        return day_df.reset_index(drop=True)
+    except Exception:
         return pd.DataFrame()
-    df = pd.DataFrame({
-        "timestamp": [datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S") for ts in t_list],
-        "open": data.get("o", []),
-        "high": data.get("h", []),
-        "low": data.get("l", []),
-        "close": data.get("c", []),
-        "volume": data.get("v", []),
-        "date": today_str,
-        "contract": "AUTO"
-    })
-    df["ts"] = pd.to_datetime(df["timestamp"])
-    df = df.set_index("ts").sort_index()
-    day_df = df[df.index.strftime("%Y-%m-%d") == today_str].between_time("08:45", "13:45")
-    return day_df.reset_index(drop=True)
 
 def roll_20days(target_date: str = None, push_git: bool = True):
     base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -45,9 +78,12 @@ def roll_20days(target_date: str = None, push_git: bool = True):
     print(f"🔄 啟動 TMF 滾動 20 日窗口資料庫自動更新 (目標日: {today_str})")
     print("=" * 80)
 
-    # 1. 抓取今日完整 1分K
+    # 1. 抓取今日完整 1分K (優先使用 Shioaji 原生主力合約，備援使用 CNYES)
     print(f"📡 正在抓取 {today_str} 日盤 (08:45 ~ 13:45) 完整 1分K 資料...")
-    today_kbars = fetch_intraday_kbars_cnyes(today_str)
+    today_kbars = fetch_intraday_kbars_shioaji(today_str)
+    if today_kbars.empty or len(today_kbars) < 60:
+        print("ℹ️ 嘗試自備援接口 (CNYES) 回補...")
+        today_kbars = fetch_intraday_kbars_cnyes(today_str)
     if today_kbars.empty or len(today_kbars) < 60:
         print(f"⚠️ 今日 ({today_str}) 抓取的 K 棒筆數不足 ({len(today_kbars)} 筆)，可能非交易日或尚未開盤。")
         return False
