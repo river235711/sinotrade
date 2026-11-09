@@ -122,14 +122,28 @@ class BacktestEngine:
 
         self.kbars = strategy.prepare_indicators(self.kbars)
 
-        # 實盤時序嚴格同步 (09:15 鎖定 ORB):
-        # 實盤機器人 (shioaji_trader.py) 在 now_str >= orb_end_time (09:15:00) 才鎖定 ORB，
-        # 在此之前 pre_orb_high 為 None，避開 09:01~09:14 現貨剛開盤的假突破雜訊。
+        # 實盤時序嚴格同步 (09:15:00 鎖定 ORB):
+        # 實盤機器人 (shioaji_trader.py) 在換分至 09:15:00 時 (09:14 K棒收完 + 09:15 開盤首Tick)，
+        # 立即鎖定 ORB 並評估剛收完的 09:14 K 棒；接著在 09:16:00 換分時完成 09:00~09:15 完整 ORB 上下界。
         orb_high, orb_low = None, None
         prev_bar = None
-        for ts, bar in self.kbars.iterrows():
+        bars_list = list(self.kbars.iterrows())
+        for idx, (ts, bar) in enumerate(bars_list):
             t_str = ts.strftime('%H:%M:%S')
-            if t_str >= eff_cfg.orb_end_time and not strategy.orb_calculated:
+            wall_clock_str = (ts + pd.Timedelta(minutes=1)).strftime('%H:%M:%S')
+            if wall_clock_str >= eff_cfg.orb_end_time and not strategy.orb_calculated:
+                slice_df = self.kbars.loc[:ts].copy()
+                if idx + 1 < len(bars_list):
+                    next_ts, next_bar = bars_list[idx + 1]
+                    if next_ts.strftime('%H:%M:%S') == eff_cfg.orb_end_time:
+                        open_p = float(next_bar['open'])
+                        open_row = next_bar.copy()
+                        open_row['high'] = open_p
+                        open_row['low'] = open_p
+                        open_row['close'] = open_p
+                        slice_df.loc[next_ts] = open_row
+                orb_high, orb_low = strategy.calculate_orb_levels(slice_df)
+            elif t_str == eff_cfg.orb_end_time:
                 orb_high, orb_low = strategy.calculate_orb_levels(self.kbars.loc[:ts])
 
             strategy.execute_bar(ts, bar, prev_bar)

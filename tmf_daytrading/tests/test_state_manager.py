@@ -72,6 +72,7 @@ class TestStateManager(unittest.TestCase):
         self.assertEqual(strat.position, -1)
         self.assertEqual(strat.entry_price, 44800.0)
         self.assertEqual(strat.highest_profit, 50.0)
+        self.assertEqual(strat._hp_before_bar_val, 50.0)
         self.assertEqual(strat.trade_count, 2)
         self.assertEqual(strat.orb_high, 45050.0)
         self.assertEqual(strat.orb_low, 44850.0)

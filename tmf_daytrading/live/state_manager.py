@@ -117,6 +117,7 @@ class StateManager:
             strategy.entry_price = float(state.get("entry_price", 0.0))
             strategy.trade_count = int(state.get("trade_count", 0))
             strategy.highest_profit = float(state.get("highest_profit", 0.0))
+            strategy._hp_before_bar_val = float(strategy.highest_profit)
             if state.get("orb_calculated", False) and state.get("orb_high") is not None:
                 strategy.orb_high = float(state["orb_high"])
                 strategy.orb_low = float(state["orb_low"])
