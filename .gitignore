@@ -3,8 +3,9 @@
 *.pfx
 *.pem
 
-# 期交所大型原始逐筆 CSV 檔 (保留輕量化的 tmf_20days_1m_kbars.csv 快取檔供直接回測)
+# 期交所大型原始逐筆 CSV 檔 (保留輕量化快取與永久日 K 歷史檔供 ATR 計算及直接回測)
 data/Daily_*.csv
+!data/daily_bars.csv
 data/*.zip
 
 # Python 快取與系統檔
