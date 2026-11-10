@@ -111,19 +111,20 @@ def compute_atr(daily: pd.DataFrame, before_date: str, period: int = 20, min_day
     return float(tr.mean()), len(tr)
 
 
-def scale_strategy_config(base_cfg, atr: Optional[float]) -> Tuple[object, Dict]:
+def scale_strategy_config(base_cfg, atr: Optional[float], ref_atr: Optional[float] = None) -> Tuple[object, Dict]:
     """
     依 ATR 縮放策略點數參數，回傳 (新設定, 資訊 dict)。
+    若提供 ref_atr (例如前 60 日動態基準 ATR)，則以 ref_atr 為分母；否則退回 base_cfg.atr_reference。
     ATR 為 None (歷史不足) 或未啟用時，回傳原固定參數。
     """
-    info = {"atr": atr, "ratio": 1.0, "applied": False}
+    info = {"atr": atr, "ref_atr": ref_atr, "ratio": 1.0, "applied": False}
     if not getattr(base_cfg, "use_atr_scaling", False) or atr is None or atr <= 0:
         return base_cfg, info
 
-    ref = float(base_cfg.atr_reference)
+    ref = float(ref_atr) if (ref_atr is not None and ref_atr > 0) else float(base_cfg.atr_reference)
     raw_ratio = atr / ref
     ratio = min(max(raw_ratio, base_cfg.atr_scale_min), base_cfg.atr_scale_max)
-    changes = {}
+    changes = {"atr_reference": round(ref, 1)}
     for f in SCALED_FIELDS:
         base_val = getattr(base_cfg, f)
         scaled_val = float(max(1.0, round(base_val * ratio)))
@@ -132,25 +133,30 @@ def scale_strategy_config(base_cfg, atr: Optional[float]) -> Tuple[object, Dict]
             scaled_val = max(float(base_val), scaled_val)
         changes[f] = scaled_val
     new_cfg = dataclasses.replace(base_cfg, **changes)
-    info.update({"ratio": ratio, "raw_ratio": raw_ratio, "applied": True})
+    info.update({"ref_atr": ref, "ratio": ratio, "raw_ratio": raw_ratio, "applied": True})
     return new_cfg, info
 
 
 def config_for_date(base_cfg, data_dir: str, target_date: str, daily: pd.DataFrame = None) -> Tuple[object, Dict]:
-    """便利函式：讀取歷史、計算 target_date 的 ATR 並回傳縮放後設定"""
+    """便利函式：讀取歷史、計算 target_date 的 20 日 ATR 與 60 日動態基準 ATR，並回傳縮放後設定"""
     if daily is None:
         daily = load_daily_history(data_dir)
     atr, n = compute_atr(daily, target_date, base_cfg.atr_period, base_cfg.atr_min_days)
-    cfg, info = scale_strategy_config(base_cfg, atr)
+    ref_period = getattr(base_cfg, "atr_ref_period", 60)
+    ref_atr, ref_n = compute_atr(daily, target_date, ref_period, base_cfg.atr_min_days)
+    cfg, info = scale_strategy_config(base_cfg, atr, ref_atr=ref_atr)
     info["atr_days"] = n
+    info["ref_days"] = ref_n
     return cfg, info
 
 
 def describe(cfg, info: Dict) -> str:
     """產生一行參數說明文字 (供日誌使用)"""
     if info.get("applied"):
+        ref_d = info.get("ref_days")
+        ref_tag = f"{ref_d}日基準" if ref_d else "基準"
         head = (f"ATR({info.get('atr_days', '?')}日)={info['atr']:.0f}點 "
-                f"(基準 {cfg.atr_reference:.0f}，比例 {info['ratio']:.2f}x)")
+                f"({ref_tag} {cfg.atr_reference:.0f}，比例 {info['ratio']:.2f}x)")
     elif info.get("atr") is None and getattr(cfg, "use_atr_scaling", False):
         head = f"ATR 歷史不足 ({info.get('atr_days', 0)} 日 < {cfg.atr_min_days} 日)，使用固定參數"
     else:

@@ -148,8 +148,9 @@ def roll_20days(target_date: str = None, push_git: bool = True):
     daily_hist = update_daily_history(data_dir, today_kbars)
     base_cfg = ORBStrategyConfig()
     next_atr, n_days = compute_atr(daily_hist, "9999-12-31", period=base_cfg.atr_period, min_days=base_cfg.atr_min_days)
-    next_cfg, next_info = scale_strategy_config(base_cfg, next_atr)
-    print(f"📐 永久日 K 歷史已更新 ({len(daily_hist)} 日) | 下一交易日 20日ATR={next_atr:.0f}點 (比例 {next_info['ratio']:.2f}x) -> 停損 -{next_cfg.stop_loss_pts:.0f}點 / 一階 +{next_cfg.breakeven_trigger_pts:.0f}→+{next_cfg.breakeven_lock_pts:.0f}點 / 二階 +{next_cfg.tier2_trigger_pts:.0f}→+{next_cfg.tier2_lock_pts:.0f}點")
+    ref_atr, ref_days = compute_atr(daily_hist, "9999-12-31", period=base_cfg.atr_ref_period, min_days=base_cfg.atr_min_days)
+    next_cfg, next_info = scale_strategy_config(base_cfg, next_atr, ref_atr=ref_atr)
+    print(f"📐 永久日 K 歷史已更新 ({len(daily_hist)} 日) | 下一交易日 20日ATR={next_atr:.0f}點 ({ref_days}日基準 {next_cfg.atr_reference:.0f}，比例 {next_info['ratio']:.2f}x) -> 停損 -{next_cfg.stop_loss_pts:.0f}點 / 一階 +{next_cfg.breakeven_trigger_pts:.0f}→+{next_cfg.breakeven_lock_pts:.0f}點 / 二階 +{next_cfg.tier2_trigger_pts:.0f}→+{next_cfg.tier2_lock_pts:.0f}點 / 三階 +{next_cfg.trailing_activation_pts:.0f}點")
 
     # 4. 自動重新執行 20 日回測並產出績效圖表
     print("\n📊 正在自動重新執行最新 20 日回測並產出報表圖表...")
