@@ -2,9 +2,9 @@
 
 > **版本**：v2.5 (2026-11-10 實裝 60日動態基準 ATR + 三階 280 點移動停利)  
 > **適用商品**：微型臺指期貨主力合約 (`TMFR1` / `TMF`，每點 NT$ 10 元)  
-> **主要設定檔路徑**：[`config.py`](file:///C:/Users/ting0/.gemini/antigravity/scratch/tmf_daytrading/config.py)  
-> **縮放邏輯實作路徑**：[`strategies/atr_scaler.py`](file:///C:/Users/ting0/.gemini/antigravity/scratch/tmf_daytrading/strategies/atr_scaler.py)  
-> **策略訊號判斷路徑**：[`strategies/orb_strategy.py`](file:///C:/Users/ting0/.gemini/antigravity/scratch/tmf_daytrading/strategies/orb_strategy.py)  
+> **主要設定檔路徑**：[`./tmf_daytrading/config.py`](./config.py)  
+> **縮放邏輯實作路徑**：[`./tmf_daytrading/strategies/atr_scaler.py`](./strategies/atr_scaler.py)  
+> **策略訊號判斷路徑**：[`./tmf_daytrading/strategies/orb_strategy.py`](./strategies/orb_strategy.py)  
 
 ---
 
@@ -96,9 +96,9 @@ $$\text{今日縮放倍率 (ratio)} = \text{clip}\left(\frac{\text{前 20 個交
 
 | 修改目標 | 對應程式檔案 | 關鍵函式或變數位置 |
 | :--- | :--- | :--- |
-| **調整停損、停利基準點數** | [`config.py`](file:///C:/Users/ting0/.gemini/antigravity/scratch/tmf_daytrading/config.py) | `class ORBStrategyConfig` (行 57 ~ 67) |
-| **調整開盤、進場、平倉時間** | [`config.py`](file:///C:/Users/ting0/.gemini/antigravity/scratch/tmf_daytrading/config.py) | `class ORBStrategyConfig` (行 44 ~ 56) |
-| **調整 ATR 計算天數 (20d / 60d)** | [`config.py`](file:///C:/Users/ting0/.gemini/antigravity/scratch/tmf_daytrading/config.py) | `atr_period` / `atr_ref_period` (行 77 ~ 78) |
-| **修改 ATR 縮放公式或保底規則** | [`strategies/atr_scaler.py`](file:///C:/Users/ting0/.gemini/antigravity/scratch/tmf_daytrading/strategies/atr_scaler.py) | `scale_strategy_config()` (行 114 ~ 137) |
-| **修改進場濾網或出場判斷邏輯** | [`strategies/orb_strategy.py`](file:///C:/Users/ting0/.gemini/antigravity/scratch/tmf_daytrading/strategies/orb_strategy.py) | `_check_exit_for_position()` 與 `execute_bar()` |
-| **修改實盤下單與收盤排程邏輯** | [`live/shioaji_trader.py`](file:///C:/Users/ting0/.gemini/antigravity/scratch/tmf_daytrading/live/shioaji_trader.py) | `run_live_trading()` (行 920 ~ 1045) |
+| **調整停損、停利基準點數** | [`./tmf_daytrading/config.py`](./config.py) | `class ORBStrategyConfig` (行 57 ~ 67) |
+| **調整開盤、進場、平倉時間** | [`./tmf_daytrading/config.py`](./config.py) | `class ORBStrategyConfig` (行 44 ~ 56) |
+| **調整 ATR 計算天數 (20d / 60d)** | [`./tmf_daytrading/config.py`](./config.py) | `atr_period` / `atr_ref_period` (行 77 ~ 78) |
+| **修改 ATR 縮放公式或保底規則** | [`./tmf_daytrading/strategies/atr_scaler.py`](./strategies/atr_scaler.py) | `scale_strategy_config()` (行 114 ~ 137) |
+| **修改進場濾網或出場判斷邏輯** | [`./tmf_daytrading/strategies/orb_strategy.py`](./strategies/orb_strategy.py) | `_check_exit_for_position()` 與 `execute_bar()` |
+| **修改實盤下單與收盤排程邏輯** | [`./tmf_daytrading/live/shioaji_trader.py`](./live/shioaji_trader.py) | `run_live_trading()` (行 920 ~ 1045) |
