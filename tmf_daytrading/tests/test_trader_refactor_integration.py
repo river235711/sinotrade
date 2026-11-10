@@ -10,6 +10,7 @@
 
 import sys
 import os
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -23,7 +24,12 @@ from config import ORBStrategyConfig, InstrumentConfig
 
 class TestTraderRefactorIntegration(unittest.TestCase):
     def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
         self.trader = ShioajiTMFTrader(simulation=True)
+        self.trader.state_manager = StateManager(log_dir=self.temp_dir.name)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
 
     def test_components_instantiation(self):
         """驗證新模組正確掛載"""
