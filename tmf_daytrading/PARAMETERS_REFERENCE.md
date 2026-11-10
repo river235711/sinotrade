@@ -1,0 +1,104 @@
+# TMF 微台指當沖交易系統 — 核心交易參數與計算規格手冊 (Parameters Reference)
+
+> **版本**：v2.5 (2026-11-10 實裝 60日動態基準 ATR + 三階 280 點移動停利)  
+> **適用商品**：微型臺指期貨主力合約 (`TMFR1` / `TMF`，每點 NT$ 10 元)  
+> **主要設定檔路徑**：[`config.py`](file:///C:/Users/ting0/.gemini/antigravity/scratch/tmf_daytrading/config.py)  
+> **縮放邏輯實作路徑**：[`strategies/atr_scaler.py`](file:///C:/Users/ting0/.gemini/antigravity/scratch/tmf_daytrading/strategies/atr_scaler.py)  
+> **策略訊號判斷路徑**：[`strategies/orb_strategy.py`](file:///C:/Users/ting0/.gemini/antigravity/scratch/tmf_daytrading/strategies/orb_strategy.py)  
+
+---
+
+## 📌 一、動態波動縮放機制 (ATR Dynamic Volatility Scaling)
+
+系統為避免固定點數在不同行情波動下失效，以「**近月短期波動 / 近一季長期常態基準**」動態放大或縮小所有點數參數。
+
+### 1. 波動倍率計算公式
+$$\text{今日縮放倍率 (ratio)} = \text{clip}\left(\frac{\text{前 20 個交易日平均真實振幅 (ATR}_{20}\text{)}}{\text{前 60 個交易日動態基準振幅 (ATR}_{60}\text{)}},\; \text{atr\_scale\_min},\; \text{atr\_scale\_max}\right)$$
+
+- **`atr_period: int = 20`**：短期真實振幅天數（取前 1 日往前推 20 日日盤）。
+- **`atr_ref_period: int = 60`**：動態基準真實振幅天數（取前 1 日往前推 60 日日盤，淘汰寫死之固定分母）。
+- **`atr_min_days: int = 20`**：歷史資料庫需滿 20 日才啟動動態縮放。
+- **`atr_reference: float = 880.0`**：僅在無歷史資料時作為 fallback 備援預設值。
+- **`atr_scale_min: float = 0.6`**：最小倍率下限（防止低波動時停損過窄被雜訊洗出場）。
+- **`atr_scale_max: float = 1.8`**：最大倍率上限（防止極端暴跌暴漲時單筆風險過大）。
+
+---
+
+## 📌 二、各交易點數參數清單（動態計算 vs 基準值）
+
+所有點數參數在盤中生效時皆為：**$\text{生效點數} = \text{round}(\text{基準點數} \times \text{ratio})$**  
+*(例外：初始停損具 90 點硬性保底機制)*
+
+| 參數中文名稱 | 變數名稱 (`config.py`) | 基準點數 (`1.0x`) | 是否為絕對值 | 計算公式與實作規則 | 2026-11-10 實例 (`1.42x`) |
+| :--- | :--- | :---: | :---: | :--- | :---: |
+| **初始停損** | `stop_loss_pts` | **`-90.0`** | **動態計算**<br>(具90點下限) | `max(90.0, round(90.0 * ratio))`；高波動等比放大，低波動不縮小 | **`-127 點`** |
+| **一階保本門檻** | `breakeven_trigger_pts` | **`+80.0`** | 動態計算 | `round(80.0 * ratio)`；達標脫離成本區啟動保本 | **`+113 點`** |
+| **一階保本鎖利** | `breakeven_lock_pts` | **`+30.0`** | 動態計算 | `round(30.0 * ratio)`；拉回破此線平倉，扣除成本淨賺 | **`+42 點`** |
+| **中階(1.5階)門檻**| `tier1_5_trigger_pts` | **`+160.0`** | 動態計算 | `round(160.0 * ratio)`；達標獲利 2R，補齊 80~200 真空帶 | **`+227 點`** |
+| **中階(1.5階)鎖利**| `tier1_5_lock_pts` | **`+100.0`** | 動態計算 | `round(100.0 * ratio)`；拉回鎖住一筆停損錢 (+100點) | **`+142 點`** |
+| **二階波段門檻** | `tier2_trigger_pts` | **`+200.0`** | 動態計算 | `round(200.0 * ratio)`；確認進入日內波段行情 | **`+283 點`** |
+| **二階波段鎖利** | `tier2_lock_pts` | **`+120.0`** | 動態計算 | `round(120.0 * ratio)`；留 80 點緩衝去拚三階大行情 | **`+170 點`** |
+| **三階移動停利門檻**| `trailing_activation_pts`| **`+280.0`** | 動態計算 | `round(280.0 * ratio)`；啟動移動停利，不再死守固定線 | **`+396 點`** |
+| **三階移動回撤距離**| `trailing_distance_pts` | **`60.0`** | 動態計算 | `round(60.0 * ratio)`；從盤中極值拉回此距離平倉 | **`85 點`** |
+| **突破追價上限距離**| `max_breakout_chase_pts`| **`60.0`** | 動態計算 | `round(60.0 * ratio)`；突破點延伸超過此距離不追價 | **`85 點`** |
+| **ORB 空間上限寬度**| `max_orb_range_pts` | **`320.0`** | 動態計算 | `round(320.0 * ratio)`；09:00~09:15 高低差超過則放棄交易 | **`453 點`** |
+| **早盤強突破門檻** | `early_super_breakout_pts`| **`85.0`** | 動態計算 | `round(85.0 * ratio)`；09:01~09:15 破早盤高低達標即進場 | **`120 點`** |
+
+---
+
+## 📌 三、固定時程參數清單（絕對時間，不隨波動縮放）
+
+所有時間參數均為絕對值（`HH:MM:SS`），精確控制程式每個交易行為的生命週期：
+
+| 參數中文名稱 | 變數名稱 (`config.py`) | 固定數值 | 角色說明與市場邏輯 |
+| :--- | :--- | :---: | :--- |
+| **期貨早盤區間起點** | `pre_orb_start_time` | **`08:45:00`** | 期貨開盤（台股現貨尚未開盤），開始統計早盤試盤振幅。 |
+| **期貨早盤區間終點** | `pre_orb_end_time` | **`09:00:00`** | 現貨開盤前一刻，統計出 `pre_orb_high` 與 `pre_orb_low`。 |
+| **ORB 現貨區間起點** | `orb_start_time` | **`09:00:00`** | 台股現貨股票開盤，法人大單進場搓合。 |
+| **ORB 現貨區間鎖定** | `orb_end_time` | **`09:15:00`** | **【關鍵時鐘】** 統計 15 分鐘 K 棒，**永久鎖定** 今日 `orb_high` 與 `orb_low`。 |
+| **標準突破進場起點** | `entry_start_time` | **`09:16:00`** | 開始接受常規突破信號（需滿足 VWAP 與 EMA 共振）。 |
+| **首次進場截止時間** | `entry_end_time` | **`11:30:00`** | 超過 11:30 代表進入午盤盤整，不再建立任何全新倉位。 |
+| **假突破反手 (SAR) 截止**| `sar_end_time` | **`11:00:00`** | 早盤首筆單若觸發停損且趨勢反轉，僅在 11:00 前允許反手一次。 |
+| **第一道：策略強制平倉**| `force_close_time` | **`13:08:00`** | 當沖策略發出市價平倉委託，避開結算日 13:15 強制沖銷與尾盤甩尾。 |
+| **第二道：底線補平時間**| `failsafe_close_time` | **`13:09:00`** | 若帳上仍有殘留部位，每秒以 `MKP + IOC` 強制追殺補平。 |
+| **第三道：安全退出時間**| `shutdown_time` | **`13:10:00`** | 確認帳上部位為 0 口，安全關閉策略並進入跨日待機。 |
+| **日盤正式結算時間** | *(內部硬編碼)* | **`13:45:15`** | 日盤正式收盤，抓取全日 300 根 1分K 執行滾動更新與次日參數預告。 |
+
+---
+
+## 📌 四、交易風控與濾網參數（固定規則 / 絕對值）
+
+| 參數中文名稱 | 變數名稱 (`config.py`) | 設定值 | 角色說明與依據 |
+| :--- | :--- | :---: | :--- |
+| **每日首次進場上限** | `max_initial_trades` | **`1 次`** | 每日僅打一次正規突破，避免過度交易與連續被巴。 |
+| **啟用假突破反手** | `enable_sar` | **`True`** | 11:00 前首筆吃滿停損且翻過 VWAP 時，允許反向進場 1 口（上限 1 次）。 |
+| **順勢濾網共振開關** | `use_vwap_ema_filter` | **`True`** | 做多需 `Close > VWAP` 且 `EMA9 > EMA21`；做空需 `Close < VWAP` 且 `EMA9 < EMA21`。 |
+| **夜盤防撞牆濾網** | `use_overnight_wall_filter` | **`True`** | 防止在昨日夜盤高低點（重要支撐/壓力牆）前追高殺低。 |
+| **防撞牆觸發緩衝門檻**| `overnight_wall_threshold_pts` | **`40.0 點`** | 當 ORB 邊緣距夜盤極值 $\le 40$ 點時，必須實質穿過夜盤高/低點才准進場。 |
+| **早盤強突破空間倍數**| `early_breakout_max_range_ratio`| **`1.25`** | 09:15 結算時若 ORB 寬度大於 `1.25 × max_orb_range`，判定動能過度耗盡不追單。 |
+
+---
+
+## 📌 五、商品規格與交易成本參數（契約與法規絕對值）
+
+| 參數中文名稱 | 變數名稱 (`InstrumentConfig`) | 設定值 | 說明 |
+| :--- | :--- | :---: | :--- |
+| **商品代碼** | `symbol` | `"TMF"` | 微型臺指期貨。 |
+| **契約乘數** | `multiplier` | **`10.0`** | 每點跳動價值新台幣 10 元。 |
+| **最小跳動點** | `tick_size` | **`1.0`** | 最小跳動點數為 1 點。 |
+| **單邊手續費** | `commission_per_order` | **`12.0`** | 永豐金期貨每口單邊手續費 NT$ 12 元。 |
+| **期貨交易稅率** | `tax_rate` | **`0.00001`** | 臺灣期交稅法規十萬分之一。 |
+| **預估單邊滑價** | `slippage_points` | **`1.0`** | 回測成本模型保守估算單邊 1 點滑價。 |
+
+---
+
+## 📌 六、修改程式時之檔案速查表
+
+| 修改目標 | 對應程式檔案 | 關鍵函式或變數位置 |
+| :--- | :--- | :--- |
+| **調整停損、停利基準點數** | [`config.py`](file:///C:/Users/ting0/.gemini/antigravity/scratch/tmf_daytrading/config.py) | `class ORBStrategyConfig` (行 57 ~ 67) |
+| **調整開盤、進場、平倉時間** | [`config.py`](file:///C:/Users/ting0/.gemini/antigravity/scratch/tmf_daytrading/config.py) | `class ORBStrategyConfig` (行 44 ~ 56) |
+| **調整 ATR 計算天數 (20d / 60d)** | [`config.py`](file:///C:/Users/ting0/.gemini/antigravity/scratch/tmf_daytrading/config.py) | `atr_period` / `atr_ref_period` (行 77 ~ 78) |
+| **修改 ATR 縮放公式或保底規則** | [`strategies/atr_scaler.py`](file:///C:/Users/ting0/.gemini/antigravity/scratch/tmf_daytrading/strategies/atr_scaler.py) | `scale_strategy_config()` (行 114 ~ 137) |
+| **修改進場濾網或出場判斷邏輯** | [`strategies/orb_strategy.py`](file:///C:/Users/ting0/.gemini/antigravity/scratch/tmf_daytrading/strategies/orb_strategy.py) | `_check_exit_for_position()` 與 `execute_bar()` |
+| **修改實盤下單與收盤排程邏輯** | [`live/shioaji_trader.py`](file:///C:/Users/ting0/.gemini/antigravity/scratch/tmf_daytrading/live/shioaji_trader.py) | `run_live_trading()` (行 920 ~ 1045) |
