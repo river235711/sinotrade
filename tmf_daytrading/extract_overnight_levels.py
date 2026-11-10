@@ -26,8 +26,12 @@ def main():
     tmf_contracts = {c.code: c for c in api.Contracts.Futures.TMF if 'TMF' in c.code}
     tmfr1 = tmf_contracts.get('TMFR1')
     
-    print("📡 正在從 Shioaji 下載 TMFR1 連續近月合約之完整 24h 1分K 資料 (2026-10-01 ~ 2026-11-06)...")
-    kb = api.kbars(tmfr1, start='2026-10-01', end='2026-11-06')
+    today = datetime.date.today()
+    start_date = (today - datetime.timedelta(days=35)).strftime("%Y-%m-%d")
+    end_date = today.strftime("%Y-%m-%d")
+    
+    print(f"📡 正在從 Shioaji 下載 TMFR1 連續近月合約之完整 24h 1分K 資料 ({start_date} ~ {end_date})...")
+    kb = api.kbars(tmfr1, start=start_date, end=end_date)
     df = pd.DataFrame({**kb})
     df.columns = [c.lower() for c in df.columns]
     api.logout()
@@ -50,10 +54,16 @@ def main():
     # 1. 盤後夜盤: 前一日 15:00:00 ~ 當日 05:00:00
     # 2. 一般日盤: 當日 08:45:00 ~ 當日 13:45:00
     
-    # 找出所有的日盤日期
+    # 找出所有的日盤日期，加上今日 (若今日夜盤 05:00 已收盤但日盤尚未開始)
     df_day = df[(df['ts'].dt.time >= datetime.time(8, 45)) & (df['ts'].dt.time <= datetime.time(13, 45))]
-    trading_dates = sorted(df_day['ts'].dt.strftime('%Y-%m-%d').unique())
-    print(f"📅 辨識出有效日盤交易日共 {len(trading_dates)} 天: {trading_dates[0]} ~ {trading_dates[-1]}")
+    trading_dates = set(df_day['ts'].dt.strftime('%Y-%m-%d').unique())
+    today_str = today.strftime("%Y-%m-%d")
+    end_today_night = datetime.datetime.combine(today, datetime.time(5, 1, 0))
+    if not df[(df['ts'] <= end_today_night) & (df['ts'] >= end_today_night - datetime.timedelta(hours=14))].empty:
+        trading_dates.add(today_str)
+    
+    trading_dates = sorted(list(trading_dates))
+    print(f"📅 辨識出有效交易日共 {len(trading_dates)} 天: {trading_dates[0]} ~ {trading_dates[-1]}")
     
     overnight_summary = []
     
@@ -61,13 +71,11 @@ def main():
         cur_date = datetime.datetime.strptime(date_str, '%Y-%m-%d').date()
         
         # 夜盤起始: 尋找 cur_date 之前最近一個有資料的下午 15:00
-        # 通常是 cur_date 前 1 天 (週二是週一下午，週一是週五下午)
-        # 範圍: [cur_date - 4天 15:00:00, cur_date 05:00:00] 且時間介於 15:00~05:00
-        end_night = datetime.datetime.combine(cur_date, datetime.time(5, 0, 0))
+        # 範圍: [cur_date - 4天 15:00:00, cur_date 05:01:00] 且時間介於 15:00~05:00
+        end_night = datetime.datetime.combine(cur_date, datetime.time(5, 1, 0))
         start_night = datetime.datetime.combine(cur_date - datetime.timedelta(days=4), datetime.time(15, 0, 0))
         
         subset = df[(df['ts'] >= start_night) & (df['ts'] <= end_night)]
-        # 取最近一次 15:00 之後的連續夜盤
         # 找到 subset 中最後一個 hour >= 15 的日期
         evening_bars = subset[subset['ts'].dt.hour >= 15]
         if not evening_bars.empty:
@@ -99,10 +107,23 @@ def main():
         else:
             print(f"[{date_str}] ⚠️ 無對應夜盤資料")
             
-    summary_df = pd.DataFrame(overnight_summary)
-    summary_path = os.path.join(DATA_DIR, "overnight_levels_summary.csv")
-    summary_df.to_csv(summary_path, index=False)
-    print(f"\n💾 夜盤高低點彙整表已儲存至: {summary_path}")
+    new_summary_df = pd.DataFrame(overnight_summary)
+    
+    # 合併現有檔案以確保歷史不丟失
+    for fn in ["overnight_levels_summary.csv", "overnight_levels_30days.csv"]:
+        fpath = os.path.join(DATA_DIR, fn)
+        if os.path.exists(fpath):
+            try:
+                old_df = pd.read_csv(fpath)
+                combined = pd.concat([old_df[~old_df["trading_date"].isin(new_summary_df["trading_date"])], new_summary_df], ignore_index=True)
+                combined = combined.sort_values("trading_date").reset_index(drop=True)
+                combined.to_csv(fpath, index=False)
+                print(f"💾 已更新並儲存至: {fpath} (共 {len(combined)} 筆)")
+                continue
+            except Exception as e:
+                print(f"合併 {fn} 時異常: {e}")
+        new_summary_df.to_csv(fpath, index=False)
+        print(f"💾 已覆寫儲存至: {fpath} (共 {len(new_summary_df)} 筆)")
 
 if __name__ == "__main__":
     main()
