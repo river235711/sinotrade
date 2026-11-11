@@ -114,7 +114,10 @@ def run_health_check(mode: str = "live", qty: int = 1, send_notify: bool = True)
     contract_bound = None
     if api and results["overall_ok"]:
         try:
-            futs = getattr(api.Contracts.Futures, "TMF", [])
+            import warnings
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", DeprecationWarning)
+                futs = getattr(api.Contracts.Futures, "TMF", [])
             for c in futs:
                 if getattr(c, "code", "") == "TMFR1":
                     contract_bound = c

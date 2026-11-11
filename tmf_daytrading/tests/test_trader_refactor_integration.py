@@ -62,6 +62,45 @@ class TestTraderRefactorIntegration(unittest.TestCase):
         self.assertIsNotNone(loaded)
         self.assertEqual(loaded.get("entry_price"), 46000.0)
 
+    def test_speed_and_stability_optimizations(self):
+        """驗證 150ms 成交確認、DataFrame 版號快取、秒停喚醒與盤後旗標持久化"""
+        import datetime
+        # 1. 150ms IOC 成交確認輪詢
+        self.assertEqual(self.trader.fill_poll_interval, 0.15)
+
+        # 2. BarAggregator 版號快取與時間戳過濾
+        agg = self.trader.bar_aggregator
+        self.assertEqual(agg.version, 0)
+        dt = datetime.datetime(2026, 11, 11, 9, 5, 12)
+        agg.update_tick(45100.0, 3, dt)
+        self.assertEqual(agg.version, 1)
+        df1 = agg.to_dataframe(today_str="2026-11-11")
+        df2 = agg.to_dataframe(today_str="2026-11-11")
+        self.assertIs(df1, df2)  # 未變動時直接命中快取，不重建 DataFrame
+
+        agg.update_tick(45120.0, 2, dt)
+        self.assertEqual(agg.version, 2)
+        df3 = agg.to_dataframe(today_str="2026-11-11")
+        self.assertIsNot(df1, df3)
+        self.assertEqual(float(df3.iloc[-1]["high"]), 45120.0)
+
+        # 3. 盤後 EOD 通知與結算旗標持久化
+        today_str = datetime.date.today().strftime("%Y-%m-%d")
+        strat = ORBStrategy(config=ORBStrategyConfig(), inst_config=InstrumentConfig())
+        self.trader._eod_close_notified = True
+        self.trader._eod_done_date = today_str
+        self.trader._save_state(strat)
+        loaded = self.trader._load_state()
+        self.assertTrue(loaded.get("eod_close_notified"))
+        self.assertTrue(loaded.get("eod_done"))
+
+        # 4. request_stop 毫秒級喚醒
+        self.trader._wake_event.clear()
+        self.assertFalse(self.trader._stop_requested)
+        self.trader.request_stop()
+        self.assertTrue(self.trader._stop_requested)
+        self.assertTrue(self.trader._wake_event.is_set())
+
 
 if __name__ == "__main__":
     unittest.main()

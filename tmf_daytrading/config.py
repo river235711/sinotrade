@@ -3,9 +3,11 @@ TMF (微型臺指期) 當沖交易設定與常數 (Pro 翻修獲利版)
 """
 import os
 import sys
+import warnings
 from dataclasses import dataclass
 
 sys.dont_write_bytecode = True
+warnings.filterwarnings("ignore", message=".*api\\.Contracts is deprecated.*", category=DeprecationWarning)
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 os.makedirs(os.path.join(_BASE_DIR, "logs"), exist_ok=True)
 os.environ.setdefault("SJ_LOG_PATH", os.path.join(_BASE_DIR, "logs", "shioaji.log"))

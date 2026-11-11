@@ -15,11 +15,12 @@ if [ -z "$PIDS" ]; then
     exit 0
 fi
 
-echo "正在向機器人程序 (PID: $PIDS) 發送安全關閉信號 (SIGINT)..."
+echo "正在向機器人程序 (PID: $PIDS) 發送安全關閉信號 (SIGTERM)..."
+kill -TERM $PIDS 2>/dev/null
 kill -INT $PIDS 2>/dev/null
 
-for i in {1..5}; do
-    sleep 1
+for i in {1..25}; do
+    sleep 0.2
     PIDS_LEFT=$(pgrep -f "main\.py --mode")
     if [ -z "$PIDS_LEFT" ]; then
         break

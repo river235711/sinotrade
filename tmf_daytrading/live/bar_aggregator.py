@@ -27,6 +27,13 @@ class BarAggregator:
         self.kbars_disabled: bool = bool(kbars_disabled)
         self.last_tick_time: float = 0.0
         self.last_snap_time: float = 0.0
+        self.version: int = 0
+        self._cached_df: Optional[pd.DataFrame] = None
+        self._cached_key: Optional[tuple] = None
+
+    def _bump_version(self) -> None:
+        self.version += 1
+        self._cached_df = None
 
     def update_tick(self, price: float, volume: int, dt: datetime.datetime) -> Optional[pd.Timestamp]:
         """
@@ -59,6 +66,7 @@ class BarAggregator:
             b["close"] = price
             b["volume"] += int(volume)
 
+        self._bump_version()
         return bar_ts
 
     def update_snapshot(self, price: float, volume: int = 1, dt: Optional[datetime.datetime] = None) -> Optional[pd.Timestamp]:
@@ -85,12 +93,20 @@ class BarAggregator:
                 "close": price,
                 "volume": int(volume or 1),
             }
+            self._bump_version()
         else:
+            changed = False
             if price > b["high"]:
                 b["high"] = price
+                changed = True
             if price < b["low"]:
                 b["low"] = price
-            b["close"] = price
+                changed = True
+            if b["close"] != price:
+                b["close"] = price
+                changed = True
+            if changed:
+                self._bump_version()
 
         return now_ts
 
@@ -122,6 +138,8 @@ class BarAggregator:
 
         if len(target_df) > 0:
             self.history_loaded = True
+        if loaded_count > 0:
+            self._bump_version()
 
         return loaded_count
 
@@ -150,6 +168,8 @@ class BarAggregator:
                 count += 1
 
         self.history_loaded = True
+        if count > 0:
+            self._bump_version()
         return count
 
     def needs_snapshot_sync(self, now_ts: pd.Timestamp, tick_timeout_sec: float = 3.0, snap_interval_sec: float = 2.0) -> bool:
@@ -166,7 +186,7 @@ class BarAggregator:
 
     def to_dataframe(self, today_str: Optional[str] = None, start_time: str = "08:45", end_time: str = "13:45") -> pd.DataFrame:
         """
-        將目前聚合的記憶體 K 棒導出為標準格式 DataFrame
+        將目前聚合的記憶體 K 棒導出為標準格式 DataFrame (含版號快取與時間戳直接過濾優化)
         :param today_str: 限制之日期字串 (YYYY-MM-DD)，若為 None 則不限制日期
         :param start_time: 起始時段 (預設 08:45)
         :param end_time: 結束時段 (預設 13:45)
@@ -175,17 +195,33 @@ class BarAggregator:
         if not self._bars:
             return pd.DataFrame()
 
-        out_df = pd.DataFrame.from_dict(self._bars, orient="index")
-        out_df.index.name = "ts"
-        out_df = out_df.sort_index()
+        cache_key = (self.version, len(self._bars), today_str, start_time, end_time)
+        if self.version > 0 and self._cached_df is not None and self._cached_key == cache_key:
+            return self._cached_df
 
-        if today_str:
-            day_mask = (out_df.index.strftime("%Y-%m-%d") == today_str)
-            out_df = out_df[day_mask]
+        if today_str and start_time and end_time:
+            t0 = pd.Timestamp(f"{today_str} {start_time}:00")
+            t1 = pd.Timestamp(f"{today_str} {end_time}:59")
+            filtered = {ts: v for ts, v in self._bars.items() if t0 <= ts <= t1}
+            if not filtered:
+                out_df = pd.DataFrame()
+            else:
+                out_df = pd.DataFrame.from_dict(filtered, orient="index")
+                out_df.index.name = "ts"
+                out_df = out_df.sort_index()
+        else:
+            out_df = pd.DataFrame.from_dict(self._bars, orient="index")
+            out_df.index.name = "ts"
+            out_df = out_df.sort_index()
+            if today_str:
+                day_mask = (out_df.index.strftime("%Y-%m-%d") == today_str)
+                out_df = out_df[day_mask]
+            if start_time and end_time and not out_df.empty:
+                out_df = out_df.between_time(start_time, end_time)
 
-        if start_time and end_time and not out_df.empty:
-            out_df = out_df.between_time(start_time, end_time)
-
+        if self.version > 0:
+            self._cached_key = cache_key
+            self._cached_df = out_df
         return out_df
 
     def has_bar(self, ts: pd.Timestamp) -> bool:
@@ -198,6 +234,7 @@ class BarAggregator:
         self.history_loaded = False
         self.last_tick_time = 0.0
         self.last_snap_time = 0.0
+        self._bump_version()
 
     def __len__(self) -> int:
         return len(self._bars)
