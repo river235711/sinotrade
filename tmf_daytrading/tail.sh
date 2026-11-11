@@ -20,6 +20,7 @@ while true; do
     FILE="$BASE_DIR/logs/$MODE/trader_${TODAY}.log"
     SECS_TO_MIDNIGHT=$(( $(date -d 'tomorrow 00:00:00' +%s) - $(date +%s) + 2 ))
     echo "📡 監看 logs/$MODE/trader_${TODAY}.log (Ctrl+C 離開，不影響機器人)"
-    timeout "$SECS_TO_MIDNIGHT" tail -n 20 -F "$FILE" 2>/dev/null
+    # --foreground：讓 tail 留在終端機前景行程群組，Ctrl+C 才收得到 (否則 timeout 會另開行程群組，Ctrl+C 無效)
+    timeout --foreground "$SECS_TO_MIDNIGHT" tail -n 20 -F "$FILE" 2>/dev/null
     [ $? -ne 124 ] && exit 0   # 非逾時結束 (例如 Ctrl+C) 就離開；逾時代表跨日，切換到新檔
 done
