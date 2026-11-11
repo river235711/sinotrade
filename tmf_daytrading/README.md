@@ -25,16 +25,16 @@
 
 ---
 
-## 二、20 個交易日回測績效 (2026-10-08 ~ 2026-11-09)
+## 二、20 個交易日回測績效 (2026-10-13 ~ 2026-11-11)
 
-- **獲利天數 / 虧損天數 / 觀望**：**10 勝 / 2 負 / 8 觀望（有交易日勝率 83.3%）**
-- **單筆交易勝率 (Win Rate)**：**83.3%（12 筆中 10 勝 2 負）**
-- **累積總獲利點數**：**+985 點**
-- **扣除成本總淨損益 (含手續費、期交稅、滑價)**：**+NT$ 9,210 元 / 口**
-- **獲利因子 (Profit Factor)**：**5.83**
+- **獲利天數 / 虧損天數 / 觀望**：**9 勝 / 2 負 / 9 觀望（有交易日勝率 81.8%）**
+- **單筆交易勝率 (Win Rate)**：**81.8%（11 筆中 9 勝 2 負）**
+- **累積總獲利點數**：**+1,287 點**
+- **扣除成本總淨損益 (含手續費、期交稅、滑價)**：**+NT$ 12,285 元 / 口**
+- **獲利因子 (Profit Factor)**：**7.44**
 - **最大區間回撤 (MDD)**：**NT$ 953 元**
 
-![20日回測損益曲線](tmf_backtest_20days.png)
+![20日回測損益曲線](reports/tmf_backtest_20days.png)
 
 ---
 
@@ -45,23 +45,29 @@ tmf_daytrading/
 ├── .env.example                # 永豐金 Shioaji API 金鑰設定範本
 ├── config.py                   # 商品規格、API 設定與 ORB Pro 策略參數
 ├── main.py                     # 系統主入口 (支援 backtest / paper / live 模式與 --cmd 即時指令)
-├── run_20days_backtest.py      # 最新 20 個交易日回測與圖表生成腳本
-├── update_20days.py            # 收盤後自動滾動更新 20/60 日資料庫與推送 GitHub
-├── health_check.py             # 開盤前 (08:35) 全系統健康巡檢模組
-├── query_account.py            # 實體期貨帳戶部位與保證金即時查詢工具
-├── start_bg.sh / stop.sh / status.sh / tail.sh  # 背景常駐、狀態巡檢與即時日誌監看腳本
+├── start_bg.sh / stop.sh / status.sh / tail.sh    # 背景常駐、狀態巡檢與即時日誌監看腳本
+├── health_check.sh / query_account.sh             # 開盤前健檢與帳戶保證金查詢腳本
+├── pull.sh / push.sh                              # GitHub 跨機同步與目錄清理腳本
 ├── strategies/                 # 策略邏輯庫
 │   ├── orb_strategy.py         # ORB Pro V2 主力策略 (含 VWAP/EMA、夜盤防撞牆、四階鎖利、SAR)
 │   └── atr_scaler.py           # 20日/60日 ATR 動態波動自適應縮放模組
 ├── backtester/                 # 回測核心引擎
 │   ├── engine.py               # 1分K合成與逐根回測引擎
-│   └── metrics.py              # 績效統計器 (含手續費、稅、滑價與 MDD 計算)
+│   ├── metrics.py              # 績效統計器 (含手續費、稅、滑價與 MDD 計算)
+│   └── run_20days_backtest.py  # 最新 20 個交易日回測與圖表生成腳本
 ├── live/                       # 實盤/模擬下單模組
 │   ├── shioaji_trader.py       # 永豐 Shioaji 自動看盤、下單與 13:08~13:10 安全平倉機器人
 │   ├── bar_aggregator.py       # 即時 Tick 串流合成 1分K 聚合器
 │   ├── state_manager.py        # 持倉與策略斷點狀態原子化持久化管理器
 │   ├── log_setup.py            # paper / live 日誌分流與每日自動換檔管理 (保留 60 天)
-│   └── notifier.py             # LINE Messaging API 與 Gmail 雙通道推播模組
+│   ├── notifier.py             # LINE Messaging API 與 Gmail 雙通道推播模組
+│   ├── health_check.py         # 開盤前 (08:35) 全系統健康巡檢模組
+│   ├── query_account.py        # 實體期貨帳戶部位與保證金即時查詢工具
+│   └── update_20days.py        # 收盤後自動滾動更新 20/60 日資料庫與推送 GitHub
+├── reports/                    # 回測圖表、核心參數規格手冊與待驗證優化備忘錄
+│   ├── tmf_backtest_20days.png # 最新 20 日累積損益曲線圖
+│   ├── PARAMETERS_REFERENCE.md # 核心交易參數與計算規格手冊
+│   └── FUTURE_OPTIMIZATIONS.md # 後續可評估進階策略備忘錄
 └── data/
     ├── tmf_20days_1m_kbars.csv         # 20 個交易日 1分K 滾動快取檔
     ├── daily_bars.csv                  # 60 日 ATR 動態基準與歷史日 K 總表
@@ -81,8 +87,8 @@ cp .env.example .env
 
 ### 2. 執行歷史回測 (無需 API Key)
 ```bash
-# 執行最新 20 個交易日回測 (亦可執行 python3 main.py --mode backtest)
-python3 run_20days_backtest.py
+# 執行最新 20 個交易日回測 (或 python3 backtester/run_20days_backtest.py)
+python3 main.py --mode backtest
 ```
 
 ### 3. 開盤日啟動自動交易機器人 (建議 08:40 ~ 08:45 啟動)

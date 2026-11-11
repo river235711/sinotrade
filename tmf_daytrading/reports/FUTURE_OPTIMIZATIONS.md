@@ -77,7 +77,7 @@
 2. **實盤/模擬下單模組 (`live/shioaji_trader.py`)**：
    - 接收 `PARTIAL_EXIT` 動作，送出 `Cover` 減倉單，並與券商帳上真實剩餘部位對帳。
    - `13:08` 強制平倉與【不死鳥追平機制】保持不變：自動將帳上無論殘留 1 口、2 口或多口，全數市價清零。
-3. **回測引擎升級 (`backtester/engine.py` & `run_20days_backtest.py`)**：
+3. **回測引擎升級 (`backtester/engine.py` & `backtester/run_20days_backtest.py`)**：
    - 支援多口分批成交損益模擬，產出 1口 vs 3口分批的績效對比報表。
 
 ---

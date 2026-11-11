@@ -6,7 +6,13 @@ TMF (微型臺指期) 當沖交易程式 - 前 20 個交易日回測腳本
 策略: ORB 開盤區間突破策略 + 移動停利 (Trailing Stop)
 """
 import os
+import sys
 import shutil
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -15,7 +21,7 @@ from config import InstrumentConfig, ORBStrategyConfig
 from backtester.engine import BacktestEngine
 
 def main():
-    base_dir = os.path.dirname(os.path.abspath(__file__))
+    base_dir = BASE_DIR
     cache_path = os.path.join(base_dir, "data", "tmf_20days_1m_kbars.csv")
     if os.path.exists(cache_path):
         cached_df = pd.read_csv(cache_path)
@@ -189,7 +195,8 @@ def main():
     plt.xticks(rotation=30)
 
     plt.tight_layout()
-    chart_path = os.path.join(base_dir, "tmf_backtest_20days.png")
+    chart_path = os.path.join(base_dir, "reports", "tmf_backtest_20days.png")
+    os.makedirs(os.path.dirname(chart_path), exist_ok=True)
     plt.savefig(chart_path, dpi=200)
     plt.close()
 

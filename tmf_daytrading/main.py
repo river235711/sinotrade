@@ -70,7 +70,7 @@ def main():
         return
 
     if args.mode == "backtest":
-        from run_20days_backtest import main as run_backtest_main
+        from backtester.run_20days_backtest import main as run_backtest_main
         run_backtest_main()
         return
 

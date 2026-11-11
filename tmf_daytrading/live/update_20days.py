@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
-# update_20days.py - 每日收盤後自動滾動更新最新 20 個交易日數據集
+# live/update_20days.py - 每日收盤後自動滾動更新最新 20 個交易日數據集
 import os
 import sys
 sys.dont_write_bytecode = True
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+
 import json
 import urllib.request
 import datetime
@@ -92,7 +97,7 @@ def fetch_intraday_kbars_cnyes(today_str: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 def roll_20days(target_date: str = None, push_git: bool = True):
-    base_dir = os.path.dirname(os.path.abspath(__file__))
+    base_dir = BASE_DIR
     data_dir = os.path.join(base_dir, "data")
     cache_path = os.path.join(data_dir, "tmf_20days_1m_kbars.csv")
 
@@ -155,7 +160,7 @@ def roll_20days(target_date: str = None, push_git: bool = True):
 
     # 4. 自動重新執行 20 日回測並產出績效圖表
     print("\n📊 正在自動重新執行最新 20 日回測並產出報表圖表...")
-    backtest_script = os.path.join(base_dir, "run_20days_backtest.py")
+    backtest_script = os.path.join(base_dir, "backtester", "run_20days_backtest.py")
     try:
         subprocess.run([sys.executable, "-B", backtest_script], check=True)
     except Exception as e:

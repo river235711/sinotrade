@@ -3,4 +3,4 @@
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$BASE_DIR"
 source "$BASE_DIR/live/_log_common.sh"
-"$PYTHON_BIN" -B query_account.py "$@"
+"$PYTHON_BIN" -B live/query_account.py "$@"

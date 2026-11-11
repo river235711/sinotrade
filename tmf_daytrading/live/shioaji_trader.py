@@ -1157,7 +1157,7 @@ class ShioajiTMFTrader:
                         self._save_state(strategy)
                         logger.info(f"🏁 日盤正式收盤 (13:45)！帳上確認 0 部位，開始執行今日 ({cur_date_str}) 盤後總結與數據滾動...")
                         try:
-                            from update_20days import roll_20days
+                            from live.update_20days import roll_20days
                             roll_20days(push_git=True)
                         except Exception as roll_err:
                             logger.warning(f"自動滾動更新 20 日資料略過: {roll_err}")
@@ -1203,7 +1203,7 @@ class ShioajiTMFTrader:
                         self._morning_wake_logged = True
                         logger.info(f"🌅 [{now_str}] 執行開盤前全系統自動健康巡檢 (Pre-Market Health Check)...")
                         try:
-                            from health_check import run_health_check
+                            from live.health_check import run_health_check
                             mode_str = "paper" if self.simulation else "live"
                             run_health_check(mode=mode_str, qty=self.quantity, send_notify=True)
                         except Exception as hc_err:
