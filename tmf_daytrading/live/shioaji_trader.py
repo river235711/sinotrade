@@ -862,14 +862,44 @@ class ShioajiTMFTrader:
         self._post_trade_check(strategy, act, result)
         self._save_state(strategy)
 
+    def _save_overnight_level_to_csv(self, data_dir: str, target_date_str: str, night_bars: pd.DataFrame):
+        """將抓到的前一日夜盤極值自動寫入 overnight_levels_summary.csv 永久保存"""
+        try:
+            os.makedirs(data_dir, exist_ok=True)
+            o_high = float(night_bars["high"].max())
+            o_low = float(night_bars["low"].min())
+            o_open = float(night_bars.iloc[0]["open"])
+            o_close = float(night_bars.iloc[-1]["close"])
+            new_row = pd.DataFrame([{
+                "trading_date": target_date_str,
+                "night_start": str(night_bars["ts"].min()),
+                "night_end": str(night_bars["ts"].max()),
+                "night_bars": len(night_bars),
+                "night_open": o_open,
+                "night_high": o_high,
+                "night_low": o_low,
+                "night_close": o_close,
+                "night_range": o_high - o_low,
+            }])
+            lvl_path = os.path.join(data_dir, "overnight_levels_summary.csv")
+            if os.path.exists(lvl_path):
+                old_df = pd.read_csv(lvl_path)
+                combined = pd.concat([old_df[old_df["trading_date"] != target_date_str], new_row], ignore_index=True)
+                combined = combined.sort_values("trading_date").reset_index(drop=True)
+            else:
+                combined = new_row
+            combined.to_csv(lvl_path, index=False)
+        except Exception as e:
+            logger.debug(f"自動儲存夜盤極值至 CSV 失敗: {e}")
+
     def load_overnight_levels_for_strategy(self, strategy: ORBStrategy, target_date_str: str):
         """讀取或查詢指定交易日所對應的前一日夜盤 (15:00~05:00) 極值並注入策略 (防撞牆保護 Wall Filter)"""
         if not getattr(strategy.config, "use_overnight_wall_filter", False):
             return
 
         data_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
-        # 1. 優先從本地高低點彙整表讀取
-        for fn in ["overnight_levels_30days.csv", "overnight_levels_summary.csv"]:
+        # 1. 優先從本地夜盤高低點彙整表 (overnight_levels_summary.csv) 讀取
+        for fn in ["overnight_levels_summary.csv", "overnight_levels_30days.csv"]:
             lvl_path = os.path.join(data_dir, fn)
             if os.path.exists(lvl_path):
                 try:
@@ -884,18 +914,19 @@ class ShioajiTMFTrader:
                 except Exception as e:
                     logger.debug(f"讀取 {fn} 失敗: {e}")
 
-        # 2. 若本地無紀錄且 API 可用，即時從 Shioaji 抓取前一日夜盤 15:00~05:00
-        if self.api is not None and not self.simulation:
+        cur_d = datetime.datetime.strptime(target_date_str, "%Y-%m-%d").date()
+        end_night = datetime.datetime.combine(cur_d, datetime.time(5, 1, 0))
+        start_night = datetime.datetime.combine(cur_d - datetime.timedelta(days=4), datetime.time(15, 0, 0))
+
+        # 2. 若本地無紀錄且 API 可用 (含 live 與 paper 各自已登入之 self.api)，即時從 Shioaji 抓取前一日夜盤 15:00~05:00
+        if self.api is not None and self.contract is not None:
             try:
-                cur_d = datetime.datetime.strptime(target_date_str, "%Y-%m-%d").date()
                 prev_4d = (cur_d - datetime.timedelta(days=4)).strftime("%Y-%m-%d")
                 kbs = self.api.kbars(self.contract, start=prev_4d, end=target_date_str, timeout=5000)
                 df_k = pd.DataFrame({**kbs})
                 if not df_k.empty:
                     df_k.columns = [c.lower() for c in df_k.columns]
                     df_k["ts"] = pd.to_datetime(df_k["ts"])
-                    end_night = datetime.datetime.combine(cur_d, datetime.time(5, 0, 0))
-                    start_night = datetime.datetime.combine(cur_d - datetime.timedelta(days=4), datetime.time(15, 0, 0))
                     subset = df_k[(df_k["ts"] >= start_night) & (df_k["ts"] <= end_night)]
                     evening_bars = subset[subset["ts"].dt.hour >= 15]
                     if not evening_bars.empty:
@@ -906,10 +937,44 @@ class ShioajiTMFTrader:
                             o_h = float(night_bars["high"].max())
                             o_l = float(night_bars["low"].min())
                             strategy.set_overnight_levels(o_h, o_l)
-                            logger.info(f"🌙 [夜盤防撞牆] 從 API 即時取得 {target_date_str} 夜盤極值: 夜高={o_h:.0f}, 夜低={o_l:.0f}")
+                            self._save_overnight_level_to_csv(data_dir, target_date_str, night_bars)
+                            logger.info(f"🌙 [夜盤防撞牆] 從 API 即時取得 {target_date_str} 夜盤極值並寫入 CSV: 夜高={o_h:.0f}, 夜低={o_l:.0f}")
                             return
             except Exception as api_err:
-                logger.warning(f"從 API 抓取夜盤極值略過: {api_err}")
+                logger.warning(f"從 Shioaji API 抓取夜盤極值逾時或略過，嘗試公開行情備援: {api_err}")
+
+        # 3. 免登入公開高速行情備援 (CNYES，完全不觸碰 simulation=False，防模擬主機 kbars 塞車逾時)
+        try:
+            import urllib.request
+            url = "https://ws.api.cnyes.com/ws/api/v1/charting/history?symbol=TWF:TXF:FUTURES&resolution=1&quote=1"
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=5) as r:
+                payload = json.loads(r.read().decode("utf-8"))
+            data = payload.get("data", {})
+            t_list = data.get("t", [])
+            if t_list:
+                df_c = pd.DataFrame({
+                    "ts": [pd.Timestamp(datetime.datetime.fromtimestamp(ts)) for ts in t_list],
+                    "open": data.get("o", []),
+                    "high": data.get("h", []),
+                    "low": data.get("l", []),
+                    "close": data.get("c", []),
+                }).sort_values("ts").reset_index(drop=True)
+                subset = df_c[(df_c["ts"] >= start_night) & (df_c["ts"] <= end_night)]
+                evening_bars = subset[subset["ts"].dt.hour >= 15]
+                if not evening_bars.empty:
+                    last_ev_date = evening_bars["ts"].dt.date.max()
+                    night_start_exact = datetime.datetime.combine(last_ev_date, datetime.time(15, 0, 0))
+                    night_bars = df_c[(df_c["ts"] >= night_start_exact) & (df_c["ts"] <= end_night)]
+                    if not night_bars.empty:
+                        o_h = float(night_bars["high"].max())
+                        o_l = float(night_bars["low"].min())
+                        strategy.set_overnight_levels(o_h, o_l)
+                        self._save_overnight_level_to_csv(data_dir, target_date_str, night_bars)
+                        logger.info(f"🌙 [夜盤防撞牆] 從公開行情備援取得 {target_date_str} 夜盤極值並寫入 CSV: 夜高={o_h:.0f}, 夜低={o_l:.0f}")
+                        return
+        except Exception as cnyes_err:
+            logger.debug(f"從公開備援抓取夜盤極值失敗: {cnyes_err}")
 
         logger.info(f"ℹ️ {target_date_str} 未取得前一日夜盤極值 (或前日休市無夜盤)，維持標準 ORB 模式運作")
 

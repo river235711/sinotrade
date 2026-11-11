@@ -105,7 +105,7 @@ class BacktestEngine:
         # 若啟用夜盤防撞牆濾網，載入該日對應之前一日夜盤極值
         if getattr(eff_cfg, "use_overnight_wall_filter", False) and self.target_date_fmt:
             data_dir = os.path.dirname(os.path.abspath(self.data_path))
-            for fn in ["overnight_levels_30days.csv", "overnight_levels_summary.csv"]:
+            for fn in ["overnight_levels_summary.csv", "overnight_levels_30days.csv"]:
                 levels_file = os.path.join(data_dir, fn)
                 if os.path.exists(levels_file):
                     try:
