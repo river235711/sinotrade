@@ -49,7 +49,7 @@ tmf_daytrading/
 ├── update_20days.py            # 收盤後自動滾動更新 20/60 日資料庫與推送 GitHub
 ├── health_check.py             # 開盤前 (08:35) 全系統健康巡檢模組
 ├── query_account.py            # 實體期貨帳戶部位與保證金即時查詢工具
-├── start_bg.sh / stop.sh / status.sh / tail.sh  # 背景常駐、狀態巡檢與即時日誌監看腳本 (+ 對應 .bat)
+├── start_bg.sh / stop.sh / status.sh / tail.sh  # 背景常駐、狀態巡檢與即時日誌監看腳本
 ├── strategies/                 # 策略邏輯庫
 │   ├── orb_strategy.py         # ORB Pro V2 主力策略 (含 VWAP/EMA、夜盤防撞牆、四階鎖利、SAR)
 │   └── atr_scaler.py           # 20日/60日 ATR 動態波動自適應縮放模組
