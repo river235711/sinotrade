@@ -15,7 +15,7 @@
 保留政策：trader_*.log 與 state_*.json 保留最近 LOG_RETENTION_DAYS 天；orders_*.csv 為稽核紀錄永久保留。
 
 不使用 TimedRotatingFileHandler 的原因：它在午夜需要「重新命名」正在寫入的檔案，
-若 Windows 端 (monitor.bat / 編輯器) 正開著該檔，rename 會失敗並每筆日誌重試報錯。
+若 Windows 端 (PowerShell Get-Content -Wait / 編輯器) 正開著該檔，rename 會失敗並每筆日誌重試報錯。
 改為直接以日期命名新檔，不需任何 rename。
 """
 import os
