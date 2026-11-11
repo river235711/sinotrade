@@ -8,7 +8,7 @@
 - 每張單送出後都會輪詢委託狀態，確認真的 Filled，並取得實際成交價與口數。
 - 送單後再用 list_positions 查帳上真實部位，與策略預期部位對帳。
 - 沒成交、部分成交、卡單：自動撤單、重新對齊策略狀態，必要時強制平倉並停止開新倉。
-- 所有委託與成交結果寫入 logs/orders_YYYYMMDD.csv 供事後核對。
+- 所有委託與成交結果寫入 logs/<live|paper>/orders_YYYYMMDD.csv 供事後核對。
 """
 import os
 import csv
@@ -26,6 +26,7 @@ from strategies.atr_scaler import config_for_date, describe
 from live.notifier import TradeNotifier
 from live.bar_aggregator import BarAggregator
 from live.state_manager import StateManager
+from live.log_setup import get_mode_log_dir
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger("ShioajiTrader")
@@ -69,7 +70,8 @@ class ShioajiTMFTrader:
         self.fill_poll_interval = 0.5           # 輪詢委託狀態的間隔秒數
         self.retry_pause = 1.0                  # 平倉重試之間的等待秒數
         self.reconcile_interval = 30.0          # 平時對帳間隔秒數
-        self.log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
+        # paper / live 日誌、狀態檔、稽核表與外部指令檔完全分開 (logs/paper 或 logs/live)
+        self.log_dir = get_mode_log_dir("paper" if simulation else "live")
 
         # 核心解耦模組：K 棒聚合器與狀態持久化管理器
         self.bar_aggregator = BarAggregator(kbars_disabled=bool(simulation))
@@ -362,7 +364,7 @@ class ShioajiTMFTrader:
         return result
 
     def _audit(self, action: str, qty: int, octype: str, result: FillResult):
-        """把每次委託結果寫入 logs/orders_YYYYMMDD.csv"""
+        """把每次委託結果寫入 logs/<live|paper>/orders_YYYYMMDD.csv"""
         try:
             os.makedirs(self.log_dir, exist_ok=True)
             now = datetime.datetime.now()
@@ -689,7 +691,7 @@ class ShioajiTMFTrader:
         return False
 
     def _check_external_command(self, strategy: ORBStrategy, cur_price: float = 0.0):
-        """每秒檢查 logs/command.json 外部即時指令 (支援對話框或 CLI 隨時下令秒級平倉)"""
+        """每秒檢查 logs/<live|paper>/command.json 外部即時指令 (支援對話框或 CLI 隨時下令秒級平倉)"""
         cmd_path = os.path.join(self.log_dir, "command.json")
         if not os.path.exists(cmd_path):
             return
@@ -1004,7 +1006,7 @@ class ShioajiTMFTrader:
         logger.info("• 雙速引擎: 換分 0.2 秒極速確認突破進場 | 持倉期間每 1 秒即時檢查停損/鎖利 | 每 3 秒更新報價")
         logger.info(f"• 收盤安全時程: {strat_cfg.force_close_time[:5]} 策略平倉 | {failsafe_time[:5]} 底線強制補平 | {shutdown_time[:5]} 零部位安全退出")
         logger.info("• 重啟保護: 自動偵測帳上未平倉部位並無縫接管風控；歷史 K 棒不重播下單")
-        logger.info("• 每張單都會確認成交並與帳上部位對帳，稽核紀錄寫入 logs/orders_YYYYMMDD.csv")
+        logger.info(f"• 每張單都會確認成交並與帳上部位對帳，稽核紀錄寫入 {os.path.relpath(self.log_dir, os.path.dirname(os.path.dirname(self.log_dir)))}/orders_YYYYMMDD.csv")
         logger.info("• 按下 Ctrl+C 可隨時安全停止程式。")
         logger.info("=" * 75)
         self.notifier.send(f"🤖 TMF 自動當沖機器人已啟動 ({today_str})\n口數: {self.quantity}口 | {describe(strat_cfg, atr_info)}")

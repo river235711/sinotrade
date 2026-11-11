@@ -100,7 +100,7 @@ python3 main.py --mode live --contract 202611 --qty 1
 如果交易途中 **Terminal 視窗關閉、網路短暫中斷或電腦重開**：
 - **自動接管真實部位**：重新啟動程式 (`python3 main.py --mode live`) 時，機器人自動透過 Shioaji 查詢帳上真實持倉。若帳上有多單或空單，機器人**立即自動接管**該部位，以券商真實成交成本價重新掛載停損 (-90點)、三階梯保本鎖利與 13:08 強制平倉風控！
 - **歷史 K 棒防重複下單**：盤中重啟時，會自動將當日前段已收盤的 K 棒標記為已處理，**絕不會重播歷史早盤訊號而重複開倉**，僅從當前最新即時行情開始監控。
-- **狀態即時快照**：盤中自動同步將最高浮盈、交易次數與進場時間儲存至 `logs/state_YYYYMMDD.json`，重啟時無縫接續追蹤最高浮損益。
+- **狀態即時快照**：盤中自動同步將最高浮盈、交易次數與進場時間儲存至 `logs/<live|paper>/state_YYYYMMDD.json`，重啟時無縫接續追蹤最高浮損益。
 - **手動平倉同步**：若你在手機 App (大戶投 / iLeader) 手動將部位平倉，機器人下次對帳時會偵測到帳上部位已歸零，自動將策略拉回空手狀態，防止後續誤平倉。
 - **13:08 ~ 13:10:00 提前收盤與絕不留倉底線**：
   1. `13:08:00`：第一道策略強制平倉（避開結算日 13:15 當沖強平、現貨尾盤集合競價與結算甩尾）。
@@ -113,20 +113,34 @@ python3 main.py --mode live --contract 202611 --qty 1
 - **開倉未成交**：策略退回空手；連續 3 次未成交則自動觸發停開新倉保護。
 - **平倉未成交**：若平倉單未成交，自動反覆補平 (最多重試 3 次)，失敗時發出 CRITICAL 警告並停止開新倉。
 - **進場價校正**：開倉成功後，策略停損與鎖利基準自動校正為**券商真實成交均價**，而非回測用的收盤價。
-- **稽核紀錄**：每筆委託與對帳結果即時寫入 `logs/orders_YYYYMMDD.csv`。
+- **稽核紀錄**：每筆委託與對帳結果即時寫入 `logs/<live|paper>/orders_YYYYMMDD.csv`。
 
 ### 4. 推薦背景常駐執行方式 (防止關閉終端機中斷)
-建議使用 `tmux` 或 `nohup` 執行，即便關閉 Terminal 視窗或 SSH 斷線，交易程式仍會在背景持續運作：
+同一時間只允許一支機器人 (paper 或 live) 運行，建議使用專案內建腳本：
 
 ```bash
-# 方法 A：使用 tmux (推薦)
-tmux new -s tmf_trader
-python3 main.py --mode live --contract 202611 --qty 1
-# 離開視窗可按 Ctrl+B 再按 D (Detach)；隨時可用 tmux attach -t tmf_trader 回來查看
-
-# 方法 B：使用 nohup 背景執行
-nohup python3 main.py --mode live --contract 202611 --qty 1 > logs/trader.log 2>&1 &
+./start_bg.sh --mode live --qty 1   # 背景啟動 (paper 改成 --mode paper)
+./status.sh                         # 狀態巡檢 (自動判斷正在跑的模式)
+./tail.sh                           # 即時監看主日誌，等同 tail -f，過午夜自動換到新檔
+./tail.sh stdout                    # 查看 SDK 底層訊息與意外錯誤
+./stop.sh                           # 安全停止
 ```
+
+### 5. 日誌與紀錄檔位置 (paper / live 分開)
+
+```
+logs/
+├── live/
+│   ├── trader_YYYYMMDD.log   # 主日誌 (每日自動分檔，跨日待機不需重啟)
+│   ├── stdout.log            # nohup 輸出：SDK 訊息、子程序輸出、未捕捉例外 (追加寫入，超過 5MB 自動輪替)
+│   ├── state_YYYYMMDD.json   # 策略斷點狀態 (重啟時恢復進度)
+│   ├── orders_YYYYMMDD.csv   # 委託成交稽核 (永久保留)
+│   └── command.json          # 外部即時指令 (main.py --cmd)
+└── paper/                    # 結構相同
+```
+
+- `trader_*.log` 與 `state_*.json` 保留最近 **60 天**，換日時自動清除過期檔 (設定於 `live/log_setup.py` 的 `LOG_RETENTION_DAYS`)。
+- `main.py --cmd close` 會自動送給正在運行的那一支；也可加 `--mode live|paper` 明確指定。
 
 ---
 

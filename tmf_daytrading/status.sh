@@ -1,9 +1,15 @@
 #!/usr/bin/env bash
 # status.sh - 檢查 TMF 交易機器人即時運行狀態
+# 用法: ./status.sh            (自動判斷 live / paper)
+#       ./status.sh live|paper (指定查看某模式)
 BASE_DIR="/mnt/c/Users/ting0/.gemini/antigravity/scratch/tmf_daytrading"
 cd "$BASE_DIR"
+source "$BASE_DIR/_log_common.sh"
 
-PID=$(pgrep -f "main\.py --mode" | head -n 1)
+PID=$(bot_pid)
+MODE=$(resolve_mode "$1")
+LOG_DIR="$BASE_DIR/logs/$MODE"
+TODAY=$(date +%Y%m%d)
 
 echo "================================================================="
 echo "📊 TMF 微型臺指期當沖機器人 - 運行狀態巡檢"
@@ -15,13 +21,13 @@ if [ -n "$PID" ]; then
 else
     echo "🔴 執行狀態: 【未運行 / 已停止】"
 fi
+echo "📂 查看模式: $MODE  (logs/$MODE/)"
 
-TODAY=$(date +%Y%m%d)
-STATE_FILE="$BASE_DIR/logs/state_${TODAY}.json"
+STATE_FILE="$LOG_DIR/state_${TODAY}.json"
 
 if [ -f "$STATE_FILE" ]; then
     echo "-----------------------------------------------------------------"
-    echo "📈 今日策略核心狀態 ($TODAY):"
+    echo "📈 今日策略核心狀態 ($TODAY, $MODE):"
     /mnt/c/Users/ting0/.gemini/antigravity/scratch/sinotrade_trader/venv/bin/python -c "
 import json
 try:
@@ -43,11 +49,18 @@ except Exception as e:
 "
 fi
 
-LOG_FILE="$BASE_DIR/logs/nohup_trader.log"
+LOG_FILE="$LOG_DIR/trader_${TODAY}.log"
 if [ -f "$LOG_FILE" ]; then
     echo "-----------------------------------------------------------------"
-    echo "⏱️ 最新日誌輸出 (最後 5 行):"
+    echo "⏱️ 最新日誌輸出 (logs/$MODE/trader_${TODAY}.log 最後 5 行):"
     tail -n 5 "$LOG_FILE"
+fi
+
+STDOUT_LOG="$LOG_DIR/stdout.log"
+if [ -f "$STDOUT_LOG" ] && grep -qE 'Traceback|\[ERROR\]|\[CRITICAL\]' <(tail -n 200 "$STDOUT_LOG"); then
+    echo "-----------------------------------------------------------------"
+    echo "⚠️ logs/$MODE/stdout.log 近期有錯誤訊息，請檢查："
+    grep -nE 'Traceback|\[ERROR\]|\[CRITICAL\]' <(tail -n 200 "$STDOUT_LOG") | tail -n 3
 fi
 
 echo "================================================================="
