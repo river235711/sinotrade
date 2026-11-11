@@ -2,6 +2,7 @@
 # update_20days.py - 每日收盤後自動滾動更新最新 20 個交易日數據集
 import os
 import sys
+sys.dont_write_bytecode = True
 import json
 import urllib.request
 import datetime
@@ -156,7 +157,7 @@ def roll_20days(target_date: str = None, push_git: bool = True):
     print("\n📊 正在自動重新執行最新 20 日回測並產出報表圖表...")
     backtest_script = os.path.join(base_dir, "run_20days_backtest.py")
     try:
-        subprocess.run([sys.executable, backtest_script], check=True)
+        subprocess.run([sys.executable, "-B", backtest_script], check=True)
     except Exception as e:
         print(f"⚠️ 重新執行回測時發生錯誤: {e}")
 
