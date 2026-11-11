@@ -148,7 +148,7 @@ def run_health_check(mode: str = "live", qty: int = 1, send_notify: bool = True)
     # 檢查項目 5: 下單憑證 (CA Certificate - 實盤專用)
     # -------------------------------------------------------------
     if is_live and api:
-        ca_path = os.environ.get("SHIOAJI_CA_PATH", "").strip()
+        ca_path = os.path.expanduser(os.environ.get("SHIOAJI_CA_PATH", "").strip())
         ca_passwd = os.environ.get("SHIOAJI_CA_PASSWD", "").strip()
         person_id = os.environ.get("SHIOAJI_PERSON_ID", "").strip()
 

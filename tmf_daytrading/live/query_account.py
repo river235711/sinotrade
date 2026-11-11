@@ -10,7 +10,7 @@ import shioaji as sj
 
 api_key = os.environ.get("SHIOAJI_API_KEY", "")
 secret_key = os.environ.get("SHIOAJI_SECRET_KEY", "")
-ca_path = os.environ.get("SHIOAJI_CA_PATH", "")
+ca_path = os.path.expanduser(os.environ.get("SHIOAJI_CA_PATH", ""))
 ca_passwd = os.environ.get("SHIOAJI_CA_PASSWD", "")
 person_id = os.environ.get("SHIOAJI_PERSON_ID", "")
 

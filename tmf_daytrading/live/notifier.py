@@ -12,6 +12,7 @@
 """
 import os
 import json
+import ssl
 import smtplib
 import datetime
 import threading
@@ -22,6 +23,13 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
 logger = logging.getLogger("Notifier")
+
+# macOS / Linux 相容 SSL 上下文 (解決未安裝 root CA 憑證時的握手失敗問題)
+try:
+    import certifi
+    _ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+except Exception:
+    _ssl_ctx = ssl._create_unverified_context()
 
 
 class TradeNotifier:
@@ -107,7 +115,7 @@ class TradeNotifier:
                 req = urllib.request.Request(
                     url, data=payload, headers={"Content-Type": "application/json"}
                 )
-                with urllib.request.urlopen(req, timeout=4) as _:
+                with urllib.request.urlopen(req, timeout=4, context=_ssl_ctx) as _:
                     pass
             except Exception as e:
                 logger.debug(f"Telegram 推播失敗: {e}")
@@ -121,7 +129,7 @@ class TradeNotifier:
                     data=payload,
                     headers={"Content-Type": "application/json", "User-Agent": "TMFBot/1.0"},
                 )
-                with urllib.request.urlopen(req, timeout=4) as _:
+                with urllib.request.urlopen(req, timeout=4, context=_ssl_ctx) as _:
                     pass
             except Exception as e:
                 logger.debug(f"Discord 推播失敗: {e}")
@@ -147,7 +155,7 @@ class TradeNotifier:
                         "Authorization": f"Bearer {self.line_channel_access_token}"
                     }
                 )
-                with urllib.request.urlopen(req, timeout=4) as _:
+                with urllib.request.urlopen(req, timeout=4, context=_ssl_ctx) as _:
                     pass
                 logger.info("📱 LINE 推播通知已成功送達")
             except urllib.error.HTTPError as http_err:
@@ -178,7 +186,7 @@ class TradeNotifier:
                     data=data,
                     headers={"Authorization": f"Bearer {self.line_token}"},
                 )
-                with urllib.request.urlopen(req, timeout=5) as _:
+                with urllib.request.urlopen(req, timeout=5, context=_ssl_ctx) as _:
                     pass
             except Exception as e:
                 logger.debug(f"LINE 推播失敗: {e}")

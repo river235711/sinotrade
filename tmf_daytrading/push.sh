@@ -10,6 +10,7 @@ if [ -d "$SEPARATE_REPO/.git" ]; then
     REPO_DIR="$SEPARATE_REPO"
     echo "🔄 同步檔案至 Git 倉庫..."
     rsync -av --delete \
+      --exclude='.git/' \
       --exclude='.env' \
       --exclude='*.pfx' \
       --exclude='*.pem' \
@@ -17,6 +18,7 @@ if [ -d "$SEPARATE_REPO/.git" ]; then
       --exclude='venv/' \
       --exclude='.venv/' \
       --exclude='__pycache__/' \
+      --exclude='Daily_*.csv' \
       --exclude='*.log' \
       "$SRC_DIR/" "$REPO_DIR/tmf_daytrading/"
 else

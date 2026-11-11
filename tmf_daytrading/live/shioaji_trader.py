@@ -763,26 +763,34 @@ class ShioajiTMFTrader:
     # ------------------------------------------------------------------
     # K 棒與主迴圈
     # ------------------------------------------------------------------
+    def _fetch_cnyes_history(self, timeout: int = 5) -> pd.DataFrame:
+        """從 CNYES 公開行情介面抓取近月台指期 1分K 資料 (使用跨平台 SSL 上下文)"""
+        import urllib.request
+        from live.notifier import _ssl_ctx
+
+        url = "https://ws.api.cnyes.com/ws/api/v1/charting/history?symbol=TWF:TXF:FUTURES&resolution=1&quote=1"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=timeout, context=_ssl_ctx) as r:
+            payload = json.loads(r.read().decode("utf-8"))
+        data = payload.get("data", {})
+        t_list = data.get("t", [])
+        if not t_list:
+            return pd.DataFrame()
+        return pd.DataFrame({
+            "ts": [pd.Timestamp(datetime.datetime.fromtimestamp(ts)) for ts in t_list],
+            "open": data.get("o", []),
+            "high": data.get("h", []),
+            "low": data.get("l", []),
+            "close": data.get("c", []),
+            "volume": data.get("v", []),
+        })
+
     def _fetch_backup_intraday_kbars(self, today_str: str) -> pd.DataFrame:
         """當永豐模擬環境 api.kbars 壅塞逾時時，自動從高速台指期 1分K 備援通道回補今日已收盤 K 棒"""
         try:
-            import urllib.request
-            url = "https://ws.api.cnyes.com/ws/api/v1/charting/history?symbol=TWF:TXF:FUTURES&resolution=1&quote=1"
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=4) as r:
-                payload = json.loads(r.read().decode("utf-8"))
-            data = payload.get("data", {})
-            t_list = data.get("t", [])
-            if not t_list:
+            df = self._fetch_cnyes_history(timeout=4)
+            if df.empty:
                 return pd.DataFrame()
-            df = pd.DataFrame({
-                "ts": [pd.Timestamp(datetime.datetime.fromtimestamp(ts)) for ts in t_list],
-                "open": data.get("o", []),
-                "high": data.get("h", []),
-                "low": data.get("l", []),
-                "close": data.get("c", []),
-                "volume": data.get("v", []),
-            })
             df = df.set_index("ts").sort_index()
             day_df = df[df.index.strftime("%Y-%m-%d") == today_str].between_time("08:45", "13:45")
             return day_df[["open", "high", "low", "close", "volume"]].copy()
@@ -984,21 +992,9 @@ class ShioajiTMFTrader:
 
         # 3. 免登入公開高速行情備援 (CNYES，完全不觸碰 simulation=False，防模擬主機 kbars 塞車逾時)
         try:
-            import urllib.request
-            url = "https://ws.api.cnyes.com/ws/api/v1/charting/history?symbol=TWF:TXF:FUTURES&resolution=1&quote=1"
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=5) as r:
-                payload = json.loads(r.read().decode("utf-8"))
-            data = payload.get("data", {})
-            t_list = data.get("t", [])
-            if t_list:
-                df_c = pd.DataFrame({
-                    "ts": [pd.Timestamp(datetime.datetime.fromtimestamp(ts)) for ts in t_list],
-                    "open": data.get("o", []),
-                    "high": data.get("h", []),
-                    "low": data.get("l", []),
-                    "close": data.get("c", []),
-                }).sort_values("ts").reset_index(drop=True)
+            df_raw = self._fetch_cnyes_history(timeout=5)
+            if not df_raw.empty:
+                df_c = df_raw[["ts", "open", "high", "low", "close"]].sort_values("ts").reset_index(drop=True)
                 subset = df_c[(df_c["ts"] >= start_night) & (df_c["ts"] <= end_night)]
                 evening_bars = subset[subset["ts"].dt.hour >= 15]
                 if not evening_bars.empty:

@@ -19,12 +19,14 @@ if [ -d "$SEPARATE_REPO/.git" ]; then
     echo ""
     echo "🧹 正在將最新檔案同步至執行目錄 (並自動清除比 Git 多出的舊檔)..."
     rsync -av --delete \
+      --exclude='.git/' \
       --exclude='.env' \
       --exclude='*.pfx' \
       --exclude='*.pem' \
       --exclude='logs/' \
       --exclude='venv/' \
       --exclude='.venv/' \
+      --exclude='Daily_*.csv' \
       --exclude='push.sh' \
       "$SEPARATE_REPO/tmf_daytrading/" "$DEST_DIR/"
 elif git -C "$DEST_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then

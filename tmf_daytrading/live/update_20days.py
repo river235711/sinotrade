@@ -73,7 +73,13 @@ def fetch_intraday_kbars_cnyes(today_str: str) -> pd.DataFrame:
     try:
         url = "https://ws.api.cnyes.com/ws/api/v1/charting/history?symbol=TWF:TXF:FUTURES&resolution=1&quote=1"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=8) as r:
+        import ssl
+        try:
+            import certifi
+            ctx = ssl.create_default_context(cafile=certifi.where())
+        except Exception:
+            ctx = ssl._create_unverified_context()
+        with urllib.request.urlopen(req, timeout=8, context=ctx) as r:
             payload = json.loads(r.read().decode("utf-8"))
         data = payload.get("data", {})
         t_list = data.get("t", [])
@@ -178,5 +184,10 @@ def roll_20days(target_date: str = None, push_git: bool = True):
     return True
 
 if __name__ == "__main__":
-    t_date = sys.argv[1] if len(sys.argv) > 1 else None
-    roll_20days(t_date)
+    import argparse
+    parser = argparse.ArgumentParser(description="TMF 盤後滾動更新 20/60 日資料庫與回測")
+    parser.add_argument("date", nargs="?", default=None, help="指定更新日期 YYYY-MM-DD (預設今日)")
+    parser.add_argument("--no-push", action="store_true", help="僅本地更新與重跑回測，不執行 push.sh 推送")
+    args = parser.parse_args()
+    ok = roll_20days(args.date, push_git=not args.no_push)
+    sys.exit(0 if ok else 1)
