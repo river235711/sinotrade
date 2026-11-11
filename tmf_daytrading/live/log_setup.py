@@ -30,6 +30,8 @@ LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
 VALID_MODES = ("live", "paper")
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+os.makedirs(os.path.join(_PROJECT_ROOT, "logs"), exist_ok=True)
+os.environ.setdefault("SJ_LOG_PATH", os.path.join(_PROJECT_ROOT, "logs", "shioaji.log"))
 _PRUNE_PATTERNS = (
     re.compile(r"^trader_(\d{8})\.log$"),
     re.compile(r"^state_(\d{8})\.json$"),

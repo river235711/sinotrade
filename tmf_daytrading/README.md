@@ -44,20 +44,28 @@
 tmf_daytrading/
 ├── .env.example                # 永豐金 Shioaji API 金鑰設定範本
 ├── config.py                   # 商品規格、API 設定與 ORB Pro 策略參數
-├── main.py                     # 系統主入口 (支援 backtest / paper / live 模式)
-├── run_backtest.py             # 單一交易日回測腳本
-├── run_10days_backtest.py      # 前 10 個交易日回測腳本
-├── run_20days_backtest.py      # 前 20 個交易日回測腳本
+├── main.py                     # 系統主入口 (支援 backtest / paper / live 模式與 --cmd 即時指令)
+├── run_20days_backtest.py      # 最新 20 個交易日回測與圖表生成腳本
+├── update_20days.py            # 收盤後自動滾動更新 20/60 日資料庫與推送 GitHub
+├── health_check.py             # 開盤前 (08:35) 全系統健康巡檢模組
+├── query_account.py            # 實體期貨帳戶部位與保證金即時查詢工具
+├── start_bg.sh / stop.sh / status.sh / tail.sh  # 背景常駐、狀態巡檢與即時日誌監看腳本 (+ 對應 .bat)
 ├── strategies/                 # 策略邏輯庫
-│   ├── orb_strategy.py         # ORB Pro V2 主力策略 (含 VWAP/EMA、三階鎖利、SAR)
-│   └── dual_ema_strategy.py    # 雙均線 + VWAP 順勢策略模板
+│   ├── orb_strategy.py         # ORB Pro V2 主力策略 (含 VWAP/EMA、夜盤防撞牆、四階鎖利、SAR)
+│   └── atr_scaler.py           # 20日/60日 ATR 動態波動自適應縮放模組
 ├── backtester/                 # 回測核心引擎
 │   ├── engine.py               # 1分K合成與逐根回測引擎
 │   └── metrics.py              # 績效統計器 (含手續費、稅、滑價與 MDD 計算)
 ├── live/                       # 實盤/模擬下單模組
-│   └── shioaji_trader.py       # 永豐 Shioaji 自動看盤、下單與 13:25 安全平倉機器人
+│   ├── shioaji_trader.py       # 永豐 Shioaji 自動看盤、下單與 13:08~13:10 安全平倉機器人
+│   ├── bar_aggregator.py       # 即時 Tick 串流合成 1分K 聚合器
+│   ├── state_manager.py        # 持倉與策略斷點狀態原子化持久化管理器
+│   ├── log_setup.py            # paper / live 日誌分流與每日自動換檔管理 (保留 60 天)
+│   └── notifier.py             # LINE Messaging API 與 Gmail 雙通道推播模組
 └── data/
-    └── tmf_20days_1m_kbars.csv # 20 個交易日 1分K 輕量快取檔 (克隆後可立即秒級回測)
+    ├── tmf_20days_1m_kbars.csv         # 20 個交易日 1分K 滾動快取檔
+    ├── daily_bars.csv                  # 60 日 ATR 動態基準與歷史日 K 總表
+    └── overnight_levels_summary.csv    # 每日夜盤 (15:00~05:00) 高低點彙整表
 ```
 
 ---
@@ -73,11 +81,8 @@ cp .env.example .env
 
 ### 2. 執行歷史回測 (無需 API Key)
 ```bash
-# 執行前 20 個交易日回測
+# 執行最新 20 個交易日回測 (亦可執行 python3 main.py --mode backtest)
 python3 run_20days_backtest.py
-
-# 執行前 10 個交易日回測
-python3 run_10days_backtest.py
 ```
 
 ### 3. 開盤日啟動自動交易機器人 (建議 08:40 ~ 08:45 啟動)
@@ -149,5 +154,5 @@ logs/
 專案包含完整的模擬券商行為單元測試（涵蓋全部成交、未成交撤單、部分成交、卡單、手動平倉對齊、重啟接管多空單、最高浮盈恢復、歷史 K 棒過濾與 13:22 強制補平），**不需要 API Key** 即可直接驗證：
 
 ```bash
-python3 tests/test_live_verification.py
+python3 -m unittest discover -s tests -p "test_*.py"
 ```

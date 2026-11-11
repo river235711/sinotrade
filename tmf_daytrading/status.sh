@@ -4,7 +4,7 @@
 #       ./status.sh live|paper (指定查看某模式)
 BASE_DIR="/mnt/c/Users/ting0/.gemini/antigravity/scratch/tmf_daytrading"
 cd "$BASE_DIR"
-source "$BASE_DIR/_log_common.sh"
+source "$BASE_DIR/live/_log_common.sh"
 
 PID=$(bot_pid)
 MODE=$(resolve_mode "$1")

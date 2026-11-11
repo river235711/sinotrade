@@ -1,6 +1,6 @@
 import os
-import shioaji as sj
 import config
+import shioaji as sj
 
 api_key = os.environ.get("SHIOAJI_API_KEY", "")
 secret_key = os.environ.get("SHIOAJI_SECRET_KEY", "")

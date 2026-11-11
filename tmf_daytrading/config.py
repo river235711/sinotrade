@@ -2,7 +2,13 @@
 TMF (微型臺指期) 當沖交易設定與常數 (Pro 翻修獲利版)
 """
 import os
+import sys
 from dataclasses import dataclass
+
+sys.dont_write_bytecode = True
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+os.makedirs(os.path.join(_BASE_DIR, "logs"), exist_ok=True)
+os.environ.setdefault("SJ_LOG_PATH", os.path.join(_BASE_DIR, "logs", "shioaji.log"))
 
 def _load_env_file():
     """自動載入同目錄下的 .env 設定檔"""

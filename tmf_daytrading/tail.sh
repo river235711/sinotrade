@@ -4,7 +4,7 @@
 #       ./tail.sh live|paper (指定模式)
 #       ./tail.sh stdout     (查看目前模式的 SDK/錯誤輸出 stdout.log)
 BASE_DIR="/mnt/c/Users/ting0/.gemini/antigravity/scratch/tmf_daytrading"
-source "$BASE_DIR/_log_common.sh"
+source "$BASE_DIR/live/_log_common.sh"
 
 if [ "$1" == "stdout" ]; then
     MODE=$(resolve_mode "$2")
