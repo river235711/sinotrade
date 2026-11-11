@@ -4,6 +4,7 @@
 #       ./tail.sh live|paper (指定模式)
 #       ./tail.sh stdout     (查看目前模式的 SDK/錯誤輸出 stdout.log)
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$BASE_DIR"
 source "$BASE_DIR/live/_log_common.sh"
 
 if [ "$1" == "stdout" ]; then
@@ -13,19 +14,56 @@ if [ "$1" == "stdout" ]; then
 fi
 
 MODE=$(resolve_mode "$1")
-trap 'echo; exit 0' INT
 
-while true; do
-    TODAY=$(date +%Y%m%d)
-    FILE="$BASE_DIR/logs/$MODE/trader_${TODAY}.log"
-    echo "📡 監看 logs/$MODE/trader_${TODAY}.log (Ctrl+C 離開，不影響機器人)"
-    if command -v timeout >/dev/null 2>&1 && date -d 'tomorrow 00:00:00' +%s >/dev/null 2>&1; then
-        SECS_TO_MIDNIGHT=$(( $(date -d 'tomorrow 00:00:00' +%s) - $(date +%s) + 2 ))
-        # --foreground：讓 tail 留在終端機前景行程群組，Ctrl+C 才收得到
-        timeout --foreground "$SECS_TO_MIDNIGHT" tail -n 20 -F "$FILE" 2>/dev/null
-        [ $? -ne 124 ] && exit 0
-    else
-        # macOS BSD 環境備援
-        exec tail -n 20 -F "$FILE"
-    fi
-done
+# 使用內建 Python 計算距離午夜秒數並管理 tail 子程序，確保 macOS / Linux / WSL 皆可不中斷跨日自動換檔與 Ctrl+C 秒退
+exec "$PYTHON_BIN" -B -c '
+import datetime, os, signal, subprocess, sys, time
+
+base_dir, mode = sys.argv[1], sys.argv[2]
+proc = None
+
+def _stop(signum=None, frame=None):
+    if proc is not None and proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=1)
+        except Exception:
+            proc.kill()
+    print("", flush=True)
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, _stop)
+signal.signal(signal.SIGTERM, _stop)
+
+while True:
+    now = datetime.datetime.now()
+    today = now.strftime("%Y%m%d")
+    log_file = os.path.join(base_dir, "logs", mode, f"trader_{today}.log")
+    print(f"📡 監看 logs/{mode}/trader_{today}.log (Ctrl+C 離開，不影響機器人)", flush=True)
+    tomorrow = (now + datetime.timedelta(days=1)).replace(hour=0, minute=0, second=2, microsecond=0)
+
+    # 等待當日檔案建立後再啟動 tail -F (防止 macOS BSD tail 在跨午夜新檔尚未寫入前直接退出)
+    while not os.path.exists(log_file):
+        if datetime.datetime.now() >= tomorrow:
+            break
+        time.sleep(0.5)
+
+    if datetime.datetime.now() >= tomorrow:
+        print("\n🌅 已跨午夜，自動切換至今日日誌...", flush=True)
+        continue
+
+    secs = max(1.0, (tomorrow - datetime.datetime.now()).total_seconds())
+    proc = subprocess.Popen(["tail", "-n", "20", "-F", log_file], stderr=subprocess.DEVNULL)
+    try:
+        proc.wait(timeout=secs)
+        break
+    except subprocess.TimeoutExpired:
+        proc.terminate()
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        print("\n🌅 已跨午夜，自動切換至今日日誌...", flush=True)
+    except KeyboardInterrupt:
+        _stop()
+' "$BASE_DIR" "$MODE"

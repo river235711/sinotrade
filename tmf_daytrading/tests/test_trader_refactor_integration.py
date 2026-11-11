@@ -101,6 +101,28 @@ class TestTraderRefactorIntegration(unittest.TestCase):
         self.assertTrue(self.trader._stop_requested)
         self.assertTrue(self.trader._wake_event.is_set())
 
+    def test_cross_platform_detect_running_mode(self):
+        """驗證 main._detect_running_mode 使用 ps -eo 跨平台偵測 (macOS / Linux / WSL)"""
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        import main as entry_main
+
+        fake_ps_out = (
+            f"  {os.getpid()} python3 -B main.py --cmd close\n"
+            "  45123 /Users/demo/venv/bin/python -B main.py --mode live --qty 1\n"
+        )
+        with patch("main.subprocess.run", return_value=SimpleNamespace(returncode=0, stdout=fake_ps_out)):
+            self.assertEqual(entry_main._detect_running_mode(), "live")
+
+        fake_ps_eq = "  8888 /opt/homebrew/bin/python3 /app/main.py --mode=paper\n"
+        with patch("main.subprocess.run", return_value=SimpleNamespace(returncode=0, stdout=fake_ps_eq)):
+            self.assertEqual(entry_main._detect_running_mode(), "paper")
+
+        fake_ps_cmd_only = "  9999 python3 main.py --mode live --cmd close\n"
+        with patch("main.subprocess.run", return_value=SimpleNamespace(returncode=0, stdout=fake_ps_cmd_only)), \
+             patch("main.os.path.isdir", return_value=False):
+            self.assertIsNone(entry_main._detect_running_mode())
+
 
 if __name__ == "__main__":
     unittest.main()

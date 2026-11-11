@@ -10,31 +10,74 @@ TMF (微型臺指期) 當沖交易系統主入口
 import os
 import sys
 import json
+import shlex
 import datetime
 import argparse
-from typing import Optional
+import subprocess
+from typing import List, Optional
 from live.log_setup import get_mode_log_dir, setup_mode_logging, VALID_MODES
 
 
+def _parse_mode_from_args(args: List[str]) -> Optional[str]:
+    """從命令列參數串列解析運行中的機器人模式 (live / paper)，忽略短暫的 --cmd 呼叫"""
+    if not any(os.path.basename(a) == "main.py" for a in args):
+        return None
+    if "--cmd" in args or any(a.startswith("--cmd=") for a in args):
+        return None
+    for i, a in enumerate(args):
+        if a == "--mode" and i + 1 < len(args) and args[i + 1] in VALID_MODES:
+            return args[i + 1]
+        if a.startswith("--mode="):
+            val = a.split("=", 1)[1]
+            if val in VALID_MODES:
+                return val
+    return None
+
+
 def _detect_running_mode() -> Optional[str]:
-    """從 /proc 找出正在運行的機器人模式 (live / paper)，找不到回傳 None"""
+    """跨平台 (macOS / Linux / WSL) 找出正在運行的機器人模式 (live / paper)，找不到回傳 None"""
+    my_pid = os.getpid()
+
+    # 1. 優先使用 POSIX ps -eo pid=,args= (macOS 與 Linux/WSL 皆支援)
+    try:
+        res = subprocess.run(
+            ["ps", "-eo", "pid=,args="],
+            capture_output=True, text=True, timeout=3, check=False
+        )
+        if res.returncode == 0 and res.stdout:
+            for line in res.stdout.splitlines():
+                parts = line.strip().split(None, 1)
+                if len(parts) < 2 or not parts[0].isdigit():
+                    continue
+                if int(parts[0]) == my_pid:
+                    continue
+                try:
+                    args = shlex.split(parts[1])
+                except ValueError:
+                    args = parts[1].split()
+                mode = _parse_mode_from_args(args)
+                if mode:
+                    return mode
+            return None
+    except Exception:
+        pass
+
+    # 2. 備援：若無 ps 可用，於 Linux/WSL 改掃描 /proc
     proc_dir = "/proc"
     if not os.path.isdir(proc_dir):
         return None
-    my_pid = str(os.getpid())
+    my_pid_str = str(my_pid)
     for pid in os.listdir(proc_dir):
-        if not pid.isdigit() or pid == my_pid:
+        if not pid.isdigit() or pid == my_pid_str:
             continue
         try:
             with open(os.path.join(proc_dir, pid, "cmdline"), "rb") as f:
                 args = [a.decode("utf-8", "ignore") for a in f.read().split(b"\0") if a]
         except OSError:
             continue
-        if not any(a.endswith("main.py") for a in args) or "--mode" not in args:
-            continue
-        idx = args.index("--mode")
-        if idx + 1 < len(args) and args[idx + 1] in VALID_MODES:
-            return args[idx + 1]
+        mode = _parse_mode_from_args(args)
+        if mode:
+            return mode
     return None
 
 
