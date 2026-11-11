@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# stop.sh - 安全停止 TMF 交易機器人
-BASE_DIR="/mnt/c/Users/ting0/.gemini/antigravity/scratch/tmf_daytrading"
+# stop.sh - 安全停止 TMF 交易機器人 (跨平台相容 macOS / Linux / WSL)
+BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$BASE_DIR"
 
 PIDS=$(pgrep -f "main\.py --mode")

@@ -1,20 +1,27 @@
 #!/usr/bin/env bash
+# push.sh - 將工作目錄更動同步至 Git 倉庫並推送至 GitHub (跨平台相容 macOS / Linux / WSL)
 set -e
 
 MSG="${1:-Update TMF daytrading system}"
-SRC_DIR="/mnt/c/Users/ting0/.gemini/antigravity/scratch/tmf_daytrading"
-REPO_DIR="/mnt/c/Users/ting0/.gemini/antigravity/scratch/sinotrade_repo"
+SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SEPARATE_REPO="$SRC_DIR/../sinotrade_repo"
 
-echo "🔄 同步檔案至 Git 倉庫..."
-rsync -av --delete \
-  --exclude='.env' \
-  --exclude='*.pfx' \
-  --exclude='*.pem' \
-  --exclude='logs/' \
-  --exclude='__pycache__/' \
-  --exclude='*.log' \
-  --exclude='push.sh' \
-  "$SRC_DIR/" "$REPO_DIR/tmf_daytrading/"
+if [ -d "$SEPARATE_REPO/.git" ]; then
+    REPO_DIR="$SEPARATE_REPO"
+    echo "🔄 同步檔案至 Git 倉庫..."
+    rsync -av --delete \
+      --exclude='.env' \
+      --exclude='*.pfx' \
+      --exclude='*.pem' \
+      --exclude='logs/' \
+      --exclude='venv/' \
+      --exclude='.venv/' \
+      --exclude='__pycache__/' \
+      --exclude='*.log' \
+      "$SRC_DIR/" "$REPO_DIR/tmf_daytrading/"
+else
+    REPO_DIR="$SRC_DIR"
+fi
 
 cd "$REPO_DIR"
 CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)

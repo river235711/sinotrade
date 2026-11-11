@@ -2,7 +2,7 @@
 # status.sh - 檢查 TMF 交易機器人即時運行狀態
 # 用法: ./status.sh            (自動判斷 live / paper)
 #       ./status.sh live|paper (指定查看某模式)
-BASE_DIR="/mnt/c/Users/ting0/.gemini/antigravity/scratch/tmf_daytrading"
+BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$BASE_DIR"
 source "$BASE_DIR/live/_log_common.sh"
 
@@ -28,7 +28,7 @@ STATE_FILE="$LOG_DIR/state_${TODAY}.json"
 if [ -f "$STATE_FILE" ]; then
     echo "-----------------------------------------------------------------"
     echo "📈 今日策略核心狀態 ($TODAY, $MODE):"
-    /mnt/c/Users/ting0/.gemini/antigravity/scratch/sinotrade_trader/venv/bin/python -c "
+    "$PYTHON_BIN" -B -c "
 import json
 try:
     with open('$STATE_FILE', 'r', encoding='utf-8') as f:

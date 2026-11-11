@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# query_account.sh - 查詢永豐金期貨真實帳戶餘額與部位
-BASE_DIR="/mnt/c/Users/ting0/.gemini/antigravity/scratch/tmf_daytrading"
+# query_account.sh - 查詢永豐金期貨實體帳戶部位與保證金 (跨平台相容 macOS / Linux / WSL)
+BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$BASE_DIR"
-/mnt/c/Users/ting0/.gemini/antigravity/scratch/sinotrade_trader/venv/bin/python query_account.py
+source "$BASE_DIR/live/_log_common.sh"
+"$PYTHON_BIN" -B query_account.py "$@"

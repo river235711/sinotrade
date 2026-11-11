@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
 # start_bg.sh - 在背景 (nohup) 獨立啟動 TMF 交易機器人 (不怕關閉終端機/IDE)
 # 同一時間只允許一支機器人 (paper 或 live) 運行；日誌依模式分開存放於 logs/<mode>/
-BASE_DIR="/mnt/c/Users/ting0/.gemini/antigravity/scratch/tmf_daytrading"
+BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$BASE_DIR"
+source "$BASE_DIR/live/_log_common.sh"
 
-PID=$(pgrep -f "main\.py --mode" | head -n 1)
+PID=$(bot_pid)
 
 echo "================================================================="
 echo "🚀 啟動 TMF 微型臺指期當沖機器人 (背景常駐守護模式)"
 echo "================================================================="
 
 if [ -n "$PID" ]; then
-    RUNNING_MODE=$(ps -o args= -p "$PID" | sed -n 's/.*--mode \([a-z]*\).*/\1/p')
+    RUNNING_MODE=$(ps -o args= -p "$PID" 2>/dev/null | sed -n 's/.*--mode \([a-z]*\).*/\1/p')
     echo "⚠️ 機器人已經在背景運行中！(PID: $PID, 模式: ${RUNNING_MODE:-未知})"
     echo "如需重啟或切換模式，請先執行 ./stop.sh 停止後再啟動。"
     echo "================================================================="
@@ -55,15 +56,15 @@ LOG_DIR="logs/$MODE"
 mkdir -p "$LOG_DIR"
 STDOUT_LOG="$LOG_DIR/stdout.log"
 
-# stdout.log 只放 SDK 底層訊息與意外錯誤，超過 5MB 時保留一份舊檔後重新開始
-if [ -f "$STDOUT_LOG" ] && [ "$(stat -c %s "$STDOUT_LOG")" -gt 5242880 ]; then
+# stdout.log 只放 SDK 底層訊息與意外錯誤，超過 5MB 時保留一份舊檔後重新開始 (相容 macOS 與 Linux)
+if [ -f "$STDOUT_LOG" ] && [ "$(wc -c < "$STDOUT_LOG")" -gt 5242880 ]; then
     mv -f "$STDOUT_LOG" "$STDOUT_LOG.1"
 fi
 
 echo "啟動參數: 模式=[$MODE], 下單口數=[$QTY]"
 echo "========== $(date '+%Y-%m-%d %H:%M:%S') 啟動 main.py --mode $MODE --qty $QTY ==========" >> "$STDOUT_LOG"
 
-nohup /mnt/c/Users/ting0/.gemini/antigravity/scratch/sinotrade_trader/venv/bin/python main.py --mode "$MODE" --qty "$QTY" >> "$STDOUT_LOG" 2>&1 &
+PYTHONDONTWRITEBYTECODE=1 nohup "$PYTHON_BIN" -B main.py --mode "$MODE" --qty "$QTY" >> "$STDOUT_LOG" 2>&1 &
 NEW_PID=$!
 
 sleep 2

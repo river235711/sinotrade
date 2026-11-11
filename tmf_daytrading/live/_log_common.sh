@@ -1,7 +1,25 @@
 #!/usr/bin/env bash
-# _log_common.sh - 供 status.sh / tail.sh 共用：判斷目前要看的模式 (live / paper)
-# 優先順序：1. 命令列參數  2. 正在運行的機器人  3. 最近有寫入日誌的模式
-BASE_DIR="/mnt/c/Users/ting0/.gemini/antigravity/scratch/tmf_daytrading"
+# _log_common.sh - 供各腳本共用：自動定位專案根目錄、Python 虛擬環境與運行模式 (跨平台相容 macOS / Linux / WSL)
+BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+find_python() {
+    local c
+    for c in \
+        "$BASE_DIR/venv/bin/python" \
+        "$BASE_DIR/.venv/bin/python" \
+        "$BASE_DIR/../sinotrade_trader/venv/bin/python" \
+        "$BASE_DIR/../venv/bin/python" \
+        "$(command -v python3 2>/dev/null)" \
+        "$(command -v python 2>/dev/null)"; do
+        if [ -n "$c" ] && [ -x "$c" ]; then
+            echo "$c"
+            return
+        fi
+    done
+    echo "python3"
+}
+
+PYTHON_BIN="$(find_python)"
 
 bot_pid() {
     pgrep -f "main\.py --mode" | head -n 1
@@ -17,7 +35,7 @@ resolve_mode() {
     pid=$(bot_pid)
     if [ -n "$pid" ]; then
         local m
-        m=$(ps -o args= -p "$pid" | sed -n 's/.*--mode \([a-z]*\).*/\1/p')
+        m=$(ps -o args= -p "$pid" 2>/dev/null | sed -n 's/.*--mode \([a-z]*\).*/\1/p')
         if [[ "$m" == "live" || "$m" == "paper" ]]; then
             echo "$m"
             return
