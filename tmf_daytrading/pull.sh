@@ -21,6 +21,7 @@ if [ -d "$SEPARATE_REPO/.git" ]; then
     rsync -av --delete \
       --exclude='.git/' \
       --exclude='.env' \
+      --exclude='certs/' \
       --exclude='*.pfx' \
       --exclude='*.pem' \
       --exclude='logs/' \
@@ -37,6 +38,7 @@ elif git -C "$DEST_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     echo "🧹 正在清理本地多餘的未追蹤檔案與快取 (保留 .env, 憑證與 logs/)..."
     git clean -fdx \
       -e '.env' \
+      -e 'certs/' \
       -e '*.pfx' \
       -e '*.pem' \
       -e 'logs/' \
