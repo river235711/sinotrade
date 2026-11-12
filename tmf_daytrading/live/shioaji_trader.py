@@ -88,6 +88,7 @@ class ShioajiTMFTrader:
         self._last_wake_price: float = 0.0
         self._eod_close_notified: bool = False
         self._eod_done_date: Optional[str] = None
+        self._holiday_detected: bool = False
 
         # 風控狀態
         self.is_kill_switch_triggered = False   # True 時拒絕所有委託 (含平倉)，僅供緊急手動使用
@@ -269,7 +270,7 @@ class ShioajiTMFTrader:
         """盤中斷線自動重連機制 (含 15 秒冷卻保護，非交易時段且零部位時不重連)"""
         now = datetime.datetime.now()
         now_str = now.strftime("%H:%M:%S")
-        is_trading_window = (now.weekday() < 5) and ("08:30:00" <= now_str <= "13:45:00")
+        is_trading_window = (now.weekday() < 5) and ("08:30:00" <= now_str <= "13:45:00") and not getattr(self, "_holiday_detected", False)
         strat = getattr(self, "_active_strategy", None)
         has_pos = (strat is not None and strat.position != 0) or getattr(self, "pending_flatten", False)
 
@@ -324,7 +325,7 @@ class ShioajiTMFTrader:
 
     def keep_alive_heartbeat(self):
         """主動向券商主機發送輕量保活查詢 (Ping)，維持 TCP Session 熱連線，防閒置逾時 (僅在盤中在線時運作)"""
-        if self.api is None or self.simulation:
+        if self.api is None or self.simulation or getattr(self, "_holiday_detected", False):
             return
         now = datetime.datetime.now()
         now_str = now.strftime("%H:%M:%S")
@@ -845,6 +846,29 @@ class ShioajiTMFTrader:
             logger.debug(f"備援 K 棒回補失敗: {e}")
             return pd.DataFrame()
 
+    @staticmethod
+    def _is_today_day_session_snapshot(snap, today_str: str) -> bool:
+        """
+        驗證 Shioaji 快照是否屬於「今日日盤 (08:45:00 ~ 13:46:00)」。
+        可防止颱風天、國定假日或開盤前讀取到前一日收盤或昨夜盤 05:00 殘留價格。
+        """
+        snap_ts_raw = getattr(snap, "ts", None)
+        if snap_ts_raw is None or not isinstance(snap_ts_raw, (int, float, str, datetime.datetime, pd.Timestamp)):
+            return True
+        try:
+            if isinstance(snap_ts_raw, (int, float)):
+                if snap_ts_raw <= 0:
+                    return False
+                snap_dt = pd.to_datetime(int(snap_ts_raw)).to_pydatetime()
+            else:
+                snap_dt = pd.to_datetime(snap_ts_raw).to_pydatetime()
+            return (
+                snap_dt.strftime("%Y-%m-%d") == today_str
+                and datetime.time(8, 45, 0) <= snap_dt.time() <= datetime.time(13, 46, 0)
+            )
+        except Exception:
+            return False
+
     def fetch_today_day_kbars(self) -> pd.DataFrame:
         """從 Shioaji 抓取今日日盤 (08:45 ~ 13:45) 1分K 資料 (委由 BarAggregator 管理即時 Tick 串流合成 + Snapshot 快照防逾時)"""
         if self.api is None or self.contract is None:
@@ -883,7 +907,7 @@ class ShioajiTMFTrader:
                     s = snaps[0]
                     price = float(getattr(s, "close", 0.0) or 0.0)
                     vol = int(getattr(s, "volume", 1) or 1)
-                    if price > 0:
+                    if price > 0 and self._is_today_day_session_snapshot(s, today_str):
                         self.bar_aggregator.update_snapshot(price, volume=vol, dt=now_dt)
             except Exception as snap_err:
                 err_str = str(snap_err).lower()
@@ -1126,6 +1150,8 @@ class ShioajiTMFTrader:
         processed_timestamps = self._reconcile_and_recover_on_startup(strategy, kbars)
         active_date_str = today_str
         last_standby_log = 0.0
+        self._holiday_detected = False
+        holiday_empty_since = 0.0
 
         # 若啟動時即處於非交易時段 (週末、平日 13:50 以後、或清晨 08:30 之前)，且帳上確定 0 部位，
         # 在完成初始檢查與對帳後，立即登出 API 進入離線省電深度休眠，避免夜間券商維護中斷與不必要連線
@@ -1154,6 +1180,8 @@ class ShioajiTMFTrader:
                     self._noon_cutoff_sent = False
                     self._eod_close_notified = False
                     self._eod_done_date = None
+                    self._holiday_detected = False
+                    holiday_empty_since = 0.0
                     self.order_failures = 0
                     strat_cfg, atr_info = config_for_date(base_cfg, data_dir, active_date_str)
                     strategy = ORBStrategy(config=strat_cfg, inst_config=InstrumentConfig())
@@ -1175,6 +1203,15 @@ class ShioajiTMFTrader:
                 # 盤中不死鳥追平：若前一秒平倉未果 (pending_flatten=True)，不等待下一根 K 棒，每秒持續以 MKT+IOC 追殺直到 0 口
                 if self.pending_flatten:
                     self._relentless_flatten_step(strategy)
+
+                # 若今日已自動判定為休市日 (國定假日/颱風休市)，且帳上無部位，維持深度離線休眠至跨日，不存取任何 API 也不誤發盤後通知
+                if self._holiday_detected and strategy.position == 0 and not self.pending_flatten:
+                    if time.time() - last_standby_log >= 1800.0:
+                        last_standby_log = time.time()
+                        logger.info(f"🏖️ [{now_str}] 今日為休市日，深度離線省電休眠中 (帳上零部位)，等待下一交易日 08:30 自動喚醒...")
+                    self._wake_event.clear()
+                    self._wake_event.wait(timeout=10.0)
+                    continue
 
                 # 第二道防線：13:09:00 後帳上仍有部位，不等待 K 棒直接強制平倉
                 if now_str >= failsafe_time:
@@ -1301,6 +1338,7 @@ class ShioajiTMFTrader:
                 cur_quote = float(kbars.iloc[-1]["close"]) if not kbars.empty else 0.0
                 self._check_external_command(strategy, cur_price=cur_quote)
                 if not kbars.empty and len(kbars) >= 2:
+                    holiday_empty_since = 0.0
                     # 準備 VWAP 與 EMA9/EMA21 指標 (若 K 棒版號未變動則直接使用快取，省去每秒重算全表)
                     cur_ver = self.bar_aggregator.version
                     if cur_ver > 0 and cur_ver == _last_prepared_ver and not _cached_kbars.empty:
@@ -1381,6 +1419,22 @@ class ShioajiTMFTrader:
                             pos_str = f"{dir_str}@{strategy.entry_price:.0f} (損益:{cur_pnl:+.0f}點 / 最高:{strategy.highest_profit:+.0f}點)"
                         logger.info(f"⏱️ [{now_str}] 報價:{latest['close']:.0f} | VWAP:{latest['vwap']:.0f} | {orb_info} | 狀態:{pos_str}{halt_info}")
                 else:
+                    if kbars.empty and now_str >= "09:05:00" and strategy.position == 0 and not self.pending_flatten:
+                        if holiday_empty_since == 0.0:
+                            holiday_empty_since = time.time()
+                        elif time.time() - holiday_empty_since >= 30.0:
+                            self._holiday_detected = True
+                            logger.info(f"🏖️ [{now_str}] 今日 ({cur_date_str}) 已過 09:05 且連續 30 秒無任何日盤開盤行情，判定今日為國定假日或颱風休市！")
+                            self.notifier.send(
+                                f"🏖️ [休市自動偵測] {cur_date_str}\n"
+                                f"已過 09:05 仍無任何日盤成交行情 (國定假日或颱風休市)，今日不執行任何交易。\n"
+                                f"• 系統已安全登出永豐金 API，提前進入離線深度省電休眠，將於明日 08:30 自動喚醒。"
+                            )
+                            self.logout_and_sleep(reason=f"{cur_date_str} 國定假日/颱風休市提前休眠")
+                            continue
+                    else:
+                        holiday_empty_since = 0.0
+
                     if time.time() - last_log_time >= 3.0:
                         last_log_time = time.time()
                         logger.info(f"⏱️ [{now_str}] 等待日盤 08:45 開盤 K 棒資料...")

@@ -171,6 +171,66 @@ class TestTraderRefactorIntegration(unittest.TestCase):
             self.trader.keep_alive_heartbeat()
             mock_api.margin.assert_not_called()
 
+    def test_holiday_and_snapshot_ts_failsafe(self):
+        """驗證快照時間戳過濾 (防止休市日/夜盤殘留價格) 與休市日提前睡眠防呆"""
+        import datetime
+        import pandas as pd
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock, patch
+
+        today_str = "2026-11-13"
+        ns = lambda dt_str: int(pd.Timestamp(dt_str).value)
+
+        # 1. 快照時間戳過濾驗證
+        # 前一日收盤快照 -> False
+        self.assertFalse(ShioajiTMFTrader._is_today_day_session_snapshot(
+            SimpleNamespace(close=43500, volume=1, ts=ns("2026-11-12 13:44:59")), today_str
+        ))
+        # 今日夜盤 04:59:59 快照 -> False
+        self.assertFalse(ShioajiTMFTrader._is_today_day_session_snapshot(
+            SimpleNamespace(close=43659, volume=1, ts=ns("2026-11-13 04:59:59")), today_str
+        ))
+        # 無效 0 時間戳 -> False
+        self.assertFalse(ShioajiTMFTrader._is_today_day_session_snapshot(
+            SimpleNamespace(close=43659, volume=1, ts=0), today_str
+        ))
+        # 今日日盤 08:45:05 快照 -> True
+        self.assertTrue(ShioajiTMFTrader._is_today_day_session_snapshot(
+            SimpleNamespace(close=43700, volume=1, ts=ns("2026-11-13 08:45:05")), today_str
+        ))
+
+        # 2. fetch_today_day_kbars 在休市日僅有昨夜盤快照時，不應產生任何假 K 棒
+        mock_api = MagicMock()
+        mock_api.kbars.return_value = {"ts": [], "Open": [], "High": [], "Low": [], "Close": [], "Volume": []}
+        mock_api.snapshots.return_value = [
+            SimpleNamespace(close=43659.0, volume=1, ts=ns("2026-11-13 04:59:59"))
+        ]
+        self.trader.api = mock_api
+        self.trader.contract = MagicMock()
+        self.trader.bar_aggregator.kbars_disabled = False
+        mock_now = datetime.datetime(2026, 11, 13, 9, 10, 0)
+        with patch("live.shioaji_trader.datetime.date") as mock_date, \
+             patch("live.shioaji_trader.datetime.datetime") as mock_dt:
+            mock_date.today.return_value = datetime.date(2026, 11, 13)
+            mock_dt.now.return_value = mock_now
+            mock_dt.side_effect = lambda *a, **kw: datetime.datetime(*a, **kw)
+            kbars_df = self.trader.fetch_today_day_kbars()
+            self.assertTrue(kbars_df.empty)
+
+        # 3. 休市旗標 _holiday_detected=True 時，即使在平日盤中時段 (10:00)，也不重連與不心跳 Ping
+        self.trader.simulation = False
+        self.trader._holiday_detected = True
+        self.trader.pending_flatten = False
+        self.trader._active_strategy = ORBStrategy(config=ORBStrategyConfig(), inst_config=InstrumentConfig())
+        self.trader._active_strategy.position = 0
+        mock_day = datetime.datetime(2026, 11, 13, 10, 0, 0)
+        with patch("live.shioaji_trader.datetime.datetime") as mock_dt2:
+            mock_dt2.now.return_value = mock_day
+            self.assertFalse(self.trader.reconnect())
+            mock_api.margin.reset_mock()
+            self.trader.keep_alive_heartbeat()
+            mock_api.margin.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
