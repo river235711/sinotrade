@@ -65,6 +65,7 @@ class ShioajiTMFTrader:
         self.api = None
         self.contract = None
         self._contract_code = "TMFR1"
+        self._is_session_active = False
         self.notifier = TradeNotifier()
         self._last_reconnect_time = 0.0
 
@@ -107,6 +108,10 @@ class ShioajiTMFTrader:
                 self.api.logout()
             except Exception:
                 pass
+            finally:
+                self.api = None
+                self.contract = None
+                self._is_session_active = False
 
     # ------------------------------------------------------------------
     # 向後相容屬性映射 (保持對既有私有屬性之存取相容)
@@ -188,8 +193,10 @@ class ShioajiTMFTrader:
                 else:
                     logger.warning("注意：實盤模式尚未設定 SHIOAJI_CA_PATH / SHIOAJI_CA_PASSWD，將僅能看盤無法送出實單。")
 
+            self._is_session_active = True
             return True
         except Exception as e:
+            self._is_session_active = False
             logger.error(f"Shioaji 初始化失敗: {e}")
             return False
 
@@ -259,7 +266,18 @@ class ShioajiTMFTrader:
             return None
 
     def reconnect(self) -> bool:
-        """盤中斷線自動重連機制 (含 15 秒冷卻保護，避免頻繁重登)"""
+        """盤中斷線自動重連機制 (含 15 秒冷卻保護，非交易時段且零部位時不重連)"""
+        now = datetime.datetime.now()
+        now_str = now.strftime("%H:%M:%S")
+        is_trading_window = (now.weekday() < 5) and ("08:30:00" <= now_str <= "13:45:00")
+        strat = getattr(self, "_active_strategy", None)
+        has_pos = (strat is not None and strat.position != 0) or getattr(self, "pending_flatten", False)
+
+        # 非開盤交易時段且無持倉時，拒絕夜間不必要的重登報警
+        if not is_trading_window and not has_pos:
+            logger.debug(f"目前為非交易時段 ({now_str}) 且無部位，略過自動重連。")
+            return False
+
         if time.time() - self._last_reconnect_time < 15.0:
             return False
         self._last_reconnect_time = time.time()
@@ -279,9 +297,38 @@ class ShioajiTMFTrader:
             logger.error(f"自動重連失敗: {e}")
         return False
 
+    def logout_and_sleep(self, reason: str = "盤後休眠"):
+        """盤後或非交易時段主動斷開連線，進入離線深度休眠模式 (防夜間中斷與不必要網路存取)"""
+        if self.api is not None:
+            try:
+                logger.info(f"🌙 [{reason}] 正在安全登出永豐金 Shioaji API，進入離線待命模式...")
+                self.api.logout()
+            except Exception as e:
+                logger.debug(f"登出異常 (可安全忽略): {e}")
+            finally:
+                self.api = None
+                self.contract = None
+                self._is_session_active = False
+                logger.info("💤 永豐 API 連線已安全斷開，進入深度省電防打擾睡眠 (零網路存取、不受夜間維護中斷干擾)。")
+
+    def wake_and_login(self, reason: str = "開盤前喚醒") -> bool:
+        """開盤前自動重新登入永豐金 Shioaji、啟用憑證並重新訂閱當日主力合約"""
+        logger.info(f"🌅 [{reason}] 正在連線登入永豐金 Shioaji 並掛載憑證與主力合約...")
+        ok = self.initialize() and (self.load_tmf_contract(self._contract_code) is not None)
+        if ok:
+            self._is_session_active = True
+            logger.info(f"✅ [{reason}] 永豐金 Shioaji 登入與即時行情串流已就緒！")
+        else:
+            logger.error(f"❌ [{reason}] 永豐金 Shioaji 登入失敗，將於稍後重試。")
+        return ok
+
     def keep_alive_heartbeat(self):
-        """主動向券商主機發送輕量保活查詢 (Ping)，維持 TCP Session 熱連線，防閒置逾時"""
+        """主動向券商主機發送輕量保活查詢 (Ping)，維持 TCP Session 熱連線，防閒置逾時 (僅在盤中在線時運作)"""
         if self.api is None or self.simulation:
+            return
+        now = datetime.datetime.now()
+        now_str = now.strftime("%H:%M:%S")
+        if not ((now.weekday() < 5) and ("08:30:00" <= now_str <= "13:45:00")):
             return
         try:
             acc = getattr(self.api, "futopt_account", None)
@@ -1080,6 +1127,14 @@ class ShioajiTMFTrader:
         active_date_str = today_str
         last_standby_log = 0.0
 
+        # 若啟動時即處於非交易時段 (週末、平日 13:50 以後、或清晨 08:30 之前)，且帳上確定 0 部位，
+        # 在完成初始檢查與對帳後，立即登出 API 進入離線省電深度休眠，避免夜間券商維護中斷與不必要連線
+        now_init = datetime.datetime.now()
+        now_init_str = now_init.strftime("%H:%M:%S")
+        is_init_off_hours = (now_init.weekday() >= 5) or (now_init_str >= "13:50:00") or (now_init_str < "08:30:00")
+        if is_init_off_hours and strategy.position == 0 and not self.pending_flatten:
+            self.logout_and_sleep(reason="啟動時處於非交易時段")
+
         try:
             while not self._stop_requested:
                 now = datetime.datetime.now()
@@ -1103,15 +1158,18 @@ class ShioajiTMFTrader:
                     strat_cfg, atr_info = config_for_date(base_cfg, data_dir, active_date_str)
                     strategy = ORBStrategy(config=strat_cfg, inst_config=InstrumentConfig())
                     self._active_strategy = strategy
-                    self.load_overnight_levels_for_strategy(strategy, active_date_str)
                     
-                    # 結算日跨月自動換約檢查：重新解析 TMFR1 當前主力月份合約 (例如 11月 TMFK6 -> 12月 TMFL6)
-                    self.load_tmf_contract(self._contract_code)
+                    # 若 API 仍在線才載入合約與夜盤；若已離線休眠，留至 08:30 喚醒時完整載入 (夜盤05:00才完全收盤)
+                    if self.api is not None:
+                        self.load_overnight_levels_for_strategy(strategy, active_date_str)
+                        self.load_tmf_contract(self._contract_code)
 
                     logger.info("=" * 75)
                     logger.info(f"🌅 [跨日自動換日] 進入新交易日 {active_date_str}，已重新載入今日 20日 ATR 動態參數：")
-                    logger.info(f"• 當前主力合約: {self.contract.code} - {self.contract.name}")
+                    logger.info(f"• 當前交易合約: {self._contract_code}")
                     logger.info(f"• 波動自適應: {describe(strat_cfg, atr_info)}")
+                    if self.api is None:
+                        logger.info("• 連線狀態: 💤 離線省電深度睡眠中 (將於今日 08:30:00 自動喚醒登入)")
                     logger.info("=" * 75)
 
                 # 盤中不死鳥追平：若前一秒平倉未果 (pending_flatten=True)，不等待下一根 K 棒，每秒持續以 MKT+IOC 追殺直到 0 口
@@ -1124,7 +1182,8 @@ class ShioajiTMFTrader:
 
                 # 第三道防線：13:10:00 後完成當日收盤檢查；若帳上仍有殘留部位，絕不進入待機，每隔 2 秒持續自動重連並以 MKT+IOC 追殺直到 0 口！
                 if now_str >= shutdown_time:
-                    final_pos = self.get_real_position()
+                    # 若已離線休眠 (api is None) 且無待平倉，說明之前已確認 0 部位並正式休眠，不再呼叫券商查詢
+                    final_pos = 0 if (self.api is None and not self.pending_flatten) else self.get_real_position()
                     if final_pos is None and self.api is not None and not self.simulation:
                         self.reconnect()
                         final_pos = self.get_real_position()
@@ -1169,6 +1228,9 @@ class ShioajiTMFTrader:
                             f"• 20 日滾動資料集已更新並推送到 GitHub\n"
                             f"• 下一交易日預載 ATR 參數已生效：\n  {describe(next_cfg, next_info)}"
                         )
+                        # 盤後安全登出：正式進入深度省電防打擾睡眠，免除夜間維護 503 警報與網路消耗
+                        if self.api is not None and strategy.position == 0 and not self.pending_flatten:
+                            self.logout_and_sleep(reason="13:45 盤後結算完成 (明日 08:30 自動喚醒)")
                     elif now_str < "13:45:15" and eod_done_date != cur_date_str:
                         if time.time() - last_standby_log >= 300.0:
                             last_standby_log = time.time()
@@ -1186,6 +1248,8 @@ class ShioajiTMFTrader:
 
                 # 週末休市待機 (週六、週日)
                 if now.weekday() >= 5:
+                    if self.api is not None and strategy.position == 0 and not self.pending_flatten:
+                        self.logout_and_sleep(reason="週末休市")
                     if time.time() - last_standby_log >= 1800.0:
                         last_standby_log = time.time()
                         logger.info(f"☕ [{now_str}] 週末休市待命守護中 (週六/週日)，等待週一 08:45:00 日盤開盤...")
@@ -1195,6 +1259,12 @@ class ShioajiTMFTrader:
 
                 # 交易日清晨開盤前待機 (00:00:00 ~ 08:44:59)
                 if now_str < "08:45:00":
+                    # 08:30:00 開盤前定時自動喚醒登入並載入夜盤數據
+                    if now_str >= "08:30:00" and self.api is None:
+                        logger.info(f"⏰ [{now_str}] 到達 08:30 預排定時，啟動開盤前自動登入與連線...")
+                        if self.wake_and_login(reason="08:30 開盤前自動喚醒"):
+                            self.load_overnight_levels_for_strategy(strategy, active_date_str)
+
                     if now_str >= "08:35:00" and not getattr(self, "_morning_wake_logged", False):
                         self._morning_wake_logged = True
                         logger.info(f"🌅 [{now_str}] 執行開盤前全系統自動健康巡檢 (Pre-Market Health Check)...")

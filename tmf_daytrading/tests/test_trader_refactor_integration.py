@@ -124,6 +124,53 @@ class TestTraderRefactorIntegration(unittest.TestCase):
              patch("main.os.path.isdir", return_value=False):
             self.assertIsNone(entry_main._detect_running_mode())
 
+    def test_off_market_sleep_and_wake(self):
+        """驗證盤後自動登出休眠、開盤前定時喚醒、非交易時段防打擾與心跳過濾"""
+        import datetime
+        from unittest.mock import MagicMock, patch
+
+        mock_api = MagicMock()
+        mock_contract = MagicMock()
+        self.trader.api = mock_api
+        self.trader.contract = mock_contract
+        self.trader._is_session_active = True
+
+        # 1. 測試 logout_and_sleep
+        self.trader.logout_and_sleep(reason="盤後測試休眠")
+        mock_api.logout.assert_called_once()
+        self.assertIsNone(self.trader.api)
+        self.assertIsNone(self.trader.contract)
+        self.assertFalse(self.trader._is_session_active)
+
+        # 2. 測試 wake_and_login
+        with patch.object(self.trader, "initialize", return_value=True) as mock_init, \
+             patch.object(self.trader, "load_tmf_contract", return_value=mock_contract) as mock_load:
+            ok = self.trader.wake_and_login(reason="早盤喚醒測試")
+            self.assertTrue(ok)
+            mock_init.assert_called_once()
+            mock_load.assert_called_once_with("TMFR1")
+            self.assertTrue(self.trader._is_session_active)
+
+        # 3. 測試非交易時段 reconnect 拒絕重連防打擾
+        mock_dt = datetime.datetime(2026, 11, 12, 22, 40, 0)
+        with patch("live.shioaji_trader.datetime.datetime") as mock_datetime:
+            mock_datetime.now.return_value = mock_dt
+            self.trader.pending_flatten = False
+            self.trader._active_strategy = ORBStrategy(config=ORBStrategyConfig(), inst_config=InstrumentConfig())
+            self.trader._active_strategy.position = 0
+            # 應拒絕重連
+            reconnected = self.trader.reconnect()
+            self.assertFalse(reconnected)
+
+        # 4. 測試非交易時段 keep_alive_heartbeat 拒絕 Ping
+        self.trader.simulation = False
+        self.trader.api = mock_api
+        mock_dt_night = datetime.datetime(2026, 11, 12, 22, 40, 0)
+        with patch("live.shioaji_trader.datetime.datetime") as mock_datetime:
+            mock_datetime.now.return_value = mock_dt_night
+            self.trader.keep_alive_heartbeat()
+            mock_api.margin.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
