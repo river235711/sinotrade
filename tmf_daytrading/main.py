@@ -128,9 +128,14 @@ def main():
         print(f"⚠️ 啟動 Shioaji 正式實盤自動下單模式 (simulation=False)！日誌: {log_dir}")
         trader = ShioajiTMFTrader(simulation=False, quantity=args.qty)
 
-    if trader.initialize():
-        if trader.load_tmf_contract(args.contract):
-            trader.run_intraday_bot()
+    try:
+        if trader.initialize():
+            if trader.load_tmf_contract(args.contract):
+                trader.run_intraday_bot()
+            else:
+                print(f"❌ 無法載入合約 ({args.contract})，已安全釋放連線並結束。")
+    finally:
+        trader.close()
 
 
 if __name__ == "__main__":

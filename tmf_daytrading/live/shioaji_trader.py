@@ -69,6 +69,7 @@ class ShioajiTMFTrader:
         self._tick_handler_api_id: Optional[int] = None
         self._subscribed_contract_code: Optional[str] = None
         self._intrabar_sar_state: Optional[dict] = None
+        self._orb_finalized: bool = False
         self.notifier = TradeNotifier()
         self._last_reconnect_time = 0.0
 
@@ -168,14 +169,17 @@ class ShioajiTMFTrader:
     def initialize(self) -> bool:
         """初始化 Shioaji API、登入並啟用憑證"""
         try:
+            if not self.api_key or self.api_key == "YOUR_API_KEY_HERE":
+                logger.error("尚未設定有效的 SHIOAJI_API_KEY！請先編輯專案目錄下的 .env 檔案。")
+                return False
+
+            # 若先前有未釋放連線，先清理避免 session 殘留
+            self.close()
+
             import shioaji as sj
             mode_str = "模擬環境 (Simulation)" if self.simulation else "正式實盤環境 (Live)"
             logger.info(f"正在連線至永豐金 Shioaji [{mode_str}]...")
             self.api = sj.Shioaji(simulation=self.simulation)
-
-            if not self.api_key or self.api_key == "YOUR_API_KEY_HERE":
-                logger.error("尚未設定有效的 SHIOAJI_API_KEY！請先編輯專案目錄下的 .env 檔案。")
-                return False
 
             accounts = self.api.login(
                 api_key=self.api_key,
@@ -202,7 +206,7 @@ class ShioajiTMFTrader:
             self._is_session_active = True
             return True
         except Exception as e:
-            self._is_session_active = False
+            self.close()
             logger.error(f"Shioaji 初始化失敗: {e}")
             return False
 
@@ -274,17 +278,15 @@ class ShioajiTMFTrader:
         self._last_reconnect_time = time.time()
         logger.warning("🔄 [自動重連] 偵測到 Shioaji 連線中斷，正在重新登入並恢復即時行情訂閱...")
         try:
-            if self.api is not None:
-                try:
-                    self.api.logout()
-                except Exception:
-                    pass
+            self.close()
             if self.initialize() and self.load_tmf_contract(self._contract_code):
                 msg = f"✅ [自動重連成功] Shioaji 已恢復連線與 Tick 訂閱 ({self._contract_code})"
                 logger.info(msg)
                 self.notifier.send(msg)
                 return True
+            self.close()
         except Exception as e:
+            self.close()
             logger.error(f"自動重連失敗: {e}")
         return False
 
@@ -312,6 +314,7 @@ class ShioajiTMFTrader:
             self._is_session_active = True
             logger.info(f"✅ [{reason}] 永豐金 Shioaji 登入與即時行情串流已就緒！")
         else:
+            self.close()
             logger.error(f"❌ [{reason}] 永豐金 Shioaji 登入失敗，將於稍後重試。")
         return ok
 
@@ -615,24 +618,40 @@ class ShioajiTMFTrader:
                 logger.info("✅ 已補平帳上殘留部位")
             return
 
+        is_sar = act in ("SAR_BUY", "SAR_SELL")
+        expected_qty = self.quantity * 2 if is_sar else self.quantity
+
         if real == 0:
             # 若交易所已明確回報 Filled 全部成交，代表僅是券商 list_positions 帳務更新較慢，絕不將真實持倉洗回空手！
-            if result.ok and result.status == "Filled" and result.filled_qty >= self.quantity:
+            if result.ok and result.status == "Filled" and result.filled_qty >= expected_qty:
                 logger.warning(f"⚠️ 成交回報已確認 Filled ({result.filled_qty}口 @ {result.avg_price:.0f})，但帳務查詢仍顯示 0 口，保留策略持倉並等待定期對帳同步！")
                 self.order_failures = 0
                 return
-            # 開倉單根本沒成交：策略退回空手，讓之後可以重新判斷
+            # 開倉單或 SAR 反手單未完全成交，帳上已成 0 口：策略退回空手並同步清除同分 SAR 狀態
             strategy.position = 0
             strategy.highest_profit = 0.0
+            strategy.entry_time = None
             strategy.trade_count = max(0, strategy.trade_count - 1)
+            self._intrabar_sar_state = None
             self.order_failures += 1
-            logger.warning(f"開倉單未成交，策略退回空手 (連續失敗 {self.order_failures}/{self.max_order_failures})")
-            if self.order_failures >= self.max_order_failures:
-                self._halt_entries("開倉單連續未成交")
+            if is_sar and result.filled_qty > 0:
+                alert = (
+                    f"⚠️ [SAR 反手部分成交] {act} 僅成交 {result.filled_qty}/{expected_qty} 口 "
+                    f"(原部位已平倉、反手未成交，狀態={result.status})，策略退回空手並停開今日新倉。"
+                )
+                logger.error(alert)
+                self.notifier.send(alert)
+                self._halt_entries("SAR 反手部分成交未開立新倉")
+            else:
+                logger.warning(f"開倉單未成交，策略退回空手 (連續失敗 {self.order_failures}/{self.max_order_failures})")
+                if self.order_failures >= self.max_order_failures:
+                    self._halt_entries("開倉單連續未成交")
+            self._save_state(strategy)
             return
 
         # 其他不一致 (方向相反、口數不對、部分成交)：為安全起見全部平掉
         logger.error("部位方向或口數與預期不符，為安全起見全部平倉")
+        self._intrabar_sar_state = None
         if not self.flatten_real_position():
             self.pending_flatten = True
             strategy.position = 1 if real > 0 else -1
@@ -640,7 +659,11 @@ class ShioajiTMFTrader:
             self.pending_flatten = False
             strategy.position = 0
             strategy.highest_profit = 0.0
+            strategy.entry_time = None
         self._halt_entries("成交結果與預期不符")
+        self.notifier.send(
+            f"🚨 [部位對帳異常] {act} 後帳上為 {real:+d} 口 (預期 {expected:+d} 口)，已介入安全平倉與停開新倉，請確認帳務。"
+        )
         self._save_state(strategy)
 
     def _periodic_reconcile(self, strategy: ORBStrategy):
@@ -661,26 +684,43 @@ class ShioajiTMFTrader:
         self._halt_entries("帳上部位與策略不一致，需人工確認")
         self._save_state(strategy)
 
-    def _force_flatten_all(self, strategy: ORBStrategy, cur_price: float = 0.0):
-        """強制平倉：以帳上真實部位為準，查不到才退回用策略部位"""
+    def _force_flatten_all(self, strategy: ORBStrategy, cur_price: float = 0.0) -> bool:
+        """強制平倉：以帳上真實部位為準，查不到才退回用策略部位；委託未確認成交時絕不誤清本地部位"""
         real = self.get_real_position()
         if real is None:
             if strategy.position == 0 and not self.pending_flatten:
-                return
+                return True
+            if strategy.position == 0:
+                logger.critical("🚨 無法查詢帳上部位且仍有待平倉旗標，保留 pending_flatten 持續重連追查！")
+                self._save_state(strategy)
+                return False
             action = "SELL" if strategy.position == 1 else "BUY"
             logger.warning("依策略部位執行平倉回補")
-            self._send_and_verify(action, self.quantity, octype="Cover", price=cur_price)
+            res = self._send_and_verify(action, self.quantity, octype="Cover", price=cur_price)
+            if not res.ok:
+                self.pending_flatten = True
+                self._halt_entries("無法查詢帳上部位且依策略平倉失敗")
+                logger.critical(
+                    f"🚨 無法查詢帳上部位且平倉委託未完全成交 ({res.status}, 成交 {res.filled_qty}/{self.quantity}口)，"
+                    f"保留持倉並啟動【不死鳥追平機制】！"
+                )
+                self._save_state(strategy)
+                return False
+            self.pending_flatten = False
         elif real != 0:
             logger.warning(f"⏰ 帳上有 {real:+d} 口，執行強制平倉！")
             if not self.flatten_real_position():
                 self.pending_flatten = True
                 logger.critical("🚨 平倉失敗，帳上仍有部位，啟動【不死鳥追平機制】持續以 MKT+IOC 追殺直到 0 口！")
-                return
+                self._save_state(strategy)
+                return False
             self.pending_flatten = False
         strategy.position = 0
         strategy.highest_profit = 0.0
+        strategy.entry_time = None
         self._intrabar_sar_state = None
         self._save_state(strategy)
+        return True
 
     def _relentless_flatten_step(self, strategy: ORBStrategy) -> bool:
         """
@@ -738,16 +778,19 @@ class ShioajiTMFTrader:
 
         cmd = str(data.get("cmd", "")).lower().strip()
         if cmd in ("close", "close_and_halt", "flatten"):
-            had_pos = (strategy.position != 0) or bool(self.get_real_position())
+            had_pos = (strategy.position != 0) or bool(self.get_real_position()) or self.pending_flatten
             pnl_str = ""
             if strategy.position != 0 and strategy.entry_price > 0 and cur_price > 0:
                 pnl = (cur_price - strategy.entry_price) if strategy.position == 1 else (strategy.entry_price - cur_price)
                 pnl_str = f" @ {cur_price:.0f} (約 {pnl:+.0f}點)"
-            self._force_flatten_all(strategy, cur_price=cur_price)
+            flattened = self._force_flatten_all(strategy, cur_price=cur_price)
             if cmd == "close_and_halt":
                 self._halt_entries("收到手動平倉並停開新倉指令")
             if had_pos:
-                msg = f"⚡ [手動指令平倉完成] 已立即平倉回補部位{pnl_str}！"
+                if flattened:
+                    msg = f"⚡ [手動指令平倉完成] 已立即平倉回補部位{pnl_str}！"
+                else:
+                    msg = f"🚨 [手動指令平倉未完成] 平倉委託失敗或尚未歸零{pnl_str}，已保留持倉並啟動持續追平，請立即確認帳務！"
             else:
                 msg = "ℹ️ [手動指令平倉] 收到平倉指令，目前帳上與策略皆無部位 (空手)。"
             logger.info(msg)
@@ -945,6 +988,32 @@ class ShioajiTMFTrader:
         post_bar["close"] = cur_close
         return post_bar
 
+    def _finalize_orb_if_closed(self, strategy: ORBStrategy, kbars: pd.DataFrame, ts: pd.Timestamp):
+        """當 09:15 K 棒正式收盤時，對齊 BacktestEngine 以完整 09:00~09:15 K 棒更新 ORB 上下界"""
+        if getattr(self, "_orb_finalized", False):
+            return
+        if ts.strftime("%H:%M:%S") != strategy.config.orb_end_time:
+            return
+        prev_h, prev_l = strategy.orb_high, strategy.orb_low
+        orb_h, orb_l = strategy.calculate_orb_levels(kbars.loc[:ts])
+        self._orb_finalized = True
+        if orb_h is None or orb_l is None:
+            return
+        if prev_h is not None and prev_l is not None and (orb_h != prev_h or orb_l != prev_l):
+            logger.info(
+                f"🔄 [09:15 完整收盤更新 ORB] 區間由 {prev_l:.0f}~{prev_h:.0f} "
+                f"更新為 {orb_l:.0f}~{orb_h:.0f} (振幅={orb_h - orb_l:.0f}點，對齊回測)"
+            )
+            _, orb_report_msg = build_0915_orb_report(strategy, entries_halted=self.entries_halted)
+            updated_msg = orb_report_msg.replace(
+                "📌 [09:15 ORB 區間確立]",
+                "📌 [09:15 ORB 完整收盤更新]",
+                1,
+            )
+            logger.info("\n" + updated_msg)
+            self.notifier.send(updated_msg)
+            self._save_state(strategy)
+
     def _evaluate_completed_and_intrabar(
         self,
         strategy: ORBStrategy,
@@ -956,6 +1025,7 @@ class ShioajiTMFTrader:
         prev_bar = None
         for ts, bar in completed_bars.iterrows():
             if ts not in processed_timestamps:
+                self._finalize_orb_if_closed(strategy, kbars, ts)
                 processed_timestamps.add(ts)
                 if self._intrabar_sar_state is not None and self._intrabar_sar_state["ts"] == ts:
                     if strategy.position != 0:
@@ -1059,18 +1129,26 @@ class ShioajiTMFTrader:
         _last_prepared_ver = -1
         _cached_kbars = pd.DataFrame()
         kbars = self.fetch_today_day_kbars()
+        now_init_orb = datetime.datetime.now().strftime("%H:%M:%S")
         if not kbars.empty and len(kbars) >= 2:
             kbars = strategy.prepare_indicators(kbars)
             _last_prepared_ver = self.bar_aggregator.version
             _cached_kbars = kbars
-            now_str = datetime.datetime.now().strftime("%H:%M:%S")
-            if now_str >= strat_cfg.orb_end_time:
+            if now_init_orb >= strat_cfg.orb_end_time:
                 orb_h, orb_l = strategy.calculate_orb_levels(kbars)
+                self._orb_finalized = any(
+                    ts.strftime("%H:%M:%S") == strat_cfg.orb_end_time
+                    for ts in kbars.iloc[:-1].index
+                )
                 if orb_h and orb_l:
                     logger.info(f"📌 今日現貨開盤區間 ({strat_cfg.orb_start_time}~{strat_cfg.orb_end_time}) 已鎖定: 上界={orb_h:.0f}, 下界={orb_l:.0f} (振幅={orb_h-orb_l:.0f}點)")
 
         # 2. 帳上部位對帳與狀態恢復 / 部位接管
         processed_timestamps = self._reconcile_and_recover_on_startup(strategy, kbars)
+        # 若今日實盤 K 棒已涵蓋 09:00~09:15，以其為準更新 ORB 避免被過期 state.json 覆蓋
+        if not kbars.empty and len(kbars) >= 2 and now_init_orb >= strat_cfg.orb_end_time:
+            strategy.calculate_orb_levels(kbars)
+            self._save_state(strategy)
         active_date_str = today_str
         last_standby_log = 0.0
         self._holiday_detected = False
@@ -1095,6 +1173,7 @@ class ShioajiTMFTrader:
                     active_date_str = cur_date_str
                     self.bar_aggregator.clear()
                     self._intrabar_sar_state = None
+                    self._orb_finalized = False
                     _last_prepared_ver = -1
                     _cached_kbars = pd.DataFrame()
                     processed_timestamps.clear()
@@ -1114,7 +1193,8 @@ class ShioajiTMFTrader:
                     # 若 API 仍在線才載入合約與夜盤；若已離線休眠，留至 08:30 喚醒時完整載入 (夜盤05:00才完全收盤)
                     if self.api is not None:
                         self.load_overnight_levels_for_strategy(strategy, active_date_str)
-                        self.load_tmf_contract(self._contract_code)
+                        if self.load_tmf_contract(self._contract_code) is None:
+                            logger.warning(f"⚠️ 跨日換日載入合約 ({self._contract_code}) 失敗，將於盤前喚醒或重連時重試。")
 
                     logger.info("=" * 75)
                     logger.info(f"🌅 [跨日自動換日] 進入新交易日 {active_date_str}，已重新載入今日 20日 ATR 動態參數：")

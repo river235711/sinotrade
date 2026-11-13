@@ -29,6 +29,25 @@ def _load_env_file():
 
 _load_env_file()
 
+
+def atomic_write_csv(df, target_path: str, **to_csv_kwargs) -> None:
+    """以暫存檔搭配 os.replace 原子寫入 CSV，防止寫檔中斷導致原檔毀損"""
+    abs_path = os.path.abspath(target_path)
+    parent = os.path.dirname(abs_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    tmp_path = f"{abs_path}.tmp.{os.getpid()}"
+    try:
+        df.to_csv(tmp_path, **to_csv_kwargs)
+        os.replace(tmp_path, abs_path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+        raise
+
 @dataclass
 class ShioajiConfig:
     api_key: str = os.environ.get("SHIOAJI_API_KEY", "")

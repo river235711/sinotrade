@@ -16,6 +16,8 @@ from typing import Optional, Tuple, Dict
 
 import pandas as pd
 
+from config import atomic_write_csv
+
 # 依 ATR 比例縮放的點數參數
 SCALED_FIELDS = (
     "stop_loss_pts",
@@ -74,11 +76,11 @@ def load_daily_history(data_dir: str) -> pd.DataFrame:
 
 
 def save_daily_history(data_dir: str, daily: pd.DataFrame):
-    """覆寫永久日 K 歷史檔"""
+    """原子覆寫永久日 K 歷史檔"""
     path = os.path.join(data_dir, DAILY_HISTORY_FILE)
     out = daily[["open", "high", "low", "close"]].sort_index().round(1)
     out.index.name = "date"
-    out.to_csv(path)
+    atomic_write_csv(out, path)
 
 
 def update_daily_history(data_dir: str, df_1m_new: pd.DataFrame) -> pd.DataFrame:

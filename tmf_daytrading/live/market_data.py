@@ -19,6 +19,8 @@ from typing import Any, Dict, Mapping, Optional, Tuple
 
 import pandas as pd
 
+from config import atomic_write_csv
+
 logger = logging.getLogger("TMFTrader.MarketData")
 
 CNYES_TXF_URL = "https://ws.api.cnyes.com/ws/api/v1/charting/history?symbol=TWF:TXF:FUTURES&resolution=1&quote=1"
@@ -273,7 +275,7 @@ def save_overnight_level_to_csv(data_dir: str, target_date_str: str, night_bars:
             combined = combined.sort_values("trading_date").reset_index(drop=True)
         else:
             combined = new_row
-        combined.to_csv(lvl_path, index=False)
+        atomic_write_csv(combined, lvl_path, index=False)
         return True
     except Exception as e:
         logger.debug(f"自動儲存夜盤極值至 CSV 失敗: {e}")

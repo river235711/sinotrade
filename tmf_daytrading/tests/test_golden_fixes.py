@@ -30,9 +30,9 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
-from config import InstrumentConfig, ORBStrategyConfig
+from config import InstrumentConfig, ORBStrategyConfig, atomic_write_csv
 from strategies.orb_strategy import ORBStrategy
-from strategies.atr_scaler import load_daily_history
+from strategies.atr_scaler import load_daily_history, save_daily_history
 from backtester.engine import BacktestEngine
 from backtester.run_20days_backtest import _preload_overnight_levels
 from live.bar_aggregator import BarAggregator
@@ -44,11 +44,12 @@ from live.market_data import (
     is_overnight_row_complete,
     should_persist_overnight,
     load_or_fetch_overnight_levels,
+    save_overnight_level_to_csv,
     build_0915_orb_report,
     fetch_cnyes_day_kbars,
 )
 from live.shioaji_trader import ShioajiTMFTrader
-from live.update_20days import archive_1m_kbars, backfill_overnight_level
+from live.update_20days import archive_1m_kbars, backfill_overnight_level, roll_20days
 from live.health_check import run_health_check
 
 
@@ -486,6 +487,196 @@ class TestGoldenFixes(unittest.TestCase):
         self.assertEqual(m_disk["net_profit_ntd"], m_mem["net_profit_ntd"])
         self.assertEqual(m_disk["orb_high"], m_mem["orb_high"])
         self.assertEqual(m_disk["orb_low"], m_mem["orb_low"])
+
+    def test_0915_orb_finalizes_on_bar_close_parity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("live.shioaji_trader.get_mode_log_dir", return_value=tmp), \
+                 patch("live.shioaji_trader.TradeNotifier"):
+                trader = ShioajiTMFTrader(simulation=True)
+                trader.notifier = MagicMock()
+                cfg = ORBStrategyConfig(use_vwap_ema_filter=False, use_atr_scaling=False, use_overnight_wall_filter=False)
+                strategy = ORBStrategy(cfg, InstrumentConfig())
+
+                # 09:00 ~ 09:14 高低點 23000~23100，09:15 收盤創新高 23140，09:16 為當前進行中 K 棒
+                times = pd.date_range("2026-11-13 08:45:00", "2026-11-13 09:16:00", freq="1min")
+                n = len(times)
+                closes = [23050.0] * n
+                highs = [23100.0 if t.strftime("%H:%M:%S") >= "09:00:00" else 23060.0 for t in times]
+                lows = [23000.0 if t.strftime("%H:%M:%S") >= "09:00:00" else 23040.0 for t in times]
+                opens = [23050.0] * n
+
+                # 先模擬 09:15:00 開盤瞬間計算 (09:15 尚未出現 23140 高點)
+                prelim_df = pd.DataFrame(
+                    {"open": opens[:-1], "high": highs[:-1], "low": lows[:-1], "close": closes[:-1], "volume": [100] * (n - 1)},
+                    index=times[:-1],
+                )
+                prelim_df.loc[pd.Timestamp("2026-11-13 09:15:00"), ["high", "low"]] = [23050.0, 23050.0]
+                prelim_df = strategy.prepare_indicators(prelim_df)
+                strategy.calculate_orb_levels(prelim_df)
+                self.assertEqual(strategy.orb_high, 23100.0)
+                self.assertFalse(trader._orb_finalized)
+
+                # 09:16:00 時，09:15 K 棒正式收盤並納入完整極值 23140
+                full_highs = list(highs)
+                idx_0915 = list(times).index(pd.Timestamp("2026-11-13 09:15:00"))
+                full_highs[idx_0915] = 23140.0
+                full_df = pd.DataFrame(
+                    {"open": opens, "high": full_highs, "low": lows, "close": closes, "volume": [100] * n},
+                    index=times,
+                )
+                full_df = strategy.prepare_indicators(full_df)
+                processed = set(times[:idx_0915])  # 08:45 ~ 09:14 已處理
+
+                trader._evaluate_completed_and_intrabar(strategy, full_df, processed)
+                self.assertTrue(trader._orb_finalized)
+                self.assertEqual(strategy.orb_high, 23140.0)
+                self.assertTrue(trader.notifier.send.called)
+                self.assertIn("完整收盤更新", trader.notifier.send.call_args[0][0])
+
+    def test_force_flatten_real_none_preserves_state_when_order_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("live.shioaji_trader.get_mode_log_dir", return_value=tmp), \
+                 patch("live.shioaji_trader.TradeNotifier"):
+                trader = ShioajiTMFTrader(simulation=False)
+                trader.notifier = MagicMock()
+                trader.get_real_position = MagicMock(return_value=None)
+                trader._send_and_verify = MagicMock(return_value=FillResult(False, 0, 0.0, "Rejected"))
+
+                strat = ORBStrategy(ORBStrategyConfig(), InstrumentConfig())
+                strat.position = 1
+                strat.entry_price = 23100.0
+                strat.entry_time = pd.Timestamp("2026-11-13 09:20:00")
+
+                cmd_path = os.path.join(tmp, "command.json")
+                with open(cmd_path, "w", encoding="utf-8") as f:
+                    json.dump({"cmd": "close"}, f)
+
+                trader._check_external_command(strat, cur_price=23110.0)
+                self.assertEqual(strat.position, 1)
+                self.assertTrue(trader.pending_flatten)
+                self.assertTrue(trader.entries_halted)
+                self.assertIn("平倉未完成", trader.notifier.send.call_args[0][0])
+                loaded = trader._load_state()
+                self.assertEqual(loaded["position"], 1)
+
+                # 若平倉成功才清零
+                trader._send_and_verify = MagicMock(return_value=FillResult(True, 1, 23110.0, "Filled"))
+                self.assertTrue(trader._force_flatten_all(strat, cur_price=23110.0))
+                self.assertEqual(strat.position, 0)
+                self.assertFalse(trader.pending_flatten)
+
+    def test_sar_partial_fill_halts_and_notifies(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("live.shioaji_trader.get_mode_log_dir", return_value=tmp), \
+                 patch("live.shioaji_trader.TradeNotifier"):
+                trader = ShioajiTMFTrader(simulation=False, quantity=1)
+                trader.notifier = MagicMock()
+                trader.get_real_position = MagicMock(return_value=0)
+                trader._intrabar_sar_state = {"ts": pd.Timestamp("2026-11-13 10:05:00"), "high": 23000, "low": 22990, "close": 22995}
+
+                strat = ORBStrategy(ORBStrategyConfig(), InstrumentConfig())
+                strat.position = -1
+                strat.trade_count = 2
+
+                # SAR 送 2 口 Auto，只成交 1 口平掉舊部位 (real == 0)
+                partial_res = FillResult(False, 1, 22995.0, "Cancelled")
+                trader._post_trade_check(strat, "SAR_SELL", partial_res)
+
+                self.assertEqual(strat.position, 0)
+                self.assertIsNone(strat.entry_time)
+                self.assertIsNone(trader._intrabar_sar_state)
+                self.assertTrue(trader.entries_halted)
+                self.assertIn("SAR 反手部分成交", trader.notifier.send.call_args[0][0])
+
+    def test_session_cleanup_on_contract_load_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("live.shioaji_trader.get_mode_log_dir", return_value=tmp), \
+                 patch("live.shioaji_trader.TradeNotifier"):
+                trader = ShioajiTMFTrader(simulation=True)
+                fake_api = MagicMock()
+
+                def fake_init():
+                    trader.api = fake_api
+                    trader._is_session_active = True
+                    return True
+
+                trader.initialize = MagicMock(side_effect=fake_init)
+                trader.load_tmf_contract = MagicMock(return_value=None)
+
+                ok = trader.wake_and_login(reason="測試合約失敗清理")
+                self.assertFalse(ok)
+                fake_api.logout.assert_called_once()
+                self.assertIsNone(trader.api)
+                self.assertFalse(trader._is_session_active)
+
+                # main.py 找不到合約時也必須呼叫 trader.close()
+                import main as entry_main
+                mock_trader = MagicMock()
+                mock_trader.initialize.return_value = True
+                mock_trader.load_tmf_contract.return_value = None
+                with patch("sys.argv", ["main.py", "--mode", "paper"]), \
+                     patch("main.setup_mode_logging", return_value=tmp), \
+                     patch("live.shioaji_trader.ShioajiTMFTrader", return_value=mock_trader):
+                    entry_main.main()
+                mock_trader.close.assert_called_once()
+
+    def test_prepare_indicators_zero_volume_vwap_fallback(self):
+        strat = ORBStrategy(ORBStrategyConfig(), InstrumentConfig())
+        df = _make_sample_kbars("2026-11-13", [23000.0, 23020.0, 23050.0], start_hhmm="08:45")
+        df["volume"] = [0, 0, 10]
+        res = strat.prepare_indicators(df)
+        self.assertEqual(float(res.iloc[0]["vwap"]), 23000.0)
+        self.assertEqual(float(res.iloc[1]["vwap"]), 23020.0)
+        self.assertEqual(float(res.iloc[2]["vwap"]), 23050.0)
+
+    def test_atomic_csv_writes_and_roll_20days_cold_start(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, "sample.csv")
+            pd.DataFrame([{"a": 1}]).to_csv(target, index=False)
+
+            class BoomDF:
+                def to_csv(self, p, **kw):
+                    with open(p, "w", encoding="utf-8") as f:
+                        f.write("corrupt_partial")
+                    raise RuntimeError("disk full")
+
+            with self.assertRaises(RuntimeError):
+                atomic_write_csv(BoomDF(), target, index=False)
+
+            # 原檔必須完全不受損，且無殘留 .tmp 檔
+            self.assertEqual(pd.read_csv(target).to_dict(orient="records"), [{"a": 1}])
+            self.assertEqual([n for n in os.listdir(tmp) if ".tmp." in n], [])
+
+            # 驗證各處原子存檔與 roll_20days 無舊檔冷啟動
+            nb = pd.DataFrame([{"ts": "2026-11-12 15:00:00", "open": 23000, "high": 23100, "low": 22950, "close": 23050}])
+            self.assertTrue(save_overnight_level_to_csv(tmp, "2026-11-13", nb))
+            daily_df = pd.DataFrame([{"open": 23000, "high": 23200, "low": 22900, "close": 23100}], index=pd.Index(["2026-11-13"]))
+            save_daily_history(tmp, daily_df)
+
+            day_rows = pd.DataFrame([
+                {
+                    "timestamp": f"2026-11-13 08:{45 + (i % 15):02d}:00" if i < 15 else f"2026-11-13 {9 + (i - 15) // 60:02d}:{(i - 15) % 60:02d}:00",
+                    "open": 23000.0,
+                    "high": 23020.0,
+                    "low": 22990.0,
+                    "close": 23010.0,
+                    "volume": 50,
+                    "date": "2026-11-13",
+                    "contract": "TMFR1",
+                }
+                for i in range(65)
+            ])
+            data_dir = os.path.join(tmp, "data")
+            os.makedirs(data_dir, exist_ok=True)
+            with patch("live.update_20days.BASE_DIR", tmp), \
+                 patch("live.update_20days.fetch_intraday_kbars_shioaji", return_value=day_rows), \
+                 patch("live.update_20days.backfill_overnight_level", return_value=True), \
+                 patch("live.update_20days.subprocess.run"):
+                ok = roll_20days(target_date="2026-11-13", push_git=False)
+            self.assertTrue(ok)
+            self.assertTrue(os.path.exists(os.path.join(data_dir, "tmf_20days_1m_kbars.csv")))
+            self.assertTrue(os.path.exists(os.path.join(data_dir, "history_1m_kbars.csv")))
+            self.assertTrue(os.path.exists(os.path.join(data_dir, "daily_bars.csv")))
 
 
 if __name__ == "__main__":

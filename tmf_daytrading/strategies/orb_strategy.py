@@ -50,10 +50,11 @@ class ORBStrategy:
         self.overnight_low = float(overnight_low) if overnight_low is not None and pd.notna(overnight_low) else None
 
     def prepare_indicators(self, kbars: pd.DataFrame) -> pd.DataFrame:
-        """計算日內 VWAP 與 EMA9 / EMA21 指標"""
+        """計算日內 VWAP 與 EMA9 / EMA21 指標 (累計量為 0 時以收盤價防呆取代 0.0)"""
         df = kbars.copy()
-        cum_vol = df['volume'].cumsum().replace(0, 1)
-        df['vwap'] = (df['close'] * df['volume']).cumsum() / cum_vol
+        cum_vol_raw = df['volume'].cumsum()
+        raw_vwap = (df['close'] * df['volume']).cumsum() / cum_vol_raw.replace(0, 1)
+        df['vwap'] = raw_vwap.where(cum_vol_raw > 0, df['close'])
         df['ema9'] = df['close'].ewm(span=9, adjust=False).mean()
         df['ema21'] = df['close'].ewm(span=21, adjust=False).mean()
         return df
