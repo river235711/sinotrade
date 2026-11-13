@@ -15,9 +15,19 @@ from strategies.atr_scaler import config_for_date
 from backtester.metrics import BacktestMetrics
 
 class BacktestEngine:
-    def __init__(self, data_path: str, inst_config: InstrumentConfig = None):
+    def __init__(
+        self,
+        data_path: str,
+        inst_config: InstrumentConfig = None,
+        cached_kbars_df: Optional[pd.DataFrame] = None,
+        daily_history_df: Optional[pd.DataFrame] = None,
+        overnight_levels_df: Optional[pd.DataFrame] = None,
+    ):
         self.data_path = data_path
         self.inst_config = inst_config or InstrumentConfig()
+        self.cached_kbars_df = cached_kbars_df
+        self.daily_history_df = daily_history_df
+        self.overnight_levels_df = overnight_levels_df
         self.kbars = None
         self.day_df = None
         self.target_date_fmt = None
@@ -27,8 +37,10 @@ class BacktestEngine:
         cache_path = os.path.join(os.path.dirname(self.data_path), "tmf_20days_1m_kbars.csv")
         day_date_fmt = f"{target_date[:4]}-{target_date[4:6]}-{target_date[6:]}"
         self.target_date_fmt = day_date_fmt
-        if os.path.exists(cache_path):
+        cached_df = self.cached_kbars_df
+        if cached_df is None and os.path.exists(cache_path):
             cached_df = pd.read_csv(cache_path, index_col=0, parse_dates=True)
+        if cached_df is not None and not cached_df.empty:
             sub = cached_df[cached_df['date'] == day_date_fmt].copy()
             if len(sub) > 0:
                 self.active_contract_month = str(sub['contract'].iloc[0])
@@ -98,27 +110,43 @@ class BacktestEngine:
         eff_cfg = base_cfg
         if getattr(base_cfg, "use_atr_scaling", False) and self.target_date_fmt:
             data_dir = os.path.dirname(os.path.abspath(self.data_path))
-            eff_cfg, atr_info = config_for_date(base_cfg, data_dir, self.target_date_fmt)
+            eff_cfg, atr_info = config_for_date(
+                base_cfg,
+                data_dir,
+                self.target_date_fmt,
+                daily=self.daily_history_df,
+            )
 
         strategy = ORBStrategy(config=eff_cfg, inst_config=self.inst_config)
 
         # 若啟用夜盤防撞牆濾網，載入該日對應之前一日夜盤極值
         if getattr(eff_cfg, "use_overnight_wall_filter", False) and self.target_date_fmt:
-            data_dir = os.path.dirname(os.path.abspath(self.data_path))
-            for fn in ["overnight_levels_summary.csv", "overnight_levels_30days.csv"]:
-                levels_file = os.path.join(data_dir, fn)
-                if os.path.exists(levels_file):
-                    try:
-                        df_lvl = pd.read_csv(levels_file)
-                        match_row = df_lvl[df_lvl["trading_date"] == self.target_date_fmt]
-                        if not match_row.empty:
-                            strategy.set_overnight_levels(
-                                overnight_high=match_row.iloc[0]["night_high"],
-                                overnight_low=match_row.iloc[0]["night_low"]
-                            )
-                            break
-                    except Exception:
-                        pass
+            if self.overnight_levels_df is not None:
+                if not self.overnight_levels_df.empty:
+                    match_row = self.overnight_levels_df[
+                        self.overnight_levels_df["trading_date"] == self.target_date_fmt
+                    ]
+                    if not match_row.empty:
+                        strategy.set_overnight_levels(
+                            overnight_high=match_row.iloc[0]["night_high"],
+                            overnight_low=match_row.iloc[0]["night_low"]
+                        )
+            else:
+                data_dir = os.path.dirname(os.path.abspath(self.data_path))
+                for fn in ["overnight_levels_summary.csv", "overnight_levels_30days.csv"]:
+                    levels_file = os.path.join(data_dir, fn)
+                    if os.path.exists(levels_file):
+                        try:
+                            df_lvl = pd.read_csv(levels_file)
+                            match_row = df_lvl[df_lvl["trading_date"] == self.target_date_fmt]
+                            if not match_row.empty:
+                                strategy.set_overnight_levels(
+                                    overnight_high=match_row.iloc[0]["night_high"],
+                                    overnight_low=match_row.iloc[0]["night_low"]
+                                )
+                                break
+                        except Exception:
+                            pass
 
         self.kbars = strategy.prepare_indicators(self.kbars)
 

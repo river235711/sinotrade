@@ -18,14 +18,32 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 from config import InstrumentConfig, ORBStrategyConfig
+from strategies.atr_scaler import load_daily_history
 from backtester.engine import BacktestEngine
+
+
+def _preload_overnight_levels(data_dir: str) -> pd.DataFrame:
+    frames = []
+    for fn in ["overnight_levels_summary.csv", "overnight_levels_30days.csv"]:
+        levels_file = os.path.join(data_dir, fn)
+        if os.path.exists(levels_file):
+            try:
+                frames.append(pd.read_csv(levels_file))
+            except Exception:
+                pass
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True).drop_duplicates(subset=["trading_date"], keep="first")
+
 
 def main():
     base_dir = BASE_DIR
-    cache_path = os.path.join(base_dir, "data", "tmf_20days_1m_kbars.csv")
+    data_dir = os.path.join(base_dir, "data")
+    cache_path = os.path.join(data_dir, "tmf_20days_1m_kbars.csv")
+    cached_kbars_df = None
     if os.path.exists(cache_path):
-        cached_df = pd.read_csv(cache_path)
-        all_dates = sorted(cached_df['date'].unique())
+        cached_kbars_df = pd.read_csv(cache_path, index_col=0, parse_dates=True)
+        all_dates = sorted(cached_kbars_df['date'].unique())
         target_dates = all_dates[-20:]
     else:
         target_dates = [
@@ -34,6 +52,9 @@ def main():
             "2026-10-15", "2026-10-16", "2026-10-19", "2026-10-20", "2026-10-21",
             "2026-10-22", "2026-10-27", "2026-10-28", "2026-10-29", "2026-10-30"
         ]
+
+    daily_history_df = load_daily_history(data_dir)
+    overnight_levels_df = _preload_overnight_levels(data_dir)
 
     trading_days = [(d.replace('-', '_'), d.replace('-', '')) for d in target_dates]
     start_date_str = target_dates[0]
@@ -58,7 +79,13 @@ def main():
 
     for file_date, target_date in trading_days:
         csv_path = os.path.join(base_dir, "data", f"Daily_{file_date}.csv")
-        engine = BacktestEngine(data_path=csv_path, inst_config=inst_cfg)
+        engine = BacktestEngine(
+            data_path=csv_path,
+            inst_config=inst_cfg,
+            cached_kbars_df=cached_kbars_df,
+            daily_history_df=daily_history_df,
+            overnight_levels_df=overnight_levels_df,
+        )
         kbars = engine.load_taifex_csv(target_date=target_date, contract_month="AUTO")
         contract_m = engine.active_contract_month
         metrics = engine.run_orb_strategy(strat_cfg)

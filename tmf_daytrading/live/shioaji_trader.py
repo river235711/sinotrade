@@ -11,15 +11,12 @@
 - 所有委託與成交結果寫入 logs/<live|paper>/orders_YYYYMMDD.csv 供事後核對。
 """
 import os
-import csv
 import json
 import time
 import signal
-import warnings
 import datetime
 import logging
 import threading
-from dataclasses import dataclass
 from typing import Optional
 
 import pandas as pd
@@ -30,26 +27,29 @@ from live.notifier import TradeNotifier
 from live.bar_aggregator import BarAggregator
 from live.state_manager import StateManager
 from live.log_setup import get_mode_log_dir
+from live.execution import (
+    FillResult,
+    FINAL_STATUSES,
+    PENDING_STATUSES,
+    status_name as _status_name,
+    query_real_position_details,
+    wait_for_order_fill,
+    append_order_audit,
+)
+from live.market_data import (
+    resolve_tmf_contract,
+    normalize_shioaji_kbars,
+    fetch_cnyes_history,
+    fetch_cnyes_day_kbars,
+    is_today_day_session_snapshot,
+    save_overnight_level_to_csv,
+    load_or_fetch_overnight_levels,
+    max_trades_for_config,
+    build_0915_orb_report,
+)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger("ShioajiTrader")
-
-FINAL_STATUSES = {"Filled", "Cancelled", "Failed", "Inactive"}
-PENDING_STATUSES = {"PendingSubmit", "PreSubmitted", "Submitted", "PartFilled"}
-
-
-def _status_name(s) -> str:
-    """把 Shioaji 的列舉值統一轉成純文字，如 Status.Filled -> 'Filled'"""
-    v = getattr(s, "value", s)
-    return str(v).split(".")[-1]
-
-
-@dataclass
-class FillResult:
-    ok: bool                 # 是否「全部成交」
-    filled_qty: int          # 實際成交口數
-    avg_price: float         # 實際成交均價 (未成交為 0)
-    status: str              # 最終委託狀態
 
 
 class ShioajiTMFTrader:
@@ -66,6 +66,9 @@ class ShioajiTMFTrader:
         self.contract = None
         self._contract_code = "TMFR1"
         self._is_session_active = False
+        self._tick_handler_api_id: Optional[int] = None
+        self._subscribed_contract_code: Optional[str] = None
+        self._intrabar_sar_state: Optional[dict] = None
         self.notifier = TradeNotifier()
         self._last_reconnect_time = 0.0
 
@@ -113,6 +116,8 @@ class ShioajiTMFTrader:
                 self.api = None
                 self.contract = None
                 self._is_session_active = False
+                self._tick_handler_api_id = None
+                self._subscribed_contract_code = None
 
     # ------------------------------------------------------------------
     # 向後相容屬性映射 (保持對既有私有屬性之存取相容)
@@ -202,62 +207,47 @@ class ShioajiTMFTrader:
             return False
 
     def load_tmf_contract(self, code: str = "TMFR1"):
-        """獲取 TMF 微型臺指期近月合約"""
+        """獲取 TMF 微型臺指期近月合約並訂閱即時 Tick (同一連線/合約不重複註冊與訂閱)"""
         self._contract_code = code or "TMFR1"
         if self.api is None:
             logger.error("API 尚未登入")
             return None
         try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", DeprecationWarning)
-                tmf_contracts = list(self.api.Contracts.Futures.TMF)
-
-            # 優先搜尋 code 相符的合約 (如 TMFR1 或 TMFK6)
-            for c in tmf_contracts:
-                if c.code == code or (hasattr(c, "name") and code in c.name):
-                    self.contract = c
-                    break
-            
-            if not self.contract:
-                # 預設綁定近月連續合約 TMFR1
-                for c in tmf_contracts:
-                    if c.code == "TMFR1":
-                        self.contract = c
-                        break
-
-            # 若選到連續合約 (如 TMFR1，其 target_code 為實際交易月份 TMFK6)，自動解析為實際可下單之月份合約
-            target_code = getattr(self.contract, "target_code", None)
-            if target_code:
-                for c in tmf_contracts:
-                    if c.code == target_code:
-                        logger.info(f"自動將連續合約 {self.contract.code} 解析為當月主力可下單合約: {c.code} ({c.name})")
-                        self.contract = c
-                        break
-
+            resolved = resolve_tmf_contract(self.api, code=self._contract_code)
+            if resolved is None:
+                logger.error(f"找不到符合之 TMF 合約 ({self._contract_code})")
+                return None
+            self.contract = resolved
             logger.info(f"已綁定交易合約: {self.contract.code} - {self.contract.name}")
 
             # 訂閱即時逐筆 Tick 報價，委由 BarAggregator 零延遲即時合成 1分K
             try:
                 import shioaji as sj
-                @self.api.on_tick_fop_v1()
-                def _on_tick(*args):
-                    try:
-                        tick = args[-1]
-                        price = float(tick.close)
-                        vol = int(tick.volume)
-                        if price <= 0:
-                            return
-                        dt = datetime.datetime.combine(tick.date, tick.time)
-                        self.bar_aggregator.update_tick(price, vol, dt)
-                        strat = self._active_strategy
-                        if strat is not None and strat.position != 0 and price != self._last_wake_price:
-                            self._last_wake_price = price
-                            self._wake_event.set()
-                    except Exception:
-                        pass
+                api_id = id(self.api)
+                if self._tick_handler_api_id != api_id:
+                    @self.api.on_tick_fop_v1()
+                    def _on_tick(*args):
+                        try:
+                            tick = args[-1]
+                            price = float(tick.close)
+                            vol = int(tick.volume)
+                            if price <= 0:
+                                return
+                            dt = datetime.datetime.combine(tick.date, tick.time)
+                            self.bar_aggregator.update_tick(price, vol, dt)
+                            strat = self._active_strategy
+                            if strat is not None and strat.position != 0 and price != self._last_wake_price:
+                                self._last_wake_price = price
+                                self._wake_event.set()
+                        except Exception:
+                            pass
+                    self._tick_handler_api_id = api_id
 
-                self.api.subscribe(self.contract, quote_type=sj.QuoteType.Tick)
-                logger.info(f"📡 已啟用即時 Tick 串流訂閱 ({self.contract.code})，自動合成即時 1分K")
+                contract_code = getattr(self.contract, "code", self._contract_code)
+                if self._subscribed_contract_code != contract_code:
+                    self.api.subscribe(self.contract, quote_type=sj.QuoteType.Tick)
+                    self._subscribed_contract_code = contract_code
+                    logger.info(f"📡 已啟用即時 Tick 串流訂閱 ({contract_code})，自動合成即時 1分K")
             except Exception as sub_err:
                 logger.warning(f"訂閱即時 Tick 略過: {sub_err}")
 
@@ -310,6 +300,8 @@ class ShioajiTMFTrader:
                 self.api = None
                 self.contract = None
                 self._is_session_active = False
+                self._tick_handler_api_id = None
+                self._subscribed_contract_code = None
                 logger.info("💤 永豐 API 連線已安全斷開，進入深度省電防打擾睡眠 (零網路存取、不受夜間維護中斷干擾)。")
 
     def wake_and_login(self, reason: str = "開盤前喚醒") -> bool:
@@ -393,41 +385,18 @@ class ShioajiTMFTrader:
 
     def wait_for_fill(self, trade, qty: int) -> FillResult:
         """輪詢委託狀態直到終態；逾時仍未成交就撤單，避免單子之後才偷偷成交"""
-        deadline = time.time() + self.fill_timeout
-        status = _status_name(trade.status.status)
+        return wait_for_order_fill(self.api, trade, qty, self.fill_timeout, self.fill_poll_interval)
 
-        while True:
-            try:
-                self.api.update_status(self.api.futopt_account)
-            except Exception as e:
-                logger.warning(f"更新委託狀態失敗: {e}")
-            status = _status_name(trade.status.status)
-            if status in FINAL_STATUSES or time.time() >= deadline:
-                break
-            time.sleep(self.fill_poll_interval)
-
-        # 逾時仍掛在市場上：撤單，再確認最終狀態
-        if status in PENDING_STATUSES:
-            logger.warning(f"⚠️ 委託 {self.fill_timeout:.0f} 秒仍為 {status}，嘗試撤單...")
-            try:
-                self.api.cancel_order(trade)
-                time.sleep(self.fill_poll_interval)
-                self.api.update_status(self.api.futopt_account)
-            except Exception as e:
-                logger.error(f"撤單失敗: {e}")
-            status = _status_name(trade.status.status)
-
-        deals = list(getattr(trade.status, "deals", None) or [])
-        filled = sum(int(d.quantity) for d in deals)
-        avg_price = (sum(float(d.price) * int(d.quantity) for d in deals) / filled) if filled else 0.0
-        if filled == 0:
-            filled = int(getattr(trade.status, "deal_quantity", 0) or 0)
-        if filled == 0 and status == "Filled":
-            filled = qty    # 狀態已是 Filled 但成交明細尚未更新
-        return FillResult(ok=filled >= qty, filled_qty=filled, avg_price=avg_price, status=status)
-
-    def _send_and_verify(self, action: str, qty: int, octype: str = "Auto", price: float = 0.0, price_type: str = "MKP") -> FillResult:
-        """送單並確認成交結果，同時寫入稽核紀錄"""
+    def _send_and_verify(
+        self,
+        action: str,
+        qty: int,
+        octype: str = "Auto",
+        price: float = 0.0,
+        price_type: str = "MKP",
+        signal_price: Optional[float] = None,
+    ) -> FillResult:
+        """送單並確認成交結果，同時寫入稽核紀錄 (含訊號參考價供統計滑價)"""
         trade = self.place_order(action, price, qty, price_type, octype)
         if trade is None:
             result = FillResult(False, 0, 0.0, "Rejected")
@@ -440,68 +409,20 @@ class ShioajiTMFTrader:
             logger.info(f"✅ 成交確認: [{action}] {qty}口 全部成交 均價 {result.avg_price:.0f} ({result.status})")
         else:
             logger.error(f"❌ 未完全成交: [{action}] 要求 {qty}口，實際成交 {result.filled_qty}口，狀態 {result.status}")
-        self._audit(action, qty, octype, result)
+        ref_sig = price if signal_price is None else signal_price
+        self._audit(action, qty, octype, result, signal_price=ref_sig)
         return result
 
-    def _audit(self, action: str, qty: int, octype: str, result: FillResult):
+    def _audit(self, action: str, qty: int, octype: str, result: FillResult, signal_price: Optional[float] = None):
         """把每次委託結果寫入 logs/<live|paper>/orders_YYYYMMDD.csv"""
-        try:
-            os.makedirs(self.log_dir, exist_ok=True)
-            now = datetime.datetime.now()
-            path = os.path.join(self.log_dir, f"orders_{now.strftime('%Y%m%d')}.csv")
-            is_new = not os.path.exists(path)
-            with open(path, "a", newline="", encoding="utf-8") as f:
-                w = csv.writer(f)
-                if is_new:
-                    w.writerow(["time", "action", "qty", "octype", "status", "filled_qty", "avg_price", "ok"])
-                w.writerow([now.strftime("%H:%M:%S"), action, qty, octype, result.status,
-                            result.filled_qty, f"{result.avg_price:.0f}", result.ok])
-        except Exception as e:
-            logger.warning(f"寫入稽核紀錄失敗: {e}")
+        append_order_audit(self.log_dir, action, qty, octype, result, signal_price=signal_price)
 
     # ------------------------------------------------------------------
     # 帳上部位對帳與狀態持久化 (Position Reconciliation & State Recovery)
     # ------------------------------------------------------------------
     def get_real_position_details(self) -> dict:
-        """
-        查詢券商帳上 TMF 詳細部位資訊 (以券商帳上為唯一真實依據 Single Source of Truth)
-        回傳: {"net": int, "avg_price": float, "direction": str, "positions": list}
-        若無 API 或查詢失敗，回傳 {"net": None, ...}
-        """
-        if self.api is None or self.simulation:
-            return {"net": None, "avg_price": 0.0, "direction": "None", "positions": []}
-        try:
-            positions = self.api.list_positions(self.api.futopt_account)
-        except Exception as e:
-            logger.error(f"查詢帳上部位詳細資訊失敗: {e}")
-            err_str = str(e).lower()
-            if any(k in err_str for k in ("authenticated", "session", "token", "disconnect", "connect")):
-                self.reconnect()
-            return {"net": None, "avg_price": 0.0, "direction": "None", "positions": []}
-
-        net = 0
-        tmf_positions = []
-        total_cost = 0.0
-        total_qty = 0
-
-        for p in positions:
-            code = str(getattr(p, "code", ""))
-            if not code.startswith("TMF"):
-                continue
-            qty = int(getattr(p, "quantity", 0))
-            d = _status_name(getattr(p, "direction", ""))
-            price = float(getattr(p, "price", 0.0))
-            tmf_positions.append({"code": code, "direction": d, "qty": qty, "price": price})
-            if d == "Buy":
-                net += qty
-            else:
-                net -= qty
-            total_cost += price * qty
-            total_qty += qty
-
-        avg_price = (total_cost / total_qty) if total_qty > 0 else 0.0
-        direction = "Buy" if net > 0 else ("Sell" if net < 0 else "Flat")
-        return {"net": net, "avg_price": avg_price, "direction": direction, "positions": tmf_positions}
+        """查詢券商帳上 TMF 詳細部位資訊 (以券商帳上為唯一真實依據 Single Source of Truth)"""
+        return query_real_position_details(self.api, self.simulation, reconnect_cb=self.reconnect)
 
     def get_real_position(self) -> Optional[int]:
         """查詢券商帳上 TMF 淨部位：多單為正、空單為負、無部位為 0；查詢失敗回傳 None"""
@@ -527,7 +448,7 @@ class ShioajiTMFTrader:
     def _reconcile_and_recover_on_startup(self, strategy: ORBStrategy, kbars: pd.DataFrame) -> set:
         """
         啟動或中斷重啟時，對帳並接管帳上真實部位：
-        以券商帳上部位 (Single Source of Truth) 為最高依據。
+        以券商帳上部位 (Single Source of Truth) 為最高依據，並統一由 StateManager 還原狀態。
         回傳已處理的時間戳記集合 processed_timestamps，防止重播歷史 K 棒重複送單。
         """
         processed_timestamps = set()
@@ -538,24 +459,17 @@ class ShioajiTMFTrader:
         pos_details = self.get_real_position_details()
         real_net = pos_details["net"]
         broker_avg = pos_details["avg_price"]
+        today_str = datetime.date.today().strftime("%Y-%m-%d")
         saved_state = self._load_state()
+        if saved_state and saved_state.get("date") and saved_state.get("date") != today_str:
+            saved_state = None
+        max_trades = max_trades_for_config(strategy.config)
 
         if real_net is None:
             # 模擬模式、乾跑模式或無法連線券商
-            if (self.api is None or self.simulation):
-                if saved_state:
-                    logger.info("ℹ️ [模擬模式] 讀取本地策略狀態檔恢復進度...")
-                    strategy.position = int(saved_state.get("position", 0))
-                    strategy.entry_price = float(saved_state.get("entry_price", 0.0))
-                    strategy.trade_count = int(saved_state.get("trade_count", 0))
-                    strategy.highest_profit = float(saved_state.get("highest_profit", 0.0))
-                    if saved_state.get("orb_calculated", False) and saved_state.get("orb_high") is not None:
-                        strategy.orb_high = float(saved_state["orb_high"])
-                        strategy.orb_low = float(saved_state["orb_low"])
-                        strategy.orb_calculated = True
-                    max_trades = getattr(strategy.config, "max_trades_per_day", None)
-                    if max_trades is None:
-                        max_trades = getattr(strategy.config, "max_initial_trades", 1) + (1 if getattr(strategy.config, "enable_sar", False) else 0)
+            if self.api is None or self.simulation:
+                if saved_state and self.state_manager.restore_strategy_state(strategy, saved_state):
+                    logger.info("ℹ️ [模擬模式] 已透過 StateManager 讀取本地策略狀態檔恢復進度...")
                     if strategy.trade_count >= max_trades or saved_state.get("entries_halted", False):
                         self._halt_entries(f"今日交易次數已達上限 ({strategy.trade_count}次)")
                 else:
@@ -568,32 +482,43 @@ class ShioajiTMFTrader:
         if real_net != 0:
             target_pos = 1 if real_net > 0 else -1
             pos_label = "多單" if target_pos == 1 else "空單"
-            
+
+            if saved_state:
+                self.state_manager.restore_strategy_state(strategy, saved_state)
+
             strategy.position = target_pos
-            strategy.trade_count = max(1, saved_state.get("trade_count", 1) if saved_state else 1)
-            
+            strategy.trade_count = max(1, int(getattr(strategy, "trade_count", 0) or 0))
+
             # 優先使用券商真實平均成本
             if broker_avg > 0:
                 strategy.entry_price = broker_avg
-            elif saved_state and saved_state.get("entry_price", 0) > 0:
+            elif saved_state and float(saved_state.get("entry_price", 0) or 0) > 0:
                 strategy.entry_price = float(saved_state["entry_price"])
             elif not kbars.empty:
-                strategy.entry_price = float(kbars.iloc[-1]['close'])
-                
-            # 恢復最高浮盈
-            if saved_state and "highest_profit" in saved_state:
-                strategy.highest_profit = float(saved_state["highest_profit"])
-            else:
+                strategy.entry_price = float(kbars.iloc[-1]["close"])
+
+            if not saved_state or "highest_profit" not in saved_state:
                 strategy.highest_profit = 0.0
 
-            # 若有當日 K 棒，檢查持倉期間是否創出更高浮盈
+            # 僅檢視「進場後 (strictly > entry_time)」的 K 棒更新最高浮盈，防止進場前早盤極值汙染保本判斷
             if not kbars.empty and strategy.entry_price > 0:
-                if target_pos == 1:
-                    max_gain = float(kbars['high'].max() - strategy.entry_price)
+                if getattr(strategy, "entry_time", None) is not None:
+                    try:
+                        et_ts = pd.Timestamp(strategy.entry_time)
+                        holding_bars = kbars[kbars.index > et_ts]
+                    except Exception:
+                        holding_bars = kbars.iloc[-1:]
                 else:
-                    max_gain = float(strategy.entry_price - kbars['low'].min())
-                if max_gain > strategy.highest_profit:
-                    strategy.highest_profit = max(0.0, max_gain)
+                    holding_bars = kbars.iloc[-1:]
+
+                if not holding_bars.empty:
+                    if target_pos == 1:
+                        max_gain = float(holding_bars["high"].max() - strategy.entry_price)
+                    else:
+                        max_gain = float(strategy.entry_price - holding_bars["low"].min())
+                    if max_gain > strategy.highest_profit:
+                        strategy.highest_profit = max(0.0, max_gain)
+                strategy._hp_before_bar_val = float(strategy.highest_profit)
 
             logger.warning("=" * 75)
             logger.warning(f"🔄 [重啟接管部位] 帳上發現未平倉 TMF {pos_label} {abs(real_net)}口 (均價 {strategy.entry_price:.0f})！")
@@ -605,20 +530,24 @@ class ShioajiTMFTrader:
 
         # 情況二：券商帳上無部位 (空手)
         logger.info("✅ 啟動檢查: 券商帳上目前無 TMF 部位 (淨部位 0)")
+        if saved_state:
+            was_pos = saved_state.get("position", 0) != 0
+            self.state_manager.restore_strategy_state(strategy, saved_state)
+            if was_pos:
+                logger.warning("⚠️ 本地紀錄原為持倉，但券商帳上已無部位 (可能已由手機App手動平倉或由券商停損)，策略拉回空手。")
         strategy.position = 0
         strategy.highest_profit = 0.0
+        strategy._hp_before_bar_val = 0.0
+        strategy.entry_time = None
 
-        if saved_state:
-            # 恢復今日已交易次數與紀錄，避免重啟後重複突破開倉超過當日上限
-            strategy.trade_count = saved_state.get("trade_count", 0)
-            if saved_state.get("position", 0) != 0:
-                logger.warning("⚠️ 本地紀錄原為持倉，但券商帳上已無部位 (可能已由手機App手動平倉或由券商停損)，策略拉回空手。")
-            max_trades = getattr(strategy.config, "max_trades_per_day", None)
-            if max_trades is None:
-                max_trades = getattr(strategy.config, "max_initial_trades", 1) + (1 if getattr(strategy.config, "enable_sar", False) else 0)
-            if strategy.trade_count >= max_trades:
-                self._halt_entries(f"今日交易次數已達上限 ({strategy.trade_count}次)")
-                logger.info(f"🛑 今日已完成 {strategy.trade_count} 次交易，不再開新倉，維持空手監控至收盤。")
+        if saved_state and (strategy.trade_count >= max_trades or saved_state.get("entries_halted", False)):
+            reason = (
+                f"今日交易次數已達上限 ({strategy.trade_count}次)"
+                if strategy.trade_count >= max_trades
+                else "先前已設定停開新倉"
+            )
+            self._halt_entries(reason)
+            logger.info(f"🛑 {reason}，維持空手監控至收盤。")
         self._save_state(strategy)
         return processed_timestamps
 
@@ -750,6 +679,7 @@ class ShioajiTMFTrader:
             self.pending_flatten = False
         strategy.position = 0
         strategy.highest_profit = 0.0
+        self._intrabar_sar_state = None
         self._save_state(strategy)
 
     def _relentless_flatten_step(self, strategy: ORBStrategy) -> bool:
@@ -772,6 +702,7 @@ class ShioajiTMFTrader:
                 self.pending_flatten = False
                 strategy.position = 0
                 strategy.highest_profit = 0.0
+                self._intrabar_sar_state = None
                 self._save_state(strategy)
             return True
 
@@ -787,6 +718,7 @@ class ShioajiTMFTrader:
             self.pending_flatten = False
             strategy.position = 0
             strategy.highest_profit = 0.0
+            self._intrabar_sar_state = None
             self._save_state(strategy)
             return True
         return False
@@ -822,41 +754,24 @@ class ShioajiTMFTrader:
             self.notifier.send(msg)
         elif cmd == "resume":
             self.entries_halted = False
-            logger.info("▶️ [外部指令] 已恢復允許開新倉。")
+            self._save_state(strategy)
+            logger.info("▶️ [外部指令] 已恢復允許開新倉並保存狀態。")
 
     # ------------------------------------------------------------------
     # K 棒與主迴圈
     # ------------------------------------------------------------------
     def _fetch_cnyes_history(self, timeout: int = 5) -> pd.DataFrame:
-        """從 CNYES 公開行情介面抓取近月台指期 1分K 資料 (使用跨平台 SSL 上下文)"""
-        import urllib.request
-        from live.notifier import _ssl_ctx
-
-        url = "https://ws.api.cnyes.com/ws/api/v1/charting/history?symbol=TWF:TXF:FUTURES&resolution=1&quote=1"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=timeout, context=_ssl_ctx) as r:
-            payload = json.loads(r.read().decode("utf-8"))
-        data = payload.get("data", {})
-        t_list = data.get("t", [])
-        if not t_list:
-            return pd.DataFrame()
-        return pd.DataFrame({
-            "ts": [pd.Timestamp(datetime.datetime.fromtimestamp(ts)) for ts in t_list],
-            "open": data.get("o", []),
-            "high": data.get("h", []),
-            "low": data.get("l", []),
-            "close": data.get("c", []),
-            "volume": data.get("v", []),
-        })
+        """從 CNYES 公開行情介面抓取近月大台指期 1分K 資料 (使用跨平台 SSL 上下文)"""
+        return fetch_cnyes_history(timeout=timeout)
 
     def _fetch_backup_intraday_kbars(self, today_str: str) -> pd.DataFrame:
-        """當永豐模擬環境 api.kbars 壅塞逾時時，自動從高速台指期 1分K 備援通道回補今日已收盤 K 棒"""
+        """當永豐模擬環境 api.kbars 壅塞逾時時，自動從高速大台指期 1分K 備援通道回補今日已收盤 K 棒"""
         try:
             df = self._fetch_cnyes_history(timeout=4)
             if df.empty:
                 return pd.DataFrame()
             df = df.set_index("ts").sort_index()
-            day_df = df[df.index.strftime("%Y-%m-%d") == today_str].between_time("08:45", "13:45")
+            day_df = df[df.index.strftime("%Y-%m-%d") == today_str].between_time("08:45", "13:44")
             return day_df[["open", "high", "low", "close", "volume"]].copy()
         except Exception as e:
             logger.debug(f"備援 K 棒回補失敗: {e}")
@@ -868,22 +783,7 @@ class ShioajiTMFTrader:
         驗證 Shioaji 快照是否屬於「今日日盤 (08:45:00 ~ 13:46:00)」。
         可防止颱風天、國定假日或開盤前讀取到前一日收盤或昨夜盤 05:00 殘留價格。
         """
-        snap_ts_raw = getattr(snap, "ts", None)
-        if snap_ts_raw is None or not isinstance(snap_ts_raw, (int, float, str, datetime.datetime, pd.Timestamp)):
-            return True
-        try:
-            if isinstance(snap_ts_raw, (int, float)):
-                if snap_ts_raw <= 0:
-                    return False
-                snap_dt = pd.to_datetime(int(snap_ts_raw)).to_pydatetime()
-            else:
-                snap_dt = pd.to_datetime(snap_ts_raw).to_pydatetime()
-            return (
-                snap_dt.strftime("%Y-%m-%d") == today_str
-                and datetime.time(8, 45, 0) <= snap_dt.time() <= datetime.time(13, 46, 0)
-            )
-        except Exception:
-            return False
+        return is_today_day_session_snapshot(snap, today_str)
 
     def fetch_today_day_kbars(self) -> pd.DataFrame:
         """從 Shioaji 抓取今日日盤 (08:45 ~ 13:45) 1分K 資料 (委由 BarAggregator 管理即時 Tick 串流合成 + Snapshot 快照防逾時)"""
@@ -891,15 +791,12 @@ class ShioajiTMFTrader:
             return pd.DataFrame()
         today_str = datetime.date.today().strftime("%Y-%m-%d")
 
-        # 1. 若尚未載入早盤歷史 K 棒，先嘗試 Shioaji kbars (限時 5 秒避免卡死)
+        # 1. 若尚未載入早盤歷史 K 棒，先嘗試 Shioaji kbars (限時 5 秒避免卡死，並統一 -1 分鐘對齊起始時間戳)
         if not self.bar_aggregator.history_loaded and not self.bar_aggregator.kbars_disabled:
             try:
                 kbars = self.api.kbars(self.contract, start=today_str, end=today_str, timeout=5000)
-                df = pd.DataFrame({**kbars})
+                df = normalize_shioaji_kbars(kbars, subtract_minute=True)
                 if not df.empty:
-                    df["ts"] = pd.to_datetime(df["ts"])
-                    df = df.set_index("ts")
-                    df.columns = [c.lower() for c in df.columns]
                     self.bar_aggregator.load_history_kbars(df, today_str=today_str)
             except Exception:
                 self.bar_aggregator.kbars_disabled = True
@@ -910,7 +807,8 @@ class ShioajiTMFTrader:
             backup_df = self._fetch_backup_intraday_kbars(today_str)
             if not backup_df.empty:
                 now_min = pd.Timestamp(datetime.datetime.now().replace(second=0, microsecond=0))
-                self.bar_aggregator.load_backup_bars(backup_df, now_min=now_min)
+                self.bar_aggregator.load_backup_bars(backup_df, now_min=now_min, source_tag="CNYES_TXF")
+                logger.warning("⚠️ [備援行情切換] kbars 逾時改用 CNYES 大台(TXF) 1分K 補齊歷史（成交量屬大台量能，價格已對齊起始時間）")
                 logger.info(f"⚡ [高速回補完成] 已載入今日 08:45 至今共 {len(backup_df)} 根 1分K，後續由 Shioaji 即時 Tick 串流與 Snapshot 零延遲更新！")
 
         # 3. 若超過 3 秒未收到新 Tick (或尚未有當分鐘 Bar)，才透過 Shioaji Snapshot 同步報價，平時直接由記憶體 Tick 0ms 合成
@@ -949,40 +847,48 @@ class ShioajiTMFTrader:
             logger.warning(f"🛑 已停止開新倉，忽略訊號 {act}")
             if act in ("SAR_BUY", "SAR_SELL"):
                 close_action = "SELL" if prev_pos == 1 else "BUY"
-                self._send_and_verify(close_action, q, octype="Cover", price=rec.get('exit_price', 0))
+                sig_p = float(rec.get("exit_price", 0) or 0)
+                self._send_and_verify(close_action, q, octype="Cover", price=sig_p, signal_price=sig_p)
             strategy.position = 0
             strategy.highest_profit = 0.0
+            self._intrabar_sar_state = None
             if act in ("BUY", "SELL"):
                 strategy.trade_count = max(0, strategy.trade_count - 1)
             self._post_trade_check(strategy, act, FillResult(True, q, 0.0, "Skipped"))
             return
 
         if act == "BUY":
-            msg = f"🟢 [訊號觸發] {ts.strftime('%H:%M')} 做多進場 @ {bar['close']:.0f} ({res.get('detail')})"
+            sig_p = float(bar["close"])
+            msg = f"🟢 [訊號觸發] {ts.strftime('%H:%M')} 做多進場 @ {sig_p:.0f} ({res.get('detail')})"
             logger.info(msg)
-            result = self._send_and_verify("BUY", q, price=bar['close'])
+            result = self._send_and_verify("BUY", q, price=sig_p, signal_price=sig_p)
             self.notifier.send(f"{msg}\n成交均價: {result.avg_price:.0f} ({result.status})")
         elif act == "SELL":
-            msg = f"🔴 [訊號觸發] {ts.strftime('%H:%M')} 做空進場 @ {bar['close']:.0f} ({res.get('detail')})"
+            sig_p = float(bar["close"])
+            msg = f"🔴 [訊號觸發] {ts.strftime('%H:%M')} 做空進場 @ {sig_p:.0f} ({res.get('detail')})"
             logger.info(msg)
-            result = self._send_and_verify("SELL", q, price=bar['close'])
+            result = self._send_and_verify("SELL", q, price=sig_p, signal_price=sig_p)
             self.notifier.send(f"{msg}\n成交均價: {result.avg_price:.0f} ({result.status})")
         elif act == "EXIT":
             strategy.position = 0
+            self._intrabar_sar_state = None
             close_action = "SELL" if prev_pos == 1 else "BUY"
-            msg = f"🏁 [平倉回補] {ts.strftime('%H:%M')} {rec.get('reason')} @ {rec.get('exit_price'):.0f} (損益: {rec.get('pnl_pts'):+.0f}點)"
+            sig_p = float(rec.get("exit_price", 0) or 0)
+            msg = f"🏁 [平倉回補] {ts.strftime('%H:%M')} {rec.get('reason')} @ {sig_p:.0f} (損益: {rec.get('pnl_pts'):+.0f}點)"
             logger.info(msg)
-            result = self._send_and_verify(close_action, q, octype="Cover", price=rec.get('exit_price', 0))
+            result = self._send_and_verify(close_action, q, octype="Cover", price=sig_p, signal_price=sig_p)
             self.notifier.send(msg)
         elif act == "SAR_SELL":
-            msg = f"🔄 [假突破反手做空 SAR] {ts.strftime('%H:%M')} 多單停損並反手做空 @ {rec.get('exit_price'):.0f}"
+            sig_p = float(rec.get("exit_price", 0) or 0)
+            msg = f"🔄 [假突破反手做空 SAR] {ts.strftime('%H:%M')} 多單停損並反手做空 @ {sig_p:.0f}"
             logger.info(msg)
-            result = self._send_and_verify("SELL", q * 2, price=rec.get('exit_price', 0))
+            result = self._send_and_verify("SELL", q * 2, price=sig_p, signal_price=sig_p)
             self.notifier.send(msg)
         elif act == "SAR_BUY":
-            msg = f"🔄 [假跌破反手做多 SAR] {ts.strftime('%H:%M')} 空單停損並反手做多 @ {rec.get('exit_price'):.0f}"
+            sig_p = float(rec.get("exit_price", 0) or 0)
+            msg = f"🔄 [假跌破反手做多 SAR] {ts.strftime('%H:%M')} 空單停損並反手做多 @ {sig_p:.0f}"
             logger.info(msg)
-            result = self._send_and_verify("BUY", q * 2, price=rec.get('exit_price', 0))
+            result = self._send_and_verify("BUY", q * 2, price=sig_p, signal_price=sig_p)
             self.notifier.send(msg)
         else:
             return
@@ -998,33 +904,7 @@ class ShioajiTMFTrader:
 
     def _save_overnight_level_to_csv(self, data_dir: str, target_date_str: str, night_bars: pd.DataFrame):
         """將抓到的前一日夜盤極值自動寫入 overnight_levels_summary.csv 永久保存"""
-        try:
-            os.makedirs(data_dir, exist_ok=True)
-            o_high = float(night_bars["high"].max())
-            o_low = float(night_bars["low"].min())
-            o_open = float(night_bars.iloc[0]["open"])
-            o_close = float(night_bars.iloc[-1]["close"])
-            new_row = pd.DataFrame([{
-                "trading_date": target_date_str,
-                "night_start": str(night_bars["ts"].min()),
-                "night_end": str(night_bars["ts"].max()),
-                "night_bars": len(night_bars),
-                "night_open": o_open,
-                "night_high": o_high,
-                "night_low": o_low,
-                "night_close": o_close,
-                "night_range": o_high - o_low,
-            }])
-            lvl_path = os.path.join(data_dir, "overnight_levels_summary.csv")
-            if os.path.exists(lvl_path):
-                old_df = pd.read_csv(lvl_path)
-                combined = pd.concat([old_df[old_df["trading_date"] != target_date_str], new_row], ignore_index=True)
-                combined = combined.sort_values("trading_date").reset_index(drop=True)
-            else:
-                combined = new_row
-            combined.to_csv(lvl_path, index=False)
-        except Exception as e:
-            logger.debug(f"自動儲存夜盤極值至 CSV 失敗: {e}")
+        save_overnight_level_to_csv(data_dir, target_date_str, night_bars)
 
     def load_overnight_levels_for_strategy(self, strategy: ORBStrategy, target_date_str: str):
         """讀取或查詢指定交易日所對應的前一日夜盤 (15:00~05:00) 極值並注入策略 (防撞牆保護 Wall Filter)"""
@@ -1032,73 +912,100 @@ class ShioajiTMFTrader:
             return
 
         data_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
-        # 1. 優先從本地夜盤高低點彙整表 (overnight_levels_summary.csv) 讀取
-        for fn in ["overnight_levels_summary.csv", "overnight_levels_30days.csv"]:
-            lvl_path = os.path.join(data_dir, fn)
-            if os.path.exists(lvl_path):
-                try:
-                    df_lvl = pd.read_csv(lvl_path)
-                    match_row = df_lvl[df_lvl["trading_date"] == target_date_str]
-                    if not match_row.empty:
-                        o_h = float(match_row.iloc[0]["night_high"])
-                        o_l = float(match_row.iloc[0]["night_low"])
-                        strategy.set_overnight_levels(o_h, o_l)
-                        logger.info(f"🌙 [夜盤防撞牆] 已載入 {target_date_str} 夜盤極值: 夜高={o_h:.0f}, 夜低={o_l:.0f} (門檻={getattr(strategy.config, 'overnight_wall_threshold_pts', 40.0):.0f}點)")
-                        return
-                except Exception as e:
-                    logger.debug(f"讀取 {fn} 失敗: {e}")
-
-        cur_d = datetime.datetime.strptime(target_date_str, "%Y-%m-%d").date()
-        end_night = datetime.datetime.combine(cur_d, datetime.time(5, 1, 0))
-        start_night = datetime.datetime.combine(cur_d - datetime.timedelta(days=4), datetime.time(15, 0, 0))
-
-        # 2. 若本地無紀錄且 API 可用 (含 live 與 paper 各自已登入之 self.api)，即時從 Shioaji 抓取前一日夜盤 15:00~05:00
-        if self.api is not None and self.contract is not None:
-            try:
-                prev_4d = (cur_d - datetime.timedelta(days=4)).strftime("%Y-%m-%d")
-                kbs = self.api.kbars(self.contract, start=prev_4d, end=target_date_str, timeout=5000)
-                df_k = pd.DataFrame({**kbs})
-                if not df_k.empty:
-                    df_k.columns = [c.lower() for c in df_k.columns]
-                    df_k["ts"] = pd.to_datetime(df_k["ts"])
-                    subset = df_k[(df_k["ts"] >= start_night) & (df_k["ts"] <= end_night)]
-                    evening_bars = subset[subset["ts"].dt.hour >= 15]
-                    if not evening_bars.empty:
-                        last_ev_date = evening_bars["ts"].dt.date.max()
-                        night_start_exact = datetime.datetime.combine(last_ev_date, datetime.time(15, 0, 0))
-                        night_bars = df_k[(df_k["ts"] >= night_start_exact) & (df_k["ts"] <= end_night)]
-                        if not night_bars.empty:
-                            o_h = float(night_bars["high"].max())
-                            o_l = float(night_bars["low"].min())
-                            strategy.set_overnight_levels(o_h, o_l)
-                            self._save_overnight_level_to_csv(data_dir, target_date_str, night_bars)
-                            logger.info(f"🌙 [夜盤防撞牆] 從 API 即時取得 {target_date_str} 夜盤極值並寫入 CSV: 夜高={o_h:.0f}, 夜低={o_l:.0f}")
-                            return
-            except Exception as api_err:
-                logger.warning(f"從 Shioaji API 抓取夜盤極值逾時或略過，嘗試公開行情備援: {api_err}")
-
-        # 3. 免登入公開高速行情備援 (CNYES，完全不觸碰 simulation=False，防模擬主機 kbars 塞車逾時)
-        try:
-            df_raw = self._fetch_cnyes_history(timeout=5)
-            if not df_raw.empty:
-                df_c = df_raw[["ts", "open", "high", "low", "close"]].sort_values("ts").reset_index(drop=True)
-                subset = df_c[(df_c["ts"] >= start_night) & (df_c["ts"] <= end_night)]
-                evening_bars = subset[subset["ts"].dt.hour >= 15]
-                if not evening_bars.empty:
-                    last_ev_date = evening_bars["ts"].dt.date.max()
-                    night_start_exact = datetime.datetime.combine(last_ev_date, datetime.time(15, 0, 0))
-                    night_bars = df_c[(df_c["ts"] >= night_start_exact) & (df_c["ts"] <= end_night)]
-                    if not night_bars.empty:
-                        o_h = float(night_bars["high"].max())
-                        o_l = float(night_bars["low"].min())
-                        strategy.set_overnight_levels(o_h, o_l)
-                        self._save_overnight_level_to_csv(data_dir, target_date_str, night_bars)
-                        logger.info(f"🌙 [夜盤防撞牆] 從公開行情備援取得 {target_date_str} 夜盤極值並寫入 CSV: 夜高={o_h:.0f}, 夜低={o_l:.0f}")
-                        return
-        except Exception as cnyes_err:
-            logger.debug(f"從公開備援抓取夜盤極值失敗: {cnyes_err}")
+        o_h, o_l, src = load_or_fetch_overnight_levels(
+            data_dir,
+            target_date_str,
+            api=self.api,
+            contract=self.contract,
+            allow_cnyes_fallback=True,
+        )
+        if o_h is not None and o_l is not None:
+            strategy.set_overnight_levels(o_h, o_l)
+            thresh = getattr(strategy.config, "overnight_wall_threshold_pts", 40.0)
+            if src == "csv":
+                logger.info(f"🌙 [夜盤防撞牆] 已載入 {target_date_str} 夜盤極值: 夜高={o_h:.0f}, 夜低={o_l:.0f} (門檻={thresh:.0f}點)")
+            elif src == "shioaji":
+                logger.info(f"🌙 [夜盤防撞牆] 從 Shioaji API 即時取得 {target_date_str} 夜盤極值: 夜高={o_h:.0f}, 夜低={o_l:.0f}")
+            elif src == "cnyes":
+                logger.warning(f"🌙 [夜盤防撞牆] 從 CNYES 大台(TXF) 公開備援取得 {target_date_str} 夜盤極值: 夜高={o_h:.0f}, 夜低={o_l:.0f}")
+            return
 
         logger.info(f"ℹ️ {target_date_str} 未取得前一日夜盤極值 (或前日休市無夜盤)，維持標準 ORB 模式運作")
+
+    @staticmethod
+    def _build_post_sar_bar(raw_bar: pd.Series, sar_state: dict) -> pd.Series:
+        """建立同分鐘 SAR 反手後的合成 K 棒，僅追蹤反手之後的 Tick 高低點，避免被反手前極值誤傷"""
+        cur_close = float(raw_bar["close"])
+        sar_state["high"] = max(float(sar_state["high"]), cur_close)
+        sar_state["low"] = min(float(sar_state["low"]), cur_close)
+        sar_state["close"] = cur_close
+        post_bar = raw_bar.copy()
+        post_bar["high"] = sar_state["high"]
+        post_bar["low"] = sar_state["low"]
+        post_bar["close"] = cur_close
+        return post_bar
+
+    def _evaluate_completed_and_intrabar(
+        self,
+        strategy: ORBStrategy,
+        kbars: pd.DataFrame,
+        processed_timestamps: set,
+    ):
+        """依序處理已收完的 1分K 與最新進行中 K 棒的即時停損/鎖利/SAR 檢查"""
+        completed_bars = kbars.iloc[:-1]
+        prev_bar = None
+        for ts, bar in completed_bars.iterrows():
+            if ts not in processed_timestamps:
+                processed_timestamps.add(ts)
+                if self._intrabar_sar_state is not None and self._intrabar_sar_state["ts"] == ts:
+                    if strategy.position != 0:
+                        eval_bar = self._build_post_sar_bar(bar, self._intrabar_sar_state)
+                        prev_pos = strategy.position
+                        res = strategy.execute_bar(ts, eval_bar, prev_bar)
+                        self._handle_action(strategy, res, ts, eval_bar, prev_pos)
+                    self._intrabar_sar_state = None
+                else:
+                    prev_pos = strategy.position
+                    res = strategy.execute_bar(ts, bar, prev_bar)
+                    self._handle_action(strategy, res, ts, bar, prev_pos)
+            prev_bar = bar
+        return prev_bar
+
+    def _evaluate_intrabar_tick(
+        self,
+        strategy: ORBStrategy,
+        latest_ts: pd.Timestamp,
+        latest: pd.Series,
+        prev_bar,
+        processed_timestamps: set,
+    ):
+        """持倉期間對當前進行中 K 棒即時檢查停損、鎖利與反手 (SAR)，並隔離同分鐘反手前後高低價"""
+        if self._intrabar_sar_state is not None and self._intrabar_sar_state["ts"] != latest_ts:
+            self._intrabar_sar_state = None
+
+        if strategy.position == 0 or latest_ts in processed_timestamps:
+            return
+
+        if self._intrabar_sar_state is not None and self._intrabar_sar_state["ts"] == latest_ts:
+            eval_bar = self._build_post_sar_bar(latest, self._intrabar_sar_state)
+            prev_pos = strategy.position
+            intrabar_res = strategy.execute_bar(latest_ts, eval_bar, prev_bar)
+            if intrabar_res.get("action", "HOLD") != "HOLD":
+                processed_timestamps.add(latest_ts)
+                self._intrabar_sar_state = None
+                self._handle_action(strategy, intrabar_res, latest_ts, eval_bar, prev_pos)
+            return
+
+        prev_pos = strategy.position
+        intrabar_res = strategy.execute_bar(latest_ts, latest, prev_bar)
+        act = intrabar_res.get("action", "HOLD")
+        if act != "HOLD":
+            self._handle_action(strategy, intrabar_res, latest_ts, latest, prev_pos)
+            if act in ("SAR_BUY", "SAR_SELL") and strategy.position != 0:
+                px = float(latest["close"])
+                self._intrabar_sar_state = {"ts": latest_ts, "high": px, "low": px, "close": px}
+            else:
+                processed_timestamps.add(latest_ts)
 
     def run_intraday_bot(self, strat_cfg: ORBStrategyConfig = None):
         """
@@ -1187,6 +1094,7 @@ class ShioajiTMFTrader:
                 if cur_date_str != active_date_str:
                     active_date_str = cur_date_str
                     self.bar_aggregator.clear()
+                    self._intrabar_sar_state = None
                     _last_prepared_ver = -1
                     _cached_kbars = pd.DataFrame()
                     processed_timestamps.clear()
@@ -1324,7 +1232,13 @@ class ShioajiTMFTrader:
                         try:
                             from live.health_check import run_health_check
                             mode_str = "paper" if self.simulation else "live"
-                            run_health_check(mode=mode_str, qty=self.quantity, send_notify=True)
+                            run_health_check(
+                                mode=mode_str,
+                                qty=self.quantity,
+                                send_notify=True,
+                                api=self.api,
+                                contract=self.contract,
+                            )
                         except Exception as hc_err:
                             logger.error(f"健康巡檢執行異常: {hc_err}")
                             self.notifier.send(f"⚠️ [08:35 開盤前健檢異常] {hc_err}")
@@ -1364,31 +1278,13 @@ class ShioajiTMFTrader:
                         _last_prepared_ver = cur_ver
                         _cached_kbars = kbars
 
-                    # 09:15 後計算並鎖定今日 ORB 上下界
+                    # 09:15 後計算並鎖定今日 ORB 上下界（延後至本輪已收完 K 棒處理後再發送完整 09:15 結論）
+                    just_locked_orb = False
                     if now_str >= strat_cfg.orb_end_time and not strategy.orb_calculated:
                         orb_h, orb_l = strategy.calculate_orb_levels(kbars)
                         if orb_h and orb_l:
+                            just_locked_orb = True
                             logger.info(f"📌 今日現貨開盤區間 ({strat_cfg.orb_start_time}~{strat_cfg.orb_end_time}) 已鎖定: 上界={orb_h:.0f}, 下界={orb_l:.0f} (振幅={orb_h-orb_l:.0f}點)")
-                            
-                            # 檢查夜盤防撞牆狀態
-                            wall_msg = ""
-                            if getattr(strategy.config, "use_overnight_wall_filter", False):
-                                thresh_pts = getattr(strategy.config, "overnight_wall_threshold_pts", 40.0)
-                                if strategy.overnight_high is not None and strategy.orb_high < strategy.overnight_high and (strategy.overnight_high - strategy.orb_high) <= thresh_pts:
-                                    wall_msg += f"\n• 🛡️ 啟動做多防撞牆: ORB上界距夜高僅 {strategy.overnight_high - strategy.orb_high:.0f} 點，需突破夜高 {strategy.overnight_high:.0f} 才開多！"
-                                if strategy.overnight_low is not None and strategy.orb_low > strategy.overnight_low and (strategy.orb_low - strategy.overnight_low) <= thresh_pts:
-                                    wall_msg += f"\n• 🛡️ 啟動做空防撞地: ORB下界距夜低僅 {strategy.orb_low - strategy.overnight_low:.0f} 點，需跌破夜低 {strategy.overnight_low:.0f} 才開空！"
-                                if not wall_msg and strategy.overnight_high is not None and strategy.overnight_low is not None:
-                                    wall_msg += f"\n• 🌙 夜盤參考水位: 夜高 {strategy.overnight_high:.0f} / 夜低 {strategy.overnight_low:.0f} (距離安全)"
-
-                            self.notifier.send(
-                                f"📌 [09:15 ORB 區間確立]\n"
-                                f"現貨開盤 15 分鐘關鍵區間已鎖定！\n"
-                                f"• 突破做多界線: {orb_h:.0f}\n"
-                                f"• 跌破做空界線: {orb_l:.0f}\n"
-                                f"• 今日開盤振幅: {orb_h - orb_l:.0f} 點{wall_msg}\n"
-                                f"• 09:16 起啟動順勢突破監控！"
-                            )
 
                     # 11:30 首次進場截止通知
                     if now_str >= "11:30:00" and not getattr(self, "_noon_cutoff_sent", False):
@@ -1402,25 +1298,18 @@ class ShioajiTMFTrader:
                         )
 
                     # (A) 逐根處理已收完的 K 棒 (換分 0.2~1 秒內立即確認突破進場)
-                    completed_bars = kbars.iloc[:-1]
-                    prev_bar = None
-                    for ts, bar in completed_bars.iterrows():
-                        if ts not in processed_timestamps:
-                            processed_timestamps.add(ts)
-                            prev_pos = strategy.position
-                            res = strategy.execute_bar(ts, bar, prev_bar)
-                            self._handle_action(strategy, res, ts, bar, prev_pos)
-                        prev_bar = bar
+                    prev_bar = self._evaluate_completed_and_intrabar(strategy, kbars, processed_timestamps)
+
+                    # 若本輪剛鎖定 09:15 ORB，於已收完 K 棒 (含 09:14 早盤強勢突破) 處理完畢後立即播報進場結論與停損/各階停利點
+                    if just_locked_orb:
+                        _, orb_report_msg = build_0915_orb_report(strategy, entries_halted=self.entries_halted)
+                        logger.info("\n" + orb_report_msg)
+                        self.notifier.send(orb_report_msg)
 
                     # (B) 持倉期間：不等待 1 分 K 收完，對當前最新 Tick K 棒即時檢查停損、保本鎖利與反手 (SAR)
                     latest_ts = kbars.index[-1]
                     latest = kbars.iloc[-1]
-                    if strategy.position != 0 and latest_ts not in processed_timestamps:
-                        prev_pos = strategy.position
-                        intrabar_res = strategy.execute_bar(latest_ts, latest, prev_bar)
-                        if intrabar_res.get("action", "HOLD") != "HOLD":
-                            processed_timestamps.add(latest_ts)
-                            self._handle_action(strategy, intrabar_res, latest_ts, latest, prev_pos)
+                    self._evaluate_intrabar_tick(strategy, latest_ts, latest, prev_bar, processed_timestamps)
 
                     # (C) 每 3 秒印出最新即時狀態列
                     if time.time() - last_log_time >= 3.0:

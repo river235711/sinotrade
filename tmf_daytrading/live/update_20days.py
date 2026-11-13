@@ -8,13 +8,19 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
-import json
-import urllib.request
 import datetime
 import subprocess
 import pandas as pd
 from strategies.atr_scaler import update_daily_history, compute_atr, scale_strategy_config
 from config import ORBStrategyConfig
+from live.market_data import (
+    resolve_tmf_contract,
+    normalize_shioaji_kbars,
+    fetch_cnyes_day_kbars,
+    is_overnight_row_complete,
+    load_or_fetch_overnight_levels,
+)
+
 
 def fetch_intraday_kbars_shioaji(today_str: str) -> pd.DataFrame:
     """
@@ -28,29 +34,18 @@ def fetch_intraday_kbars_shioaji(today_str: str) -> pd.DataFrame:
         cfg = ShioajiConfig()
         api = sj.Shioaji()
         api.login(api_key=cfg.api_key, secret_key=cfg.secret_key)
-        
-        # 優先使用 contracts v2 原生 API 獲取 TMFR1 連續合約
-        try:
-            futures_tmf = api.contracts.futures('TMF')
-            tmfr1_info = next(c for c in futures_tmf if getattr(c, 'code', '') == 'TMFR1')
-            tmfr1 = getattr(tmfr1_info, 'contract', tmfr1_info)
-        except Exception:
-            tmfr1 = next(c for c in api.Contracts.Futures.TMF if c.code == 'TMFR1')
-        
-        kb = api.kbars(tmfr1, start=today_str, end=today_str, timeout=10000)
-        
-        df = pd.DataFrame({**kb})
+
+        contract = resolve_tmf_contract(api, "TMFR1")
+        if contract is None:
+            return pd.DataFrame()
+
+        kb = api.kbars(contract, start=today_str, end=today_str, timeout=10000)
+        df = normalize_shioaji_kbars(kb, subtract_minute=True)
         if df.empty:
             return pd.DataFrame()
-        df.columns = [c.lower() for c in df.columns]
-        
-        # 重要轉換：Shioaji K 棒時間戳為收盤時間 (Close Timestamp，如 08:46:00 代表 08:45~08:46 該根 K 棒)
-        # 本系統策略核心與回測皆採用起始時間戳 (Start Timestamp，即 08:45:00 代表 08:45~08:46)，精準減去 1 分鐘
-        df['ts'] = pd.to_datetime(df['ts']) - pd.Timedelta(minutes=1)
-        df = df.sort_values('ts').reset_index(drop=True)
-        
-        # 嚴格篩選台指期日盤完整時段 (08:45:00 ~ 13:44:00 共 300 根)
-        df_day = df[(df['ts'].dt.time >= datetime.time(8, 45)) & (df['ts'].dt.time <= datetime.time(13, 44))].copy()
+
+        df = df.reset_index()
+        df_day = df[(df["ts"].dt.time >= datetime.time(8, 45)) & (df["ts"].dt.time <= datetime.time(13, 44))].copy()
         if df_day.empty:
             return pd.DataFrame()
         df_day["timestamp"] = df_day["ts"].dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -68,39 +63,80 @@ def fetch_intraday_kbars_shioaji(today_str: str) -> pd.DataFrame:
             except Exception:
                 pass
 
+
 def fetch_intraday_kbars_cnyes(today_str: str) -> pd.DataFrame:
-    """從高速台指期行情接口獲取指定日期的完整 1分K 資料 (08:45 ~ 13:45)"""
+    """從 CNYES 高速台指期行情接口獲取指定日期的完整 1分K 資料 (08:45 ~ 13:44)，標記為大台備援 (TXF_BKP)"""
     try:
-        url = "https://ws.api.cnyes.com/ws/api/v1/charting/history?symbol=TWF:TXF:FUTURES&resolution=1&quote=1"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        import ssl
-        try:
-            import certifi
-            ctx = ssl.create_default_context(cafile=certifi.where())
-        except Exception:
-            ctx = ssl._create_unverified_context()
-        with urllib.request.urlopen(req, timeout=8, context=ctx) as r:
-            payload = json.loads(r.read().decode("utf-8"))
-        data = payload.get("data", {})
-        t_list = data.get("t", [])
-        if not t_list:
+        day_df = fetch_cnyes_day_kbars(today_str, timeout=8)
+        if day_df.empty:
             return pd.DataFrame()
-        df = pd.DataFrame({
-            "timestamp": [datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S") for ts in t_list],
-            "open": data.get("o", []),
-            "high": data.get("h", []),
-            "low": data.get("l", []),
-            "close": data.get("c", []),
-            "volume": data.get("v", []),
-            "date": today_str,
-            "contract": "AUTO"
-        })
-        df["ts"] = pd.to_datetime(df["timestamp"])
-        df = df.set_index("ts").sort_index()
-        day_df = df[df.index.strftime("%Y-%m-%d") == today_str].between_time("08:45", "13:45")
-        return day_df.reset_index(drop=True)
+        print("⚠️ [CNYES 備援資料] 本日日盤 1分K 改由 CNYES 大台(TXF) 公開行情回補（成交量屬 TXF 量能，已標記 contract=TXF_BKP）。")
+        out = day_df.reset_index().copy()
+        out["timestamp"] = out["ts"].dt.strftime("%Y-%m-%d %H:%M:%S")
+        out["date"] = today_str
+        out["contract"] = "TXF_BKP"
+        cols = ["timestamp", "open", "high", "low", "close", "volume", "date", "contract"]
+        return out[cols].reset_index(drop=True)
     except Exception:
         return pd.DataFrame()
+
+
+def archive_1m_kbars(history_path: str, seed_df: pd.DataFrame, today_kbars: pd.DataFrame, today_str: str) -> pd.DataFrame:
+    """將每日 1分K 累積歸檔至永久歷史庫 (history_1m_kbars.csv)，永不剔除超過 20 日的歷史 K 棒"""
+    if os.path.exists(history_path):
+        hist_base = pd.read_csv(history_path)
+    else:
+        hist_base = seed_df.copy()
+
+    clean_hist = hist_base[hist_base["date"] != today_str]
+    merged = pd.concat([clean_hist, today_kbars], ignore_index=True)
+    merged["ts"] = pd.to_datetime(merged["timestamp"])
+    merged = merged.sort_values("ts").drop_duplicates(subset=["timestamp"], keep="last").reset_index(drop=True)
+    merged = merged.drop(columns=["ts"], errors="ignore")
+    os.makedirs(os.path.dirname(history_path), exist_ok=True)
+    merged.to_csv(history_path, index=False)
+    return merged
+
+
+def backfill_overnight_level(data_dir: str, target_date_str: str) -> bool:
+    """若今日夜盤彙整紀錄遺失或不完整（例如半夜誤存半截夜盤），以 Shioaji 原生行情補齊 overnight_levels_summary.csv"""
+    lvl_path = os.path.join(data_dir, "overnight_levels_summary.csv")
+    if os.path.exists(lvl_path):
+        try:
+            df_lvl = pd.read_csv(lvl_path)
+            match_row = df_lvl[df_lvl["trading_date"] == target_date_str]
+            if not match_row.empty and is_overnight_row_complete(match_row.iloc[0].to_dict(), target_date_str):
+                return True
+        except Exception:
+            pass
+
+    api = None
+    try:
+        import shioaji as sj
+        from config import ShioajiConfig
+        cfg = ShioajiConfig()
+        api = sj.Shioaji()
+        api.login(api_key=cfg.api_key, secret_key=cfg.secret_key)
+        contract = resolve_tmf_contract(api, "TMFR1")
+        o_h, o_l, src = load_or_fetch_overnight_levels(
+            data_dir,
+            target_date_str,
+            api=api,
+            contract=contract,
+            allow_cnyes_fallback=False,
+        )
+        if o_h is not None and o_l is not None:
+            print(f"🌙 [盤後夜盤補齊] 已透過 {src} 補齊 {target_date_str} 完整夜盤極值: 夜高={o_h:.0f} / 夜低={o_l:.0f}")
+            return True
+    except Exception as e:
+        print(f"⚠️ [盤後夜盤補齊] 補抓 {target_date_str} 夜盤極值略過: {e}")
+    finally:
+        if api is not None:
+            try:
+                api.logout()
+            except Exception:
+                pass
+    return False
 
 def roll_20days(target_date: str = None, push_git: bool = True):
     base_dir = BASE_DIR
@@ -151,10 +187,17 @@ def roll_20days(target_date: str = None, push_git: bool = True):
     else:
         kept_dates = all_dates
 
-    # 儲存回 CSV
+    # 儲存回滾動 20 日 CSV，並同步將所有 1分K 累積保存至永久歷史檔 history_1m_kbars.csv
     combined_df.to_csv(cache_path, index=False)
     print(f"💾 已成功覆蓋儲存至: {cache_path}")
     print(f"📅 最新 20 日區間: {kept_dates[0]} ~ {kept_dates[-1]} (共 {len(kept_dates)} 天，總計 {len(combined_df)} 根 K 棒)")
+
+    history_path = os.path.join(data_dir, "history_1m_kbars.csv")
+    hist_df = archive_1m_kbars(history_path, old_df, today_kbars, today_str)
+    print(f"🗄️ 永久 1分K 歷史庫已更新: {history_path} (累計 {hist_df['date'].nunique()} 天 / {len(hist_df)} 根)")
+
+    # 若今日夜盤彙整表遺失或不完整，順便於盤後補齊
+    backfill_overnight_level(data_dir, today_str)
 
     # 3b. 同步更新永久日 K 歷史檔 (daily_bars.csv)，並預告下一交易日的 ATR 動態參數
     daily_hist = update_daily_history(data_dir, today_kbars)
@@ -172,13 +215,13 @@ def roll_20days(target_date: str = None, push_git: bool = True):
     except Exception as e:
         print(f"⚠️ 重新執行回測時發生錯誤: {e}")
 
-    # 5. 自動 Commit & Push 到 GitHub
+    # 5. 自動 Commit & Push 到 GitHub (僅推送數據與報表目錄，不誤推本機未完成程式碼)
     if push_git:
         push_script = os.path.join(base_dir, "push.sh")
         if os.path.exists(push_script):
             commit_msg = f"data: Roll 20-day dataset to {today_str} ({kept_dates[0]} ~ {kept_dates[-1]})"
             print(f"\n🚀 正在自動推送最新資料與圖表至 GitHub: {commit_msg} ...")
-            subprocess.run(["bash", push_script, commit_msg], check=False)
+            subprocess.run(["bash", push_script, "--data-only", commit_msg], check=False)
 
     print("\n🎉 滾動 20 日更新與回測流程全部順利完成！")
     return True

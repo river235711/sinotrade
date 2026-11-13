@@ -58,7 +58,11 @@ class StateManager:
         """
         try:
             path = self.get_state_path(date_str)
-            today_fmt = datetime.date.today().strftime("%Y-%m-%d")
+            if date_str:
+                clean_d = date_str.replace("-", "")
+                today_fmt = f"{clean_d[:4]}-{clean_d[4:6]}-{clean_d[6:]}" if len(clean_d) == 8 else date_str
+            else:
+                today_fmt = datetime.date.today().strftime("%Y-%m-%d")
 
             state = {
                 "date": today_fmt,
@@ -115,6 +119,18 @@ class StateManager:
         try:
             strategy.position = int(state.get("position", 0))
             strategy.entry_price = float(state.get("entry_price", 0.0))
+            raw_et = state.get("entry_time")
+            if raw_et:
+                import pandas as pd
+                et_str = str(raw_et).strip()
+                if len(et_str) <= 8 and state.get("date"):
+                    et_str = f"{state['date']} {et_str}"
+                try:
+                    strategy.entry_time = pd.Timestamp(et_str)
+                except Exception:
+                    strategy.entry_time = raw_et
+            else:
+                strategy.entry_time = None
             strategy.trade_count = int(state.get("trade_count", 0))
             strategy.highest_profit = float(state.get("highest_profit", 0.0))
             strategy._hp_before_bar_val = float(strategy.highest_profit)

@@ -17,15 +17,24 @@ if BASE_DIR not in sys.path:
 from config import InstrumentConfig, ORBStrategyConfig
 from strategies.atr_scaler import config_for_date, describe
 from live.notifier import TradeNotifier
+from live.market_data import resolve_tmf_contract
 
 logger = logging.getLogger("HealthCheck")
 
-def run_health_check(mode: str = "live", qty: int = 1, send_notify: bool = True) -> Dict[str, Any]:
+def run_health_check(
+    mode: str = "live",
+    qty: int = 1,
+    send_notify: bool = True,
+    api: Any = None,
+    contract: Any = None,
+) -> Dict[str, Any]:
     """
     執行開盤前全系統健康巡檢
     :param mode: 'live' 實盤 或 'paper' 模擬
     :param qty: 預計下單口數
     :param send_notify: 是否發送 LINE 與 Gmail 推播
+    :param api: 可選：複用主程式已登入之 Shioaji API 實例 (避免重複登入互踢)
+    :param contract: 可選：複用主程式已解析之主力合約
     :return: 包含巡檢狀態、細節與報告文字的字典
     """
     now = datetime.datetime.now()
@@ -81,27 +90,29 @@ def run_health_check(mode: str = "live", qty: int = 1, send_notify: bool = True)
         print(f"2. [今日參數] ❌ 載入失敗: {e}")
 
     # -------------------------------------------------------------
-    # 檢查項目 3: 永豐金 Shioaji API 連線與帳號登入 (API Login)
+    # 檢查項目 3: 永豐金 Shioaji API 連線與帳號登入 (API Login / Reuse)
     # -------------------------------------------------------------
-    api = None
+    own_session = (api is None)
     account = None
     try:
-        import shioaji as sj
-        api = sj.Shioaji(simulation=not is_live)
-        api_key = os.environ.get("SHIOAJI_API_KEY", "").strip()
-        secret_key = os.environ.get("SHIOAJI_SECRET_KEY", "").strip()
+        if own_session:
+            import shioaji as sj
+            api = sj.Shioaji(simulation=not is_live)
+            api_key = os.environ.get("SHIOAJI_API_KEY", "").strip()
+            secret_key = os.environ.get("SHIOAJI_SECRET_KEY", "").strip()
 
-        if not api_key or not secret_key:
-            raise ValueError(".env 未設定 SHIOAJI_API_KEY 或 SHIOAJI_SECRET_KEY")
+            if not api_key or not secret_key:
+                raise ValueError(".env 未設定 SHIOAJI_API_KEY 或 SHIOAJI_SECRET_KEY")
 
-        api.login(api_key=api_key, secret_key=secret_key)
-        account = api.futopt_account
+            api.login(api_key=api_key, secret_key=secret_key)
+        account = getattr(api, "futopt_account", None)
         if not account:
             raise ValueError("登入成功但查無期貨交易帳號 (futopt_account)")
 
         acc_desc = f"{account.broker_id}-{account.account_id} ({account.username})"
-        results["checks"]["API連線"] = {"status": "PASS", "detail": f"登入成功 ({acc_desc})"}
-        print(f"3. [API連線]  ✅ 登入成功 ({acc_desc})")
+        reuse_tag = "複用既有連線" if not own_session else "登入成功"
+        results["checks"]["API連線"] = {"status": "PASS", "detail": f"{reuse_tag} ({acc_desc})"}
+        print(f"3. [API連線]  ✅ {reuse_tag} ({acc_desc})")
     except Exception as e:
         results["checks"]["API連線"] = {"status": "FAIL", "detail": str(e)}
         results["overall_ok"] = False
@@ -111,25 +122,11 @@ def run_health_check(mode: str = "live", qty: int = 1, send_notify: bool = True)
     # -------------------------------------------------------------
     # 檢查項目 4: 當月主力合約解析 (Contract Binding)
     # -------------------------------------------------------------
-    contract_bound = None
+    contract_bound = contract
     if api and results["overall_ok"]:
         try:
-            import warnings
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", DeprecationWarning)
-                futs = getattr(api.Contracts.Futures, "TMF", [])
-            for c in futs:
-                if getattr(c, "code", "") == "TMFR1":
-                    contract_bound = c
-                    break
-
-            if contract_bound:
-                target_code = getattr(contract_bound, "target_code", None)
-                if target_code:
-                    for c in futs:
-                        if getattr(c, "code", "") == target_code:
-                            contract_bound = c
-                            break
+            if contract_bound is None:
+                contract_bound = resolve_tmf_contract(api, code="TMFR1")
 
             if contract_bound:
                 c_code = getattr(contract_bound, "code", "")
@@ -157,6 +154,9 @@ def run_health_check(mode: str = "live", qty: int = 1, send_notify: bool = True)
             results["overall_ok"] = False
             results["alerts"].append(f"憑證檔不存在: {ca_path}")
             print(f"5. [下單憑證] ❌ 憑證檔不存在: {ca_path}")
+        elif not own_session:
+            results["checks"]["下單憑證"] = {"status": "PASS", "detail": "憑證檔存在 (已隨主連線啟用)"}
+            print("5. [下單憑證] ✅ 憑證檔存在 (已隨主連線啟用)")
         else:
             try:
                 api.activate_ca(ca_path=ca_path, ca_passwd=ca_passwd, person_id=person_id)
@@ -238,8 +238,8 @@ def run_health_check(mode: str = "live", qty: int = 1, send_notify: bool = True)
         results["checks"]["保證金"] = {"status": "PASS", "detail": "模擬模式免保證金"}
         print(f"7. [保證金]   ℹ️ 模擬模式免真實保證金")
 
-    # 登出 API
-    if api:
+    # 若為獨立執行建立之暫時連線才登出；複用主程式連線則保持開啟
+    if own_session and api:
         try:
             api.logout()
         except Exception:
