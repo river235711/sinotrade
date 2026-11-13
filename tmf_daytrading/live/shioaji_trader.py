@@ -644,9 +644,20 @@ class ShioajiTMFTrader:
         self.entries_halted = True
 
     def _post_trade_check(self, strategy: ORBStrategy, act: str, result: FillResult):
-        """送單後以帳上真實部位對帳，並把策略狀態拉回與現實一致"""
+        """送單後以帳上真實部位對帳，並把策略狀態拉回與現實一致 (含券商帳務非同步延遲重試保護)"""
         expected = 0 if act == "EXIT" else (strategy.position * self.quantity)
         real = self.get_real_position()
+
+        # 若成交回報已確認成交 (Filled/部分成交)，但 list_positions 短暫回傳舊值 (實盤常見 100~1000ms 帳本同步延遲)，
+        # 最多重試 5 次 (每次間隔 0.4 秒，總計 2 秒) 確認最新帳務，防止誤判退回空手或重複平倉！
+        if real is not None and real != expected and (result.ok or result.filled_qty > 0):
+            for _ in range(5):
+                time.sleep(0.4)
+                real_retry = self.get_real_position()
+                if real_retry is not None:
+                    real = real_retry
+                    if real == expected:
+                        break
 
         if real is None:
             # 沒有券商資料可對帳 (乾跑模式，或查詢失敗)
@@ -676,6 +687,11 @@ class ShioajiTMFTrader:
             return
 
         if real == 0:
+            # 若交易所已明確回報 Filled 全部成交，代表僅是券商 list_positions 帳務更新較慢，絕不將真實持倉洗回空手！
+            if result.ok and result.status == "Filled" and result.filled_qty >= self.quantity:
+                logger.warning(f"⚠️ 成交回報已確認 Filled ({result.filled_qty}口 @ {result.avg_price:.0f})，但帳務查詢仍顯示 0 口，保留策略持倉並等待定期對帳同步！")
+                self.order_failures = 0
+                return
             # 開倉單根本沒成交：策略退回空手，讓之後可以重新判斷
             strategy.position = 0
             strategy.highest_profit = 0.0
