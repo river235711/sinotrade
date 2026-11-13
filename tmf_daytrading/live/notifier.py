@@ -33,7 +33,10 @@ try:
     import certifi
     _ssl_ctx = ssl.create_default_context(cafile=certifi.where())
 except Exception:
-    _ssl_ctx = ssl._create_unverified_context()
+    try:
+        _ssl_ctx = ssl.create_default_context()
+    except Exception:
+        _ssl_ctx = ssl._create_unverified_context()
 
 
 class TradeNotifier:

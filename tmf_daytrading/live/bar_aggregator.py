@@ -146,12 +146,18 @@ class BarAggregator:
 
         return now_ts
 
-    def load_history_kbars(self, df: pd.DataFrame, today_str: Optional[str] = None) -> int:
+    def load_history_kbars(
+        self,
+        df: pd.DataFrame,
+        today_str: Optional[str] = None,
+        now_min: Optional[pd.Timestamp] = None,
+    ) -> int:
         """
         載入券商歷史 1 分 K 棒至快取中
         :param df: 包含 open, high, low, close, volume 且以 ts 為索引的 DataFrame
         :param today_str: 指定日期字串 (YYYY-MM-DD)，若提供則自動篩選 08:45 ~ 13:45
-        :return: 新載入的 K 棒數量
+        :param now_min: 當前進行中分鐘時間戳 (僅對此時間以前之已收盤缺漏/不完整 K 棒融合補齊)
+        :return: 新載入或補齊的 K 棒數量
         """
         if df.empty:
             return 0
@@ -160,18 +166,36 @@ class BarAggregator:
         if today_str:
             target_df = target_df[target_df.index.strftime("%Y-%m-%d") == today_str].between_time("08:45", "13:45")
 
+        limit_min = now_min or pd.Timestamp(datetime.datetime.now().replace(second=0, microsecond=0))
         loaded_count = 0
         with self._lock:
             for ts, row in target_df.iterrows():
+                o = float(row["open"])
+                h = float(row["high"])
+                l = float(row["low"])
+                c = float(row["close"])
+                v = int(row["volume"])
                 if ts not in self._bars:
                     self._bars[ts] = {
-                        "open": float(row["open"]),
-                        "high": float(row["high"]),
-                        "low": float(row["low"]),
-                        "close": float(row["close"]),
-                        "volume": int(row["volume"]),
+                        "open": o,
+                        "high": h,
+                        "low": l,
+                        "close": c,
+                        "volume": v,
                     }
                     loaded_count += 1
+                elif ts < limit_min:
+                    cur = self._bars[ts]
+                    merged = {
+                        "open": o,
+                        "high": max(h, float(cur["high"])),
+                        "low": min(l, float(cur["low"])),
+                        "close": c,
+                        "volume": max(v, int(cur["volume"])),
+                    }
+                    if merged != cur:
+                        self._bars[ts] = merged
+                        loaded_count += 1
 
             if len(target_df) > 0:
                 self.history_loaded = True
@@ -182,27 +206,25 @@ class BarAggregator:
 
     def load_backup_bars(self, backup_df: pd.DataFrame, now_min: Optional[pd.Timestamp] = None, source_tag: str = "TXF_BACKUP") -> int:
         """
-        載入外部備援 1 分 K 棒 (高速補齊今日開盤歷史)
+        載入外部備援 1 分 K 棒 (僅補齊本地尚未收到的缺漏分鐘，絕不覆寫已有真實 TMF Tick/歷史 K 棒)
         :param backup_df: 外部備援 DataFrame (ts 索引)
-        :param now_min: 當前分鐘時間戳 (避免覆蓋當前分鐘即時 Tick)
+        :param now_min: 當前分鐘時間戳上限 (避免寫入超過當下的未來時間戳)
         :param source_tag: 備援來源標記 (供區隔是否混用大台量能)
-        :return: 處理的 K 棒數量
+        :return: 補齊的 K 棒數量
         """
         if backup_df.empty:
             return 0
 
-        limit_min = now_min or pd.Timestamp(datetime.datetime.now().replace(second=0, microsecond=0))
         count = 0
         with self._lock:
             for ts, row in backup_df.iterrows():
-                if ts not in self._bars or ts < limit_min:
-                    cur_vol = self._bars.get(ts, {}).get("volume", 0)
+                if ts not in self._bars and (now_min is None or ts <= now_min):
                     self._bars[ts] = {
                         "open": float(row["open"]),
                         "high": float(row["high"]),
                         "low": float(row["low"]),
                         "close": float(row["close"]),
-                        "volume": max(int(row["volume"]), cur_vol),
+                        "volume": int(row["volume"]),
                     }
                     count += 1
 

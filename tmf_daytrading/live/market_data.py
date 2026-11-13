@@ -179,6 +179,8 @@ def is_overnight_row_complete(
     """
     檢查 overnight_levels_summary.csv 單日紀錄是否包含完整夜盤 (約 15:00 ~ 05:00 共 ~840 根)。
     若中途 (如 00:01) 曾誤寫入半截夜盤 (如 night_bars=541)，回傳 False 促使程式重抓補齊。
+    注意：週一或連假後開盤所對應的前一夜盤結束於前週六或假前清晨 (例如 2026-11-16 對應 2026-11-14 05:00)，
+    不可寫死比對 target_date 當日 04:55，否則週一載入必判失敗。
     """
     raw_bars = row.get("night_bars")
     if raw_bars is not None and pd.notna(raw_bars):
@@ -193,9 +195,22 @@ def is_overnight_row_complete(
         try:
             end_dt = pd.to_datetime(raw_end).to_pydatetime()
             target_d = datetime.datetime.strptime(target_date_str, "%Y-%m-%d").date()
-            min_end_dt = datetime.datetime.combine(target_d, min_end_hhmm)
-            if end_dt < min_end_dt:
+            # 收盤時間必須落於開盤前合理天數內，且位於清晨 04:55~06:00 收盤區間 (排除 00:01 或 23:59 半截夜盤)
+            days_gap = (target_d - end_dt.date()).days
+            if days_gap < 0 or days_gap > 14:
                 return False
+            if not (min_end_hhmm <= end_dt.time() <= datetime.time(6, 0, 0)):
+                return False
+
+            raw_start = row.get("night_start")
+            if raw_start is not None and pd.notna(raw_start):
+                start_dt = pd.to_datetime(raw_start).to_pydatetime()
+                min_session_end = datetime.datetime.combine(
+                    start_dt.date() + datetime.timedelta(days=1),
+                    min_end_hhmm,
+                )
+                if end_dt < min_session_end:
+                    return False
         except Exception:
             return False
 
@@ -239,9 +254,11 @@ def should_persist_overnight(
         return False
     cur_now = now_dt or datetime.datetime.now()
     target_d = datetime.datetime.strptime(target_date_str, "%Y-%m-%d").date()
+    ts_series = pd.to_datetime(night_bars["ts"])
     summary_stub = {
         "night_bars": len(night_bars),
-        "night_end": str(pd.to_datetime(night_bars["ts"]).max()),
+        "night_start": str(ts_series.min()),
+        "night_end": str(ts_series.max()),
     }
     if is_overnight_row_complete(summary_stub, target_date_str):
         return True

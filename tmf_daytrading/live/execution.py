@@ -32,13 +32,27 @@ class FillResult:
     status: str              # 最終委託狀態
 
 
-def query_real_position_details(api: Any, simulation: bool, reconnect_cb=None) -> dict:
+def query_real_position_details(
+    api: Any,
+    simulation: bool,
+    reconnect_cb=None,
+    contract_code: Optional[str] = None,
+) -> dict:
     """
     查詢券商帳上 TMF 詳細部位資訊 (以券商帳上為唯一真實依據 Single Source of Truth)
-    回傳: {"net": int | None, "avg_price": float, "direction": str, "positions": list}
+    若指定具體交易月合約代碼 contract_code (非連續月 *R1)，僅統計該合約淨部位與均價，
+    並將其他月份 TMF 部位獨立回報於 other_positions，防止換月/結算殘倉互相抵銷掩蓋風險。
+    回傳: {"net": int | None, "avg_price": float, "direction": str, "positions": list, "other_positions": list, "target_code": Optional[str]}
     """
     if api is None or simulation:
-        return {"net": None, "avg_price": 0.0, "direction": "None", "positions": []}
+        return {
+            "net": None,
+            "avg_price": 0.0,
+            "direction": "None",
+            "positions": [],
+            "other_positions": [],
+            "target_code": None,
+        }
     try:
         positions = api.list_positions(api.futopt_account)
     except Exception as e:
@@ -46,14 +60,24 @@ def query_real_position_details(api: Any, simulation: bool, reconnect_cb=None) -
         err_str = str(e).lower()
         if reconnect_cb and any(k in err_str for k in ("authenticated", "session", "token", "disconnect", "connect")):
             reconnect_cb()
-        return {"net": None, "avg_price": 0.0, "direction": "None", "positions": []}
+        return {
+            "net": None,
+            "avg_price": 0.0,
+            "direction": "None",
+            "positions": [],
+            "other_positions": [],
+            "target_code": None,
+        }
 
-    net = 0
+    filter_code = (
+        contract_code
+        if (isinstance(contract_code, str) and contract_code and not contract_code.endswith("R1"))
+        else None
+    )
     tmf_positions = []
-    total_cost = 0.0
-    total_qty = 0
+    by_code: dict[str, dict[str, Any]] = {}
 
-    for p in positions:
+    for p in positions or []:
         code = str(getattr(p, "code", ""))
         if not code.startswith("TMF"):
             continue
@@ -61,16 +85,64 @@ def query_real_position_details(api: Any, simulation: bool, reconnect_cb=None) -
         d = status_name(getattr(p, "direction", ""))
         price = float(getattr(p, "price", 0.0))
         tmf_positions.append({"code": code, "direction": d, "qty": qty, "price": price})
-        if d == "Buy":
-            net += qty
-        else:
-            net -= qty
-        total_cost += price * qty
-        total_qty += qty
 
-    avg_price = (total_cost / total_qty) if total_qty > 0 else 0.0
+        bucket = by_code.setdefault(
+            code,
+            {"net": 0, "buy_qty": 0, "buy_cost": 0.0, "sell_qty": 0, "sell_cost": 0.0},
+        )
+        if d == "Buy":
+            bucket["net"] += qty
+            bucket["buy_qty"] += qty
+            bucket["buy_cost"] += price * qty
+        else:
+            bucket["net"] -= qty
+            bucket["sell_qty"] += qty
+            bucket["sell_cost"] += price * qty
+
+    net = 0
+    buy_qty = 0
+    buy_cost = 0.0
+    sell_qty = 0
+    sell_cost = 0.0
+    other_positions = []
+
+    for code, bucket in by_code.items():
+        if filter_code is None or code == filter_code:
+            net += bucket["net"]
+            buy_qty += bucket["buy_qty"]
+            buy_cost += bucket["buy_cost"]
+            sell_qty += bucket["sell_qty"]
+            sell_cost += bucket["sell_cost"]
+        elif bucket["net"] != 0:
+            o_net = bucket["net"]
+            o_qty = bucket["buy_qty"] if o_net > 0 else bucket["sell_qty"]
+            o_cost = bucket["buy_cost"] if o_net > 0 else bucket["sell_cost"]
+            other_positions.append(
+                {
+                    "code": code,
+                    "net": o_net,
+                    "qty": abs(o_net),
+                    "direction": "Buy" if o_net > 0 else "Sell",
+                    "avg_price": (o_cost / o_qty) if o_qty > 0 else 0.0,
+                }
+            )
+
+    if net > 0 and buy_qty > 0:
+        avg_price = buy_cost / buy_qty
+    elif net < 0 and sell_qty > 0:
+        avg_price = sell_cost / sell_qty
+    else:
+        avg_price = 0.0
+
     direction = "Buy" if net > 0 else ("Sell" if net < 0 else "Flat")
-    return {"net": net, "avg_price": avg_price, "direction": direction, "positions": tmf_positions}
+    return {
+        "net": net,
+        "avg_price": avg_price,
+        "direction": direction,
+        "positions": tmf_positions,
+        "other_positions": other_positions,
+        "target_code": filter_code,
+    }
 
 
 def wait_for_order_fill(api: Any, trade: Any, qty: int, fill_timeout: float, poll_interval: float) -> FillResult:

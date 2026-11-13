@@ -218,8 +218,12 @@ def main():
     ax2.axhline(0, color='black', linewidth=0.8)
     ax2.set_title("Daily Net Profit / Loss (NTD)", fontsize=12, fontweight='bold')
     ax2.set_ylabel("Daily Net PnL (NTD)", fontsize=11)
-    ax2.set_xlabel("Trading Date (2026)", fontsize=11)
-    ax2.set_ylim(min(daily_ntds) - 350, max(daily_ntds) + 350)
+    start_year = start_date_str[:4]
+    end_year = end_date_str[:4]
+    year_label = start_year if start_year == end_year else f"{start_year}~{end_year}"
+    ax2.set_xlabel(f"Trading Date ({year_label})", fontsize=11)
+    if daily_ntds:
+        ax2.set_ylim(min(daily_ntds) - 350, max(daily_ntds) + 350)
     ax2.grid(True, linestyle=':', alpha=0.6)
     plt.xticks(rotation=30)
 
@@ -229,18 +233,12 @@ def main():
     plt.savefig(chart_path, dpi=200)
     plt.close()
 
-    artifact_dirs = [
-        r"C:\Users\ting0\.gemini\antigravity\brain\c1cda5b4-65ce-41d0-bb17-ab30721342ef",
-        "/mnt/c/Users/ting0/.gemini/antigravity/brain/c1cda5b4-65ce-41d0-bb17-ab30721342ef",
-        r"C:\Users\ting0\.gemini\antigravity\brain\0eeb3784-cd73-4675-a9e0-4753b8b0afaf",
-        "/mnt/c/Users/ting0/.gemini/antigravity/brain/0eeb3784-cd73-4675-a9e0-4753b8b0afaf",
-    ]
-    for ad in artifact_dirs:
-        if os.path.exists(ad):
-            try:
-                shutil.copy(chart_path, os.path.join(ad, "tmf_backtest_20days.png"))
-            except Exception:
-                pass
+    extra_copy_dir = os.environ.get("TMF_BACKTEST_COPY_DIR", "").strip()
+    if extra_copy_dir and os.path.isdir(extra_copy_dir):
+        try:
+            shutil.copy(chart_path, os.path.join(extra_copy_dir, "tmf_backtest_20days.png"))
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main()

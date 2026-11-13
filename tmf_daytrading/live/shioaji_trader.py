@@ -70,8 +70,13 @@ class ShioajiTMFTrader:
         self._is_session_active = False
         self._tick_handler_api_id: Optional[int] = None
         self._subscribed_contract_code: Optional[str] = None
+        self._subscribed_contract_obj: Any = None
         self._intrabar_sar_state: Optional[dict] = None
         self._orb_finalized: bool = False
+        self._orb_report_sent: bool = False
+        self._offline_hc_alert_sent: bool = False
+        self.ca_activated: bool = False
+        self._last_position_details: Optional[dict] = None
         self.notifier = TradeNotifier()
         self._last_reconnect_time = 0.0
 
@@ -121,6 +126,9 @@ class ShioajiTMFTrader:
                 self._is_session_active = False
                 self._tick_handler_api_id = None
                 self._subscribed_contract_code = None
+                self._subscribed_contract_obj = None
+                self.ca_activated = False
+                self._last_position_details = None
 
     # ------------------------------------------------------------------
     # 向後相容屬性映射 (保持對既有私有屬性之存取相容)
@@ -192,18 +200,23 @@ class ShioajiTMFTrader:
             # 確保底層 Solace session 完整建立 (等待 2 秒)
             time.sleep(2.0)
 
-            # 若為正式實盤環境，必須啟用下單憑證 (.pfx)
+            # 若為正式實盤環境，必須啟用下單憑證 (.pfx)，缺少或無效即阻止啟動以免盤中拒單
             if not self.simulation:
-                if self.ca_path and self.ca_passwd:
-                    logger.info(f"正在載入實盤下單憑證: {self.ca_path} ...")
-                    self.api.activate_ca(
-                        ca_path=self.ca_path,
-                        ca_passwd=self.ca_passwd,
-                        person_id=self.person_id
-                    )
-                    logger.info("實盤下單憑證啟用成功！")
-                else:
-                    logger.warning("注意：實盤模式尚未設定 SHIOAJI_CA_PATH / SHIOAJI_CA_PASSWD，將僅能看盤無法送出實單。")
+                ca_file = os.path.expanduser(self.ca_path.strip()) if self.ca_path else ""
+                if not ca_file or not self.ca_passwd or not os.path.exists(ca_file):
+                    msg = f"❌ [實盤啟動失敗] 尚未設定有效的 SHIOAJI_CA_PATH / SHIOAJI_CA_PASSWD (檔案不存在: {ca_file!r})，為避免盤中無法送單已中止啟動！"
+                    logger.error(msg)
+                    self.notifier.send(msg)
+                    self.close()
+                    return False
+                logger.info(f"正在載入實盤下單憑證: {ca_file} ...")
+                self.api.activate_ca(
+                    ca_path=ca_file,
+                    ca_passwd=self.ca_passwd,
+                    person_id=self.person_id
+                )
+                self.ca_activated = True
+                logger.info("實盤下單憑證啟用成功！")
 
             self._is_session_active = True
             return True
@@ -235,6 +248,14 @@ class ShioajiTMFTrader:
                     def _on_tick(*args):
                         try:
                             tick = args[-1]
+                            tick_code = getattr(tick, "code", None)
+                            if (
+                                self._subscribed_contract_code
+                                and isinstance(tick_code, str)
+                                and tick_code
+                                and tick_code != self._subscribed_contract_code
+                            ):
+                                return
                             price = float(tick.close)
                             vol = int(tick.volume)
                             if price <= 0:
@@ -251,8 +272,17 @@ class ShioajiTMFTrader:
 
                 contract_code = getattr(self.contract, "code", self._contract_code)
                 if self._subscribed_contract_code != contract_code:
+                    prev_code = self._subscribed_contract_code
+                    prev_obj = self._subscribed_contract_obj
+                    if prev_code and prev_obj is not None:
+                        try:
+                            self.api.unsubscribe(prev_obj, quote_type=sj.QuoteType.Tick)
+                            logger.info(f"🔕 已退訂舊合約即時 Tick ({prev_code})")
+                        except Exception as unsub_err:
+                            logger.debug(f"退訂舊合約 {prev_code} 略過: {unsub_err}")
                     self.api.subscribe(self.contract, quote_type=sj.QuoteType.Tick)
                     self._subscribed_contract_code = contract_code
+                    self._subscribed_contract_obj = self.contract
                     logger.info(f"📡 已啟用即時 Tick 串流訂閱 ({contract_code})，自動合成即時 1分K")
             except Exception as sub_err:
                 logger.warning(f"訂閱即時 Tick 略過: {sub_err}")
@@ -310,6 +340,9 @@ class ShioajiTMFTrader:
                 self._is_session_active = False
                 self._tick_handler_api_id = None
                 self._subscribed_contract_code = None
+                self._subscribed_contract_obj = None
+                self.ca_activated = False
+                self._last_position_details = None
                 logger.info("💤 永豐 API 連線已安全斷開，進入深度省電防打擾睡眠 (零網路存取、不受夜間維護中斷干擾)。")
 
     def wake_and_login(self, reason: str = "開盤前喚醒") -> bool:
@@ -323,6 +356,48 @@ class ShioajiTMFTrader:
             self.close()
             logger.error(f"❌ [{reason}] 永豐金 Shioaji 登入失敗，將於稍後重試。")
         return ok
+
+    def _ensure_intraday_connection(self, strategy: ORBStrategy, active_date_str: str) -> bool:
+        """盤中時段確保 API 與主力合約有效；若 08:30 喚醒失敗遺留過 08:45 或盤中斷線，自動重連並補載夜盤極值"""
+        if self.api is not None and self.contract is not None:
+            return True
+        if self.reconnect():
+            if strategy.overnight_high is None or strategy.overnight_low is None:
+                self.load_overnight_levels_for_strategy(strategy, active_date_str)
+            return True
+        return False
+
+    def _update_holiday_detection(
+        self,
+        strategy: ORBStrategy,
+        snap,
+        now_str: str,
+        cur_date_str: str,
+        holiday_empty_since: float,
+        now_epoch: float = None,
+    ) -> float:
+        """
+        僅在確定已成功連線並綁定合約時，若過 09:05 仍持續 30 秒無任何日盤開盤 K 棒才判定休市並深度休眠；
+        斷線重連期間絕不誤判為國定假日休市。
+        """
+        is_connected = (self.api is not None and self.contract is not None)
+        if not (is_connected and snap is None and now_str >= "09:05:00" and strategy.position == 0 and not self.pending_flatten):
+            return 0.0
+
+        cur_t = time.time() if now_epoch is None else now_epoch
+        if holiday_empty_since == 0.0:
+            return cur_t
+        if cur_t - holiday_empty_since >= 30.0:
+            self._holiday_detected = True
+            logger.info(f"🏖️ [{now_str}] 今日 ({cur_date_str}) 已過 09:05 且連續 30 秒無任何日盤開盤行情，判定今日為國定假日或颱風休市！")
+            self.notifier.send(
+                f"🏖️ [休市自動偵測] {cur_date_str}\n"
+                f"已過 09:05 仍無任何日盤成交行情 (國定假日或颱風休市)，今日不執行任何交易。\n"
+                f"• 系統已安全登出永豐金 API，提前進入離線深度省電休眠，將於明日 08:30 自動喚醒。"
+            )
+            self.logout_and_sleep(reason=f"{cur_date_str} 國定假日/颱風休市提前休眠")
+            return 0.0
+        return holiday_empty_since
 
     def keep_alive_heartbeat(self):
         """主動向券商主機發送輕量保活查詢 (Ping)，維持 TCP Session 熱連線，防閒置逾時 (僅在盤中在線時運作)"""
@@ -343,7 +418,7 @@ class ShioajiTMFTrader:
     # ------------------------------------------------------------------
     # 送單
     # ------------------------------------------------------------------
-    def place_order(self, action: str, price: float, quantity: int = 1, price_type: str = "MKP", octype: str = "Auto"):
+    def place_order(self, action: str, price: float, quantity: int = 1, price_type: str = "MKP", octype: str = "Auto", contract: Any = None):
         """
         送出期貨委託單 (只負責送出，是否成交請用 _send_and_verify 確認)
         :param action: 'BUY' 或 'SELL'
@@ -351,12 +426,14 @@ class ShioajiTMFTrader:
         :param quantity: 下單口數
         :param price_type: 'MKP' 範圍市價 (當沖突破建議使用，確保成交且防滑價), 'LMT' 限價
         :param octype: 'Auto' 自動, 'New' 新倉, 'Cover' 平倉, 'DayTrade' 當沖
+        :param contract: 可選，指定委託之特定月份合約 (預設使用 self.contract)
         """
         if self.is_kill_switch_triggered:
             logger.warning("已觸發當日風控熔斷 (Kill Switch)，拒絕新增任何委託！")
             return None
 
-        if self.api is None or self.contract is None or self.simulation:
+        target_contract = contract if contract is not None else self.contract
+        if self.api is None or target_contract is None or self.simulation:
             logger.info(f"[模擬下單] 送出委託: {action} {quantity}口 TMF @ {price} ({price_type}/{octype})")
             return {"status": "Simulated", "action": action, "price": price, "qty": quantity}
 
@@ -380,7 +457,7 @@ class ShioajiTMFTrader:
                 octype=sj_octype,
                 account=self.api.futopt_account
             )
-            trade = self.api.place_order(self.contract, order)
+            trade = self.api.place_order(target_contract, order)
         except Exception as e:
             logger.error(f"❌ 送單失敗 [{action}] {quantity}口: {e}")
             return None
@@ -425,9 +502,23 @@ class ShioajiTMFTrader:
     # ------------------------------------------------------------------
     # 帳上部位對帳與狀態持久化 (Position Reconciliation & State Recovery)
     # ------------------------------------------------------------------
+    def _active_contract_filter_code(self) -> Optional[str]:
+        """取得具體已解析之當月 TMF 合約代碼 (忽略 Mock 物件與連續月 TMFR1)"""
+        code = getattr(self.contract, "code", None)
+        if isinstance(code, str) and code and not code.endswith("R1"):
+            return code
+        return None
+
     def get_real_position_details(self) -> dict:
         """查詢券商帳上 TMF 詳細部位資訊 (以券商帳上為唯一真實依據 Single Source of Truth)"""
-        return query_real_position_details(self.api, self.simulation, reconnect_cb=self.reconnect)
+        details = query_real_position_details(
+            self.api,
+            self.simulation,
+            reconnect_cb=self.reconnect,
+            contract_code=self._active_contract_filter_code(),
+        )
+        self._last_position_details = details
+        return details
 
     def get_real_position(self) -> Optional[int]:
         """查詢券商帳上 TMF 淨部位：多單為正、空單為負、無部位為 0；查詢失敗回傳 None"""
@@ -444,7 +535,12 @@ class ShioajiTMFTrader:
             "eod_close_notified": bool(getattr(self, "_eod_close_notified", False)),
             "eod_done": bool(getattr(self, "_eod_done_date", None) == today_str),
         }
-        return self.state_manager.save_state(strategy, entries_halted=self.entries_halted, custom_fields=custom)
+        return self.state_manager.save_state(
+            strategy,
+            entries_halted=self.entries_halted,
+            custom_fields=custom,
+            date_str=today_str,
+        )
 
     def _reset_flat_state(
         self,
@@ -467,7 +563,7 @@ class ShioajiTMFTrader:
 
     def _load_state(self) -> Optional[dict]:
         """讀取當日策略狀態檔 logs/state_YYYYMMDD.json (委由 StateManager 管理)"""
-        return self.state_manager.load_state()
+        return self.state_manager.load_state(date_str=datetime.date.today().strftime("%Y-%m-%d"))
 
     def _reconcile_and_recover_on_startup(self, strategy: ORBStrategy, kbars: pd.DataFrame) -> set:
         """
@@ -573,21 +669,67 @@ class ShioajiTMFTrader:
         self._save_state(strategy)
         return processed_timestamps
 
+    def _flatten_other_month_positions(self, other_positions: list, price_type: str = "MKP") -> bool:
+        """針對非當前主力月份的 TMF 殘留部位，依其原合約代碼送出 Cover 平倉單避免跨月價差留倉"""
+        if not other_positions:
+            return True
+        all_ok = True
+        for pos in other_positions:
+            other_code = str(pos.get("code", "")).strip()
+            other_net = int(pos.get("net", 0))
+            if not other_code or other_net == 0:
+                continue
+            action = "SELL" if other_net > 0 else "BUY"
+            qty = abs(other_net)
+            other_contract = resolve_tmf_contract(self.api, code=other_code) if self.api is not None else None
+            if other_contract is None:
+                logger.critical(f"🚨 無法解析非當月 TMF 殘倉合約 {other_code} ({other_net:+d}口)，無法自動下單平倉，請立即手動檢查！")
+                self.notifier.send(f"🚨 [跨月殘倉警告] 帳上發現非當月合約 {other_code} ({other_net:+d}口) 且無法解析合約物件，請立即手動平倉！")
+                all_ok = False
+                continue
+
+            trade = self.place_order(action, 0.0, qty, price_type=price_type, octype="Cover", contract=other_contract)
+            if trade is None:
+                res = FillResult(False, 0, 0.0, "Rejected")
+            elif isinstance(trade, dict):
+                res = FillResult(True, qty, 0.0, "Simulated")
+            else:
+                res = self.wait_for_fill(trade, qty)
+            self._audit(f"{action}({other_code})", qty, "Cover", res)
+            alert_msg = (
+                f"🚨 [跨月殘倉清理] 偵測到非當月合約 {other_code} ({other_net:+d}口)，"
+                f"已送出 {action} {qty}口 ({price_type}/Cover -> {res.status} {res.filled_qty}/{qty}口 @ {res.avg_price:.0f})"
+            )
+            logger.critical(alert_msg)
+            self.notifier.send(alert_msg)
+            if not res.ok:
+                all_ok = False
+        return all_ok
+
     def flatten_real_position(self, retries: int = 3) -> bool:
-        """依帳上真實部位反向平倉，前幾次用 MKP 防滑價，最後一次保底自動升級為 MKT 純市價必平；成功回傳 True"""
+        """依帳上真實部位反向平倉 (含檢查非當月 TMF 殘倉)，前幾次 MKP 防滑價、最後一次升級 MKT；成功回傳 True"""
         for i in range(retries):
             real = self.get_real_position()
             if real is None:
                 logger.error("無法查詢帳上部位，無法確認是否已平倉！請立即手動檢查券商軟體。")
                 return False
-            if real == 0:
+            details = self._last_position_details if isinstance(self._last_position_details, dict) else {}
+            other_pos = details.get("other_positions", []) if details.get("net") == real else []
+            if real == 0 and not other_pos:
                 return True
-            action = "SELL" if real > 0 else "BUY"
             ptype = "MKT" if (i == retries - 1 and retries > 1) else "MKP"
-            logger.warning(f"🧹 平倉嘗試 {i + 1}/{retries} ({ptype}+IOC): 帳上 {real:+d} 口，送出 {action} {abs(real)}口")
-            self._send_and_verify(action, abs(real), octype="Cover", price_type=ptype)
+            if real != 0:
+                action = "SELL" if real > 0 else "BUY"
+                logger.warning(f"🧹 平倉嘗試 {i + 1}/{retries} ({ptype}+IOC): 帳上 {real:+d} 口，送出 {action} {abs(real)}口")
+                self._send_and_verify(action, abs(real), octype="Cover", price_type=ptype)
+            if other_pos:
+                self._flatten_other_month_positions(other_pos, price_type=ptype)
             time.sleep(self.retry_pause)
-        return self.get_real_position() == 0
+
+        final_real = self.get_real_position()
+        final_details = self._last_position_details if isinstance(self._last_position_details, dict) else {}
+        final_other = final_details.get("other_positions", []) if final_details.get("net") == final_real else []
+        return final_real == 0 and not final_other
 
     def _halt_entries(self, reason: str):
         if not self.entries_halted:
@@ -680,17 +822,54 @@ class ShioajiTMFTrader:
         self._save_state(strategy)
 
     def _periodic_reconcile(self, strategy: ORBStrategy):
-        """沒有交易動作時的定期對帳 (例如你在券商軟體手動平倉或加碼)"""
+        """沒有交易動作時的定期對帳 (含手動操作接管停損風控、與跨月 TMF 殘倉檢核)"""
         real = self.get_real_position()
         if real is None:
             return
+        details = self._last_position_details if isinstance(self._last_position_details, dict) else {}
+        other_pos = details.get("other_positions", []) if details.get("net") == real else []
+        if other_pos:
+            desc = ", ".join(f"{p['code']}:{p['net']:+d}口" for p in other_pos)
+            logger.critical(f"🚨 定期對帳發現非當月 TMF 殘留部位 ({desc})，立即停止新倉並介入平倉！")
+            self._halt_entries(f"偵測到跨月 TMF 殘留部位 ({desc})")
+            self._flatten_other_month_positions(other_pos, price_type="MKP")
+            self._save_state(strategy)
+
         expected = strategy.position * self.quantity
         if real == expected:
             return
         logger.warning(f"⚠️ 定期對帳發現不一致: 帳上 {real:+d} 口，策略預期 {expected:+d} 口（可能有手動操作）")
         if real == 0:
             self._reset_flat_state(strategy, clear_sar=False, clear_pending_flatten=True, save=False)
-        elif strategy.position != 0:
+        elif strategy.position == 0:
+            # 策略原本空手但帳上有部位：接管部位納入盤中停損/鎖利與 13:08 平倉保護
+            avg_p = float(details.get("avg_price", 0.0) or 0.0) if details.get("net") == real else 0.0
+            if avg_p <= 0:
+                ref_details = self.get_real_position_details()
+                avg_p = float((ref_details or {}).get("avg_price", 0.0) or 0.0)
+            if avg_p <= 0 and self._last_wake_price > 0:
+                avg_p = float(self._last_wake_price)
+            if avg_p <= 0:
+                today_str = datetime.date.today().strftime("%Y-%m-%d")
+                snap = self.bar_aggregator.get_latest_bar_state(today_str, start_time="08:45", end_time="13:45")
+                if snap is not None and snap[7] > 0:
+                    avg_p = float(snap[7])
+
+            strategy.position = 1 if real > 0 else -1
+            if avg_p > 0:
+                strategy.entry_price = avg_p
+            if getattr(strategy, "entry_time", None) is None:
+                strategy.entry_time = pd.Timestamp(datetime.datetime.now().replace(second=0, microsecond=0))
+            strategy.highest_profit = 0.0
+            strategy._hp_before_bar_val = 0.0
+            strategy.trade_count = max(1, int(getattr(strategy, "trade_count", 0) or 0))
+            takeover_msg = (
+                f"🔄 [定期對帳接管異常持倉] 策略原為空手，帳上發現 {real:+d} 口 (均價參考 {strategy.entry_price:.0f})！"
+                f"已納入停損/保本鎖利與 {strategy.config.force_close_time[:5]} 平倉風控保護，今日停開新倉。"
+            )
+            logger.warning(takeover_msg)
+            self.notifier.send(takeover_msg)
+        else:
             strategy.position = 1 if real > 0 else -1
         self._halt_entries("帳上部位與策略不一致，需人工確認")
         self._save_state(strategy)
@@ -733,7 +912,7 @@ class ShioajiTMFTrader:
         """
         不死鳥追平單步執行：
         當盤中平倉未果 (pending_flatten=True) 或已過收盤時間仍有殘留部位時，
-        不需等待下一根 1 分 K，每隔 1~2 秒自動檢測連線並以 MKT+IOC 持續追殺直到帳上歸零 (0 口)。
+        不需等待下一根 1 分 K，每隔 1~2 秒自動檢測連線並以 MKT+IOC 持續追殺直到帳上歸零 (含跨月殘倉)。
         """
         real = self.get_real_position() if real_pos is _UNSET else real_pos
         if real is None:
@@ -743,20 +922,31 @@ class ShioajiTMFTrader:
             if real is None:
                 return False
 
-        if real == 0:
+        details = self._last_position_details if isinstance(self._last_position_details, dict) else {}
+        other_pos = details.get("other_positions", []) if (real_pos is _UNSET and details.get("net") == real) else []
+
+        if real == 0 and not other_pos:
             if self.pending_flatten or strategy.position != 0:
                 logger.info("🦅 [不死鳥追平完成] 確認券商帳上部位已歸零 (0 口)！")
                 self._reset_flat_state(strategy, clear_pending_flatten=True, save=True)
             return True
 
-        action = "SELL" if real > 0 else "BUY"
-        logger.warning(f"🦅 [不死鳥持續追平] 帳上仍有 {real:+d} 口，立即補送 MKT+IOC 強制平倉 ({action} {abs(real)}口)...")
-        res = self._send_and_verify(action, abs(real), octype="Cover", price_type="MKT")
-        if res.status == "Rejected" and self.api is not None and not self.simulation:
+        rejected = False
+        if real != 0:
+            action = "SELL" if real > 0 else "BUY"
+            logger.warning(f"🦅 [不死鳥持續追平] 帳上仍有 {real:+d} 口，立即補送 MKT+IOC 強制平倉 ({action} {abs(real)}口)...")
+            res = self._send_and_verify(action, abs(real), octype="Cover", price_type="MKT")
+            if res.status == "Rejected":
+                rejected = True
+        if other_pos:
+            self._flatten_other_month_positions(other_pos, price_type="MKT")
+        if rejected and self.api is not None and not self.simulation:
             self.reconnect()
 
         after_real = self.get_real_position()
-        if after_real == 0:
+        after_details = self._last_position_details if isinstance(self._last_position_details, dict) else {}
+        after_other = after_details.get("other_positions", []) if after_details.get("net") == after_real else []
+        if after_real == 0 and not after_other:
             logger.info("🦅 [不死鳥追平成功] 帳上殘留部位已全數清零 (0 口)！")
             self._reset_flat_state(strategy, clear_pending_flatten=True, save=True)
             return True
@@ -974,8 +1164,22 @@ class ShioajiTMFTrader:
         post_bar["close"] = cur_close
         return post_bar
 
+    def _send_0915_orb_report(self, strategy: ORBStrategy, updated: bool = False):
+        """發送 09:15 完整收盤後之 ORB 定稿報告 (保證同日僅於定稿時推播一次)"""
+        _, orb_report_msg = build_0915_orb_report(strategy, entries_halted=self.entries_halted)
+        if updated:
+            orb_report_msg = orb_report_msg.replace(
+                "📌 [09:15 ORB 區間確立]",
+                "📌 [09:15 ORB 完整收盤更新]",
+                1,
+            )
+        self._orb_report_sent = True
+        logger.info("\n" + orb_report_msg)
+        self.notifier.send(orb_report_msg)
+        self._save_state(strategy)
+
     def _finalize_orb_if_closed(self, strategy: ORBStrategy, kbars: pd.DataFrame, ts: pd.Timestamp):
-        """當 09:15 K 棒正式收盤時，對齊 BacktestEngine 以完整 09:00~09:15 K 棒更新 ORB 上下界"""
+        """當 09:15 K 棒正式收盤時，對齊 BacktestEngine 以完整 09:00~09:15 K 棒更新 ORB 上下界並發送唯一確立報告"""
         if getattr(self, "_orb_finalized", False):
             return
         if ts.strftime("%H:%M:%S") != strategy.config.orb_end_time:
@@ -985,20 +1189,14 @@ class ShioajiTMFTrader:
         self._orb_finalized = True
         if orb_h is None or orb_l is None:
             return
-        if prev_h is not None and prev_l is not None and (orb_h != prev_h or orb_l != prev_l):
+        changed = prev_h is not None and prev_l is not None and (orb_h != prev_h or orb_l != prev_l)
+        if changed:
             logger.info(
                 f"🔄 [09:15 完整收盤更新 ORB] 區間由 {prev_l:.0f}~{prev_h:.0f} "
                 f"更新為 {orb_l:.0f}~{orb_h:.0f} (振幅={orb_h - orb_l:.0f}點，對齊回測)"
             )
-            _, orb_report_msg = build_0915_orb_report(strategy, entries_halted=self.entries_halted)
-            updated_msg = orb_report_msg.replace(
-                "📌 [09:15 ORB 區間確立]",
-                "📌 [09:15 ORB 完整收盤更新]",
-                1,
-            )
-            logger.info("\n" + updated_msg)
-            self.notifier.send(updated_msg)
-            self._save_state(strategy)
+        if changed or not getattr(self, "_orb_report_sent", False):
+            self._send_0915_orb_report(strategy, updated=changed)
 
     def _evaluate_completed_and_intrabar(
         self,
@@ -1012,27 +1210,25 @@ class ShioajiTMFTrader:
             return None
         comp_len = n_bars - 1
         times = kbars.index
-        prev_bar = None
         for idx in range(comp_len):
             ts = times[idx]
             if ts in processed_timestamps:
                 continue
             bar = kbars.iloc[idx]
-            prev_bar = kbars.iloc[idx - 1] if idx > 0 else None
             self._finalize_orb_if_closed(strategy, kbars, ts)
             processed_timestamps.add(ts)
             if self._intrabar_sar_state is not None and self._intrabar_sar_state["ts"] == ts:
                 if strategy.position != 0:
                     eval_bar = self._build_post_sar_bar(bar, self._intrabar_sar_state)
                     prev_pos = strategy.position
-                    res = strategy.execute_bar(ts, eval_bar, prev_bar)
+                    res = strategy.execute_bar(ts, eval_bar)
                     self._handle_action(strategy, res, ts, eval_bar, prev_pos)
                 self._intrabar_sar_state = None
             else:
                 prev_pos = strategy.position
-                res = strategy.execute_bar(ts, bar, prev_bar)
+                res = strategy.execute_bar(ts, bar)
                 self._handle_action(strategy, res, ts, bar, prev_pos)
-        return kbars.iloc[comp_len - 1]
+        return None
 
     def _evaluate_intrabar_core(
         self,
@@ -1138,6 +1334,31 @@ class ShioajiTMFTrader:
         ema21 = _ALPHA_EMA21 * close + (1.0 - _ALPHA_EMA21) * ema21_prev
         return vwap, ema9, ema21
 
+    def _run_premarket_health_check(self, async_notify: bool = False) -> bool:
+        """執行開盤前健康巡檢 (複用當前連線與 ca_activated 狀態)"""
+        now_str = datetime.datetime.now().strftime("%H:%M:%S")
+        logger.info(f"🌅 [{now_str}] 執行開盤前全系統自動健康巡檢 (Pre-Market Health Check)...")
+        try:
+            from live.health_check import run_health_check
+            mode_str = "paper" if self.simulation else "live"
+            res = run_health_check(
+                mode=mode_str,
+                qty=self.quantity,
+                send_notify=not async_notify,
+                api=self.api,
+                contract=self.contract,
+                ca_activated=self.ca_activated,
+            )
+            if async_notify and res.get("report_message"):
+                self.notifier.send(res["report_message"], async_send=True)
+            self._morning_wake_logged = True
+            return True
+        except Exception as hc_err:
+            self._morning_wake_logged = True
+            logger.error(f"健康巡檢執行異常: {hc_err}")
+            self.notifier.send(f"⚠️ [08:35 開盤前健檢異常] {hc_err}", async_send=async_notify)
+            return False
+
     def run_intraday_bot(self, strat_cfg: ORBStrategyConfig = None):
         """
         啟動日盤全自動監控與下單迴圈 (08:45 ~ 13:24)
@@ -1200,6 +1421,7 @@ class ShioajiTMFTrader:
                     ts.strftime("%H:%M:%S") == strat_cfg.orb_end_time
                     for ts in kbars.iloc[:-1].index
                 )
+                self._orb_report_sent = self._orb_finalized
                 if orb_h and orb_l:
                     logger.info(f"📌 今日現貨開盤區間 ({strat_cfg.orb_start_time}~{strat_cfg.orb_end_time}) 已鎖定: 上界={orb_h:.0f}, 下界={orb_l:.0f} (振幅={orb_h-orb_l:.0f}點)")
 
@@ -1234,6 +1456,8 @@ class ShioajiTMFTrader:
                     self.bar_aggregator.clear()
                     self._intrabar_sar_state = None
                     self._orb_finalized = False
+                    self._orb_report_sent = False
+                    self._offline_hc_alert_sent = False
                     _last_struct_sig = None
                     _prefix_state = None
                     processed_timestamps.clear()
@@ -1368,21 +1592,18 @@ class ShioajiTMFTrader:
                             self.load_overnight_levels_for_strategy(strategy, active_date_str)
 
                     if now_str >= "08:35:00" and not getattr(self, "_morning_wake_logged", False):
-                        self._morning_wake_logged = True
-                        logger.info(f"🌅 [{now_str}] 執行開盤前全系統自動健康巡檢 (Pre-Market Health Check)...")
-                        try:
-                            from live.health_check import run_health_check
-                            mode_str = "paper" if self.simulation else "live"
-                            run_health_check(
-                                mode=mode_str,
-                                qty=self.quantity,
-                                send_notify=True,
-                                api=self.api,
-                                contract=self.contract,
-                            )
-                        except Exception as hc_err:
-                            logger.error(f"健康巡檢執行異常: {hc_err}")
-                            self.notifier.send(f"⚠️ [08:35 開盤前健檢異常] {hc_err}")
+                        if self.api is None or self.contract is None:
+                            if self.wake_and_login(reason="08:35 健檢前自動重連嘗試"):
+                                self.load_overnight_levels_for_strategy(strategy, active_date_str)
+                        if self.api is not None and self.contract is not None:
+                            self._run_premarket_health_check(async_notify=False)
+                        else:
+                            # 連線尚未恢復時保留 _morning_wake_logged=False，待連線上線後自動補做完整健檢
+                            if not getattr(self, "_offline_hc_alert_sent", False):
+                                self._offline_hc_alert_sent = True
+                                warn_msg = "⚠️ [08:35 開盤前健檢延後] 尚未連上 Shioaji / 綁定合約，將於連線恢復後自動補做完整健檢！"
+                                logger.warning(warn_msg)
+                                self.notifier.send(warn_msg)
                     elif time.time() - last_standby_log >= 1800.0:
                         last_standby_log = time.time()
                         logger.info(f"🌙 [{now_str}] 開盤前待命守護中 (帳上零部位)，等待今日 08:45:00 日盤開盤...")
@@ -1405,6 +1626,10 @@ class ShioajiTMFTrader:
                     self._save_state(strategy)
                     last_state_save = time.time()
 
+                # 盤中確保連線與合約有效 (若 08:30 喚醒失敗遺留過 08:45 或盤中斷線，定期自動重連並補載夜盤與補跑健檢)
+                self._ensure_intraday_connection(strategy, active_date_str)
+                if self.api is not None and self.contract is not None and not getattr(self, "_morning_wake_logged", False):
+                    self._run_premarket_health_check(async_notify=True)
                 today_sync_str = self.sync_today_market_data()
                 snap = (
                     self.bar_aggregator.get_latest_bar_state(today_sync_str, start_time="08:45", end_time="13:45")
@@ -1441,25 +1666,29 @@ class ShioajiTMFTrader:
                         _last_struct_sig = struct_sig
                         _prefix_state = self._compute_prefix_state(kbars)
 
-                        just_locked_orb = False
                         if now_str >= strat_cfg.orb_end_time and not strategy.orb_calculated:
                             orb_h, orb_l = strategy.calculate_orb_levels(kbars)
                             if orb_h and orb_l:
-                                just_locked_orb = True
-                                logger.info(f"📌 今日現貨開盤區間 ({strat_cfg.orb_start_time}~{strat_cfg.orb_end_time}) 已鎖定: 上界={orb_h:.0f}, 下界={orb_l:.0f} (振幅={orb_h-orb_l:.0f}點)")
+                                logger.info(
+                                    f"📌 今日現貨開盤區間 ({strat_cfg.orb_start_time}~{strat_cfg.orb_end_time}) "
+                                    f"暫鎖定: 上界={orb_h:.0f}, 下界={orb_l:.0f} (振幅={orb_h - orb_l:.0f}點，待 09:15 完整收盤後發送報告)"
+                                )
 
-                        # (A) 逐根處理已收完的 K 棒 (換分 0.2~1 秒內立即確認突破進場)
-                        prev_bar = self._evaluate_completed_and_intrabar(strategy, kbars, processed_timestamps)
+                        # (A) 逐根處理已收完的 K 棒 (換分 0.2~1 秒內立即確認突破進場，並於 09:15 收盤時確立發報)
+                        self._evaluate_completed_and_intrabar(strategy, kbars, processed_timestamps)
 
-                        # 若本輪剛鎖定 09:15 ORB，於已收完 K 棒 (含 09:14 早盤強勢突破) 處理完畢後立即播報進場結論與停損/各階停利點
-                        if just_locked_orb:
-                            _, orb_report_msg = build_0915_orb_report(strategy, entries_halted=self.entries_halted)
-                            logger.info("\n" + orb_report_msg)
-                            self.notifier.send(orb_report_msg)
+                        # 若已跨過 09:15 分鐘 (例如 09:15 無 Tick 跳至 09:16)，補發唯一一次定稿 ORB 報告
+                        if (
+                            strategy.orb_calculated
+                            and not getattr(self, "_orb_report_sent", False)
+                            and latest_ts.strftime("%H:%M:%S") > strat_cfg.orb_end_time
+                        ):
+                            self._orb_finalized = True
+                            self._send_0915_orb_report(strategy, updated=False)
 
                         # (B) 持倉期間：對當前最新進行中 K 棒即時檢查停損、保本鎖利與反手 (SAR)
                         latest = kbars.iloc[-1]
-                        self._evaluate_intrabar_tick(strategy, latest_ts, latest, prev_bar, processed_timestamps)
+                        self._evaluate_intrabar_tick(strategy, latest_ts, latest, None, processed_timestamps)
                         latest_close = float(latest["close"])
                         latest_vwap = float(latest["vwap"])
                     else:
@@ -1496,25 +1725,18 @@ class ShioajiTMFTrader:
                             pos_str = f"{dir_str}@{strategy.entry_price:.0f} (損益:{cur_pnl:+.0f}點 / 最高:{strategy.highest_profit:+.0f}點)"
                         logger.info(f"⏱️ [{now_str}] 報價:{latest_close:.0f} | VWAP:{latest_vwap:.0f} | {orb_info} | 狀態:{pos_str}{halt_info}")
                 else:
-                    if snap is None and now_str >= "09:05:00" and strategy.position == 0 and not self.pending_flatten:
-                        if holiday_empty_since == 0.0:
-                            holiday_empty_since = time.time()
-                        elif time.time() - holiday_empty_since >= 30.0:
-                            self._holiday_detected = True
-                            logger.info(f"🏖️ [{now_str}] 今日 ({cur_date_str}) 已過 09:05 且連續 30 秒無任何日盤開盤行情，判定今日為國定假日或颱風休市！")
-                            self.notifier.send(
-                                f"🏖️ [休市自動偵測] {cur_date_str}\n"
-                                f"已過 09:05 仍無任何日盤成交行情 (國定假日或颱風休市)，今日不執行任何交易。\n"
-                                f"• 系統已安全登出永豐金 API，提前進入離線深度省電休眠，將於明日 08:30 自動喚醒。"
-                            )
-                            self.logout_and_sleep(reason=f"{cur_date_str} 國定假日/颱風休市提前休眠")
-                            continue
-                    else:
-                        holiday_empty_since = 0.0
+                    holiday_empty_since = self._update_holiday_detection(
+                        strategy, snap, now_str, cur_date_str, holiday_empty_since
+                    )
+                    if self._holiday_detected:
+                        continue
 
                     if time.time() - last_log_time >= 3.0:
                         last_log_time = time.time()
-                        logger.info(f"⏱️ [{now_str}] 等待日盤 08:45 開盤 K 棒資料...")
+                        if self.api is None or self.contract is None:
+                            logger.info(f"⏱️ [{now_str}] 等待 Shioaji 連線重試恢復...")
+                        else:
+                            logger.info(f"⏱️ [{now_str}] 等待日盤 08:45 開盤 K 棒資料...")
 
                 # 雙速睡眠與事件喚醒控制：
                 # 1. 持倉期間若收到新 Tick 價位變動，_on_tick 會立即觸發 _wake_event (<5ms 喚醒檢查停損/鎖利)

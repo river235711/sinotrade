@@ -7,7 +7,7 @@ import os
 import sys
 import datetime
 import logging
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 # 加入專案根目錄
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -27,6 +27,7 @@ def run_health_check(
     send_notify: bool = True,
     api: Any = None,
     contract: Any = None,
+    ca_activated: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """
     執行開盤前全系統健康巡檢
@@ -155,8 +156,17 @@ def run_health_check(
             results["alerts"].append(f"憑證檔不存在: {ca_path}")
             print(f"5. [下單憑證] ❌ 憑證檔不存在: {ca_path}")
         elif not own_session:
-            results["checks"]["下單憑證"] = {"status": "PASS", "detail": "憑證檔存在 (已隨主連線啟用)"}
-            print("5. [下單憑證] ✅ 憑證檔存在 (已隨主連線啟用)")
+            if ca_activated is False:
+                results["checks"]["下單憑證"] = {"status": "FAIL", "detail": "主連線尚未成功啟用憑證 (ca_activated=False)"}
+                results["overall_ok"] = False
+                results["alerts"].append("主連線尚未成功啟用實盤下單憑證，無法送出實單！")
+                print("5. [下單憑證] ❌ 主連線尚未成功啟用實盤下單憑證！")
+            elif ca_activated is True:
+                results["checks"]["下單憑證"] = {"status": "PASS", "detail": "憑證檔存在 (主連線已完成啟用驗證)"}
+                print("5. [下單憑證] ✅ 憑證檔存在 (主連線已完成啟用驗證)")
+            else:
+                results["checks"]["下單憑證"] = {"status": "PASS", "detail": "憑證檔存在 (已隨主連線啟用)"}
+                print("5. [下單憑證] ✅ 憑證檔存在 (已隨主連線啟用)")
         else:
             try:
                 api.activate_ca(ca_path=ca_path, ca_passwd=ca_passwd, person_id=person_id)
@@ -177,21 +187,24 @@ def run_health_check(
     if is_live and api and account:
         try:
             positions = api.list_positions(account)
-            tmf_pos = 0
+            by_code: Dict[str, int] = {}
             if positions:
                 for p in positions:
-                    if str(getattr(p, "code", "")).startswith("TMF"):
+                    code = str(getattr(p, "code", ""))
+                    if code.startswith("TMF"):
                         d = 1 if "Buy" in str(getattr(p, "direction", "")) else -1
-                        tmf_pos += int(getattr(p, "quantity", 0)) * d
+                        by_code[code] = by_code.get(code, 0) + int(getattr(p, "quantity", 0)) * d
 
-            if tmf_pos == 0:
+            non_zero = {k: v for k, v in by_code.items() if v != 0}
+            if not non_zero:
                 results["checks"]["帳上部位"] = {"status": "PASS", "detail": "0 口 (空手零留倉風險)"}
                 print(f"6. [帳上部位] ✅ 帳上確認 0 口 (完全空手，無隔夜留倉)")
             else:
-                results["checks"]["帳上部位"] = {"status": "FAIL", "detail": f"帳上有殘留部位: {tmf_pos:+d}口"}
+                pos_desc = ", ".join(f"{k}:{v:+d}口" for k, v in sorted(non_zero.items()))
+                results["checks"]["帳上部位"] = {"status": "FAIL", "detail": f"帳上有殘留部位 ({pos_desc})"}
                 results["overall_ok"] = False
-                results["alerts"].append(f"開盤前帳上有未平倉部位: {tmf_pos:+d} 口！")
-                print(f"6. [帳上部位] 🚨 異常！帳上有殘留部位: {tmf_pos:+d} 口！請立即檢查券商軟體！")
+                results["alerts"].append(f"開盤前帳上有未平倉部位: {pos_desc}！")
+                print(f"6. [帳上部位] 🚨 異常！帳上有殘留部位: {pos_desc}！請立即檢查券商軟體！")
         except Exception as e:
             results["checks"]["帳上部位"] = {"status": "WARN", "detail": f"查詢失敗: {e}"}
             results["has_warnings"] = True

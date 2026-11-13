@@ -56,6 +56,7 @@ class StateManager:
         :param date_str: 日期字串，預設今日
         :return: 儲存成功與否 (bool)
         """
+        tmp_path = None
         try:
             path = self.get_state_path(date_str)
             if date_str:
@@ -81,12 +82,17 @@ class StateManager:
             if custom_fields:
                 state.update(custom_fields)
 
-            tmp_path = path + ".tmp"
+            tmp_path = f"{path}.tmp.{os.getpid()}"
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(state, f, ensure_ascii=False, indent=2)
             os.replace(tmp_path, path)
             return True
         except Exception as e:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
             logger.warning(f"保存策略狀態失敗: {e}")
             return False
 

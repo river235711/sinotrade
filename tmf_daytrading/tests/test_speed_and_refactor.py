@@ -28,6 +28,7 @@ from config import InstrumentConfig, ORBStrategyConfig, load_env_file
 from strategies.orb_strategy import ORBStrategy
 from strategies.atr_scaler import config_for_date, load_daily_history
 from live.bar_aggregator import BarAggregator
+from live.market_data import is_overnight_row_complete, should_persist_overnight
 from live.shioaji_trader import ShioajiTMFTrader
 from live.execution import FillResult, append_order_audit
 from live.notifier import TradeNotifier
@@ -466,6 +467,408 @@ class TestSpeedAndRefactor(unittest.TestCase):
                 self.assertEqual(os.environ["TMF_TEST_KEEP"], "from_file")
         finally:
             os.remove(env_file)
+
+    def test_monday_and_holiday_overnight_completeness(self):
+        """驗證週一與連假後夜盤完整度檢核不再誤殺週五夜盤，並仍擋下 23:59/00:01 半截與過舊紀錄"""
+        # 1. 週一 2026-11-16 對應週五夜盤 (2026-11-13 15:00 ~ 2026-11-14 04:59/05:00)
+        self.assertTrue(
+            is_overnight_row_complete(
+                {
+                    "night_bars": 840,
+                    "night_start": "2026-11-13 15:00:00",
+                    "night_end": "2026-11-14 04:59:00",
+                },
+                "2026-11-16",
+            )
+        )
+        # 即使無 night_start 欄位，只要落於前數日內清晨 04:55~06:00 亦須通過
+        self.assertTrue(
+            is_overnight_row_complete(
+                {"night_bars": 840, "night_end": "2026-11-14 05:00:00"},
+                "2026-11-16",
+            )
+        )
+        # 連假後首日 2026-10-12 (對應 2026-10-08 15:01 ~ 2026-10-09 05:00)
+        self.assertTrue(
+            is_overnight_row_complete(
+                {
+                    "night_bars": 840,
+                    "night_start": "2026-10-08 15:01:00",
+                    "night_end": "2026-10-09 05:00:00",
+                },
+                "2026-10-12",
+            )
+        )
+
+        # 2. 半截夜盤 (23:59 尚未跨午夜、00:01 半途寫入、過舊紀錄) 皆必須拒絕
+        self.assertFalse(
+            is_overnight_row_complete(
+                {
+                    "night_bars": 840,
+                    "night_start": "2026-11-13 15:00:00",
+                    "night_end": "2026-11-13 23:59:00",
+                },
+                "2026-11-16",
+            )
+        )
+        self.assertFalse(
+            is_overnight_row_complete(
+                {
+                    "night_bars": 541,
+                    "night_start": "2026-11-13 15:00:00",
+                    "night_end": "2026-11-14 00:01:00",
+                },
+                "2026-11-16",
+            )
+        )
+        self.assertFalse(
+            is_overnight_row_complete(
+                {
+                    "night_bars": 840,
+                    "night_start": "2026-10-20 15:00:00",
+                    "night_end": "2026-10-21 05:00:00",
+                },
+                "2026-11-16",
+            )
+        )
+
+        # 3. should_persist_overnight 在週六預存週五完整夜盤時應允許寫入；半截則否
+        full_friday_night = pd.DataFrame(
+            {"ts": pd.date_range("2026-11-13 15:00:00", periods=840, freq="1min")}
+        )
+        self.assertTrue(
+            should_persist_overnight(
+                full_friday_night,
+                "2026-11-16",
+                now_dt=datetime.datetime(2026, 11, 14, 10, 0, 0),
+            )
+        )
+        partial_friday_night = pd.DataFrame(
+            {"ts": pd.date_range("2026-11-13 15:00:00", periods=540, freq="1min")}
+        )
+        self.assertFalse(
+            should_persist_overnight(
+                partial_friday_night,
+                "2026-11-16",
+                now_dt=datetime.datetime(2026, 11, 14, 0, 2, 0),
+            )
+        )
+
+        # 4. 實際驗證 overnight_levels_summary.csv 內所有歷史列 (含所有週一與國定假日後) 全數通過
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        on_path = os.path.join(base_dir, "data", "overnight_levels_summary.csv")
+        if os.path.exists(on_path):
+            df_on = pd.read_csv(on_path)
+            for _, r in df_on.iterrows():
+                self.assertTrue(
+                    is_overnight_row_complete(r.to_dict(), str(r["trading_date"])),
+                    f"Historical overnight row failed completeness check: {r.to_dict()}",
+                )
+
+    def test_intraday_reconnect_and_offline_holiday_guard(self):
+        """驗證 08:45 後斷線會自動重連補載夜盤，且未連線時不會在 09:05 誤判休市"""
+        trader = ShioajiTMFTrader(api_key="", secret_key="", simulation=True)
+        trader.notifier = MagicMock()
+        strat = ORBStrategy(self.cfg, self.inst)
+
+        # 1. api=None 時呼叫 _ensure_intraday_connection 會嘗試重連，並在連上後補載夜盤極值
+        def _mock_reconn():
+            trader.api = MagicMock()
+            trader.contract = MagicMock()
+            return True
+
+        trader.reconnect = MagicMock(side_effect=_mock_reconn)
+        trader.load_overnight_levels_for_strategy = MagicMock(
+            side_effect=lambda s, d: s.set_overnight_levels(44100.0, 43200.0)
+        )
+        self.assertTrue(trader._ensure_intraday_connection(strat, "2026-11-16"))
+        trader.reconnect.assert_called_once()
+        trader.load_overnight_levels_for_strategy.assert_called_once_with(strat, "2026-11-16")
+        self.assertEqual(strat.overnight_high, 44100.0)
+
+        # 已連線且合約存在時不得重複重連或重載夜盤
+        trader.reconnect.reset_mock()
+        trader.load_overnight_levels_for_strategy.reset_mock()
+        self.assertTrue(trader._ensure_intraday_connection(strat, "2026-11-16"))
+        trader.reconnect.assert_not_called()
+        trader.load_overnight_levels_for_strategy.assert_not_called()
+
+        # 2. 未連線狀態 (api=None) 於 09:06 持續無 snap 超過 30 秒：不得誤判為休市！
+        trader.api = None
+        trader.contract = None
+        trader.logout_and_sleep = MagicMock()
+        since = trader._update_holiday_detection(strat, None, "09:06:00", "2026-11-16", 0.0, now_epoch=1000.0)
+        self.assertEqual(since, 0.0)
+        since = trader._update_holiday_detection(strat, None, "09:06:35", "2026-11-16", since, now_epoch=1035.0)
+        self.assertEqual(since, 0.0)
+        self.assertFalse(trader._holiday_detected)
+        trader.logout_and_sleep.assert_not_called()
+
+        # 3. 已確定連線與合約 (api!=None, contract!=None) 於 09:06 持續無行情 30 秒以上 -> 正確觸發休市休眠
+        trader.api = MagicMock()
+        trader.contract = MagicMock()
+        since = trader._update_holiday_detection(strat, None, "09:06:00", "2026-11-16", 0.0, now_epoch=2000.0)
+        self.assertEqual(since, 2000.0)
+        self.assertFalse(trader._holiday_detected)
+        since = trader._update_holiday_detection(strat, None, "09:06:31", "2026-11-16", since, now_epoch=2031.0)
+        self.assertEqual(since, 0.0)
+        self.assertTrue(trader._holiday_detected)
+        trader.logout_and_sleep.assert_called_once()
+
+    def test_periodic_reconcile_takeover_unexpected_position(self):
+        """驗證 _periodic_reconcile 在策略空手但帳上有真實部位時自動接管並停止新倉"""
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("live.shioaji_trader.get_mode_log_dir", return_value=tmp), \
+                 patch("live.shioaji_trader.TradeNotifier"):
+                trader = ShioajiTMFTrader(simulation=False)
+                trader.notifier = MagicMock()
+                mock_api = MagicMock()
+                mock_api.futopt_account = "FUT-ACC"
+                mock_api.list_positions.return_value = [
+                    SimpleNamespace(code="TMFK6", direction="Buy", quantity=1, price=23180.0),
+                ]
+                trader.api = mock_api
+                trader.contract = SimpleNamespace(code="TMFK6")
+
+                strat = ORBStrategy(self.cfg, self.inst)
+                self.assertEqual(strat.position, 0)
+                trader._periodic_reconcile(strat)
+
+                self.assertEqual(strat.position, 1)
+                self.assertEqual(strat.entry_price, 23180.0)
+                self.assertEqual(strat.highest_profit, 0.0)
+                self.assertEqual(strat.trade_count, 1)
+                self.assertTrue(trader.entries_halted)
+                self.assertTrue(trader.notifier.send.called)
+                self.assertIn("接管", trader.notifier.send.call_args[0][0])
+
+    def test_cross_month_tmf_separation_reconcile_and_tick_filter(self):
+        """驗證跨月 TMF 部位不會互相抵銷淨額、能針對非當月合約獨立平倉，且換月訂閱退訂舊合約並過濾舊 tick.code"""
+        from types import SimpleNamespace
+        from live.execution import query_real_position_details
+
+        # 1. query_real_position_details 分離當月 TMFL6 (+1) 與非當月 TMFK6 (-1)
+        mock_api = MagicMock()
+        mock_api.futopt_account = "FUT-ACC"
+        mock_api.list_positions.return_value = [
+            SimpleNamespace(code="TMFL6", direction="Buy", quantity=1, price=23200.0),
+            SimpleNamespace(code="TMFK6", direction="Sell", quantity=1, price=23050.0),
+        ]
+        details = query_real_position_details(mock_api, simulation=False, contract_code="TMFL6")
+        self.assertEqual(details["net"], 1)
+        self.assertEqual(details["avg_price"], 23200.0)
+        self.assertEqual(details["target_code"], "TMFL6")
+        self.assertEqual(len(details["other_positions"]), 1)
+        self.assertEqual(details["other_positions"][0]["code"], "TMFK6")
+        self.assertEqual(details["other_positions"][0]["net"], -1)
+
+        # 2. _periodic_reconcile 偵測非當月 TMFK6 (-1) 時獨立用該合約下單回補，不誤當淨部位 0
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("live.shioaji_trader.get_mode_log_dir", return_value=tmp), \
+                 patch("live.shioaji_trader.TradeNotifier"), \
+                 patch("live.shioaji_trader.resolve_tmf_contract") as mock_resolve:
+                trader = ShioajiTMFTrader(simulation=False)
+                trader.notifier = MagicMock()
+                c_old = SimpleNamespace(code="TMFK6", name="微台指202611")
+                c_new = SimpleNamespace(code="TMFL6", name="微台指202612")
+                trader.api = mock_api
+                trader.contract = c_new
+                mock_resolve.side_effect = lambda api, code="TMFR1": c_old if code == "TMFK6" else c_new
+                trader.place_order = MagicMock(return_value={"status": "Simulated"})
+
+                strat = ORBStrategy(self.cfg, self.inst)
+                strat.position = 1
+                strat.entry_price = 23200.0
+                trader._periodic_reconcile(strat)
+
+                self.assertTrue(trader.entries_halted)
+                trader.place_order.assert_called_once()
+                _, kwargs = trader.place_order.call_args
+                self.assertEqual(trader.place_order.call_args[0][0], "BUY")
+                self.assertEqual(kwargs.get("contract"), c_old)
+
+        # 3. load_tmf_contract 換約時退訂舊合約，且 _on_tick 過濾非訂閱合約 tick.code
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("live.shioaji_trader.get_mode_log_dir", return_value=tmp), \
+                 patch("live.shioaji_trader.TradeNotifier"), \
+                 patch("live.shioaji_trader.resolve_tmf_contract") as mock_resolve:
+                trader = ShioajiTMFTrader(simulation=True)
+                trader.notifier = MagicMock()
+                callbacks = []
+                api_tick = MagicMock()
+                def capture_dec():
+                    def _reg(fn):
+                        callbacks.append(fn)
+                        return fn
+                    return _reg
+                api_tick.on_tick_fop_v1.side_effect = capture_dec
+                trader.api = api_tick
+
+                c_old = SimpleNamespace(code="TMFK6", name="微台指202611")
+                c_new = SimpleNamespace(code="TMFL6", name="微台指202612")
+                mock_resolve.return_value = c_old
+                trader.load_tmf_contract("TMFK6")
+
+                mock_resolve.return_value = c_new
+                trader.load_tmf_contract("TMFL6")
+                self.assertEqual(len(callbacks), 1)
+                api_tick.unsubscribe.assert_called_once()
+                self.assertEqual(api_tick.unsubscribe.call_args[0][0], c_old)
+
+                on_tick = callbacks[0]
+                t_old = SimpleNamespace(code="TMFK6", close=21000.0, volume=5, date=datetime.date(2026, 11, 14), time=datetime.time(9, 10, 0))
+                t_new = SimpleNamespace(code="TMFL6", close=23300.0, volume=3, date=datetime.date(2026, 11, 14), time=datetime.time(9, 10, 0))
+                on_tick(None, t_old)
+                self.assertEqual(len(trader.bar_aggregator), 0)
+                on_tick(None, t_new)
+                self.assertEqual(len(trader.bar_aggregator), 1)
+                df_b = trader.bar_aggregator.to_dataframe()
+                self.assertEqual(float(df_b.iloc[0]["close"]), 23300.0)
+
+    def test_live_initialize_missing_ca_and_health_check_guards(self):
+        """驗證實盤缺少憑證於 initialize() 立即失敗中止，且健檢攔截 ca_activated=False 與跨月鎖倉"""
+        from types import SimpleNamespace
+        from live.health_check import run_health_check
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("live.shioaji_trader.get_mode_log_dir", return_value=tmp), \
+                 patch("live.shioaji_trader.TradeNotifier"), \
+                 patch("shioaji.Shioaji") as mock_sj_cls, \
+                 patch("live.shioaji_trader.time.sleep"):
+                mock_sj = MagicMock()
+                mock_sj_cls.return_value = mock_sj
+                trader = ShioajiTMFTrader(simulation=False)
+                trader.notifier = MagicMock()
+                trader.api_key = "KEY"
+                trader.secret_key = "SEC"
+                trader.ca_path = os.path.join(tmp, "missing.pfx")
+                trader.ca_passwd = "pw"
+                trader.person_id = "A123456789"
+
+                ok = trader.initialize()
+                self.assertFalse(ok)
+                self.assertFalse(trader.ca_activated)
+                self.assertIsNone(trader.api)
+                self.assertTrue(trader.notifier.send.called)
+                self.assertIn("實盤啟動失敗", trader.notifier.send.call_args[0][0])
+
+            # 健檢 Check #5 (ca_activated=False) 與 Check #6 (跨月 +1 TMFK6 / -1 TMFL6 不相互抵銷)
+            pfx = os.path.join(tmp, "Sinopac.pfx")
+            with open(pfx, "wb") as f:
+                f.write(b"dummy")
+            hc_api = MagicMock()
+            hc_api.futopt_account = SimpleNamespace(broker_id="F002000", account_id="123456")
+            hc_api.list_positions.return_value = [
+                SimpleNamespace(code="TMFK6", direction="Buy", quantity=1),
+                SimpleNamespace(code="TMFL6", direction="Sell", quantity=1),
+            ]
+            hc_api.margin.return_value = SimpleNamespace(available_margin=100000.0, equity=100000.0)
+            hc_contract = SimpleNamespace(code="TMFL6", name="微台指202612")
+
+            with patch.dict(os.environ, {"SHIOAJI_CA_PATH": pfx, "SHIOAJI_CA_PASSWD": "pw", "SHIOAJI_PERSON_ID": "A123456789"}):
+                res = run_health_check(
+                    mode="live",
+                    qty=1,
+                    send_notify=False,
+                    api=hc_api,
+                    contract=hc_contract,
+                    ca_activated=False,
+                )
+            self.assertFalse(res["overall_ok"])
+            self.assertEqual(res["checks"]["下單憑證"]["status"], "FAIL")
+            self.assertEqual(res["checks"]["帳上部位"]["status"], "FAIL")
+            self.assertIn("TMFK6", res["checks"]["帳上部位"]["detail"])
+            self.assertIn("TMFL6", res["checks"]["帳上部位"]["detail"])
+
+    def test_bar_aggregator_merge_closed_backup_non_overwrite_and_state_tmp(self):
+        """驗證 BarAggregator 補齊已收盤缺漏、備援不覆寫既有 TMF、以及 StateManager .tmp 清理"""
+        from live.state_manager import StateManager
+
+        agg = BarAggregator()
+        agg.update_tick(23100.0, 1, datetime.datetime(2026, 11, 13, 9, 5, 10))
+        ts_04 = pd.Timestamp("2026-11-13 09:04:00")
+        ts_05 = pd.Timestamp("2026-11-13 09:05:00")
+        ts_06 = pd.Timestamp("2026-11-13 09:06:00")
+        ts_07 = pd.Timestamp("2026-11-13 09:07:00")
+
+        hist_df = pd.DataFrame(
+            [{"open": 23098.0, "high": 23120.0, "low": 23095.0, "close": 23115.0, "volume": 50}],
+            index=pd.DatetimeIndex([ts_05]),
+        )
+        merged_n = agg.load_history_kbars(hist_df, today_str="2026-11-13", now_min=ts_06)
+        self.assertEqual(merged_n, 1)
+
+        backup_df = pd.DataFrame(
+            [
+                {"open": 23080.0, "high": 23095.0, "low": 23075.0, "close": 23090.0, "volume": 100},
+                {"open": 29990.0, "high": 29999.0, "low": 29980.0, "close": 29995.0, "volume": 999},
+                {"open": 24000.0, "high": 24010.0, "low": 23990.0, "close": 24005.0, "volume": 10},
+            ],
+            index=pd.DatetimeIndex([ts_04, ts_05, ts_07]),
+        )
+        added_backup = agg.load_backup_bars(backup_df, now_min=ts_06)
+        self.assertEqual(added_backup, 1)
+        df_res = agg.to_dataframe()
+        self.assertIn(ts_04, df_res.index)
+        self.assertNotIn(ts_07, df_res.index)
+        self.assertEqual(float(df_res.loc[ts_05, "close"]), 23115.0)
+        self.assertEqual(int(df_res.loc[ts_05, "volume"]), 50)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            sm = StateManager(log_dir=tmp)
+            strat = ORBStrategy(self.cfg, self.inst)
+            self.assertTrue(sm.save_state(strat, date_str="20261113"))
+            self.assertEqual([f for f in os.listdir(tmp) if ".tmp" in f], [])
+            with patch("live.state_manager.os.replace", side_effect=OSError("disk full")):
+                self.assertFalse(sm.save_state(strat, date_str="20261113"))
+            self.assertEqual([f for f in os.listdir(tmp) if ".tmp" in f], [])
+
+    def test_0915_orb_notification_deferred_until_close_and_tls_context(self):
+        """驗證 09:15 ORB 報告僅於收盤定稿推播一次，且 TradeNotifier 優先使用系統驗證 TLS context"""
+        import ssl
+        from live import notifier as notifier_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("live.shioaji_trader.get_mode_log_dir", return_value=tmp), \
+                 patch("live.shioaji_trader.TradeNotifier"):
+                trader = ShioajiTMFTrader(simulation=True)
+                trader.notifier = MagicMock()
+                strat = ORBStrategy(self.cfg, self.inst)
+
+                idx = pd.date_range("2026-11-13 09:00:00", periods=16, freq="1min")
+                kbars = pd.DataFrame(
+                    {
+                        "open": [23050.0] * 16,
+                        "high": [23100.0] * 16,
+                        "low": [23000.0] * 16,
+                        "close": [23080.0] * 16,
+                        "volume": [100] * 16,
+                    },
+                    index=idx,
+                )
+                strat.calculate_orb_levels(kbars)
+                self.assertFalse(trader._orb_report_sent)
+
+                # 尚未到 09:15:00 收盤不推播
+                trader._finalize_orb_if_closed(strat, kbars, idx[14])
+                self.assertFalse(trader._orb_finalized)
+                self.assertFalse(trader._orb_report_sent)
+                trader.notifier.send.assert_not_called()
+
+                # 09:15:00 收盤後發送一次確立報告，重複呼叫不重發
+                trader._finalize_orb_if_closed(strat, kbars, idx[15])
+                self.assertTrue(trader._orb_finalized)
+                self.assertTrue(trader._orb_report_sent)
+                self.assertEqual(trader.notifier.send.call_count, 1)
+                self.assertIn("09:15 ORB 區間確立", trader.notifier.send.call_args[0][0])
+
+                trader._finalize_orb_if_closed(strat, kbars, idx[15])
+                self.assertEqual(trader.notifier.send.call_count, 1)
+
+        self.assertIsInstance(notifier_mod._ssl_ctx, ssl.SSLContext)
+        self.assertEqual(notifier_mod._ssl_ctx.verify_mode, ssl.CERT_REQUIRED)
+        self.assertTrue(notifier_mod._ssl_ctx.check_hostname)
 
 
 if __name__ == "__main__":

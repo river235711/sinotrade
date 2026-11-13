@@ -203,8 +203,8 @@ class ORBStrategy:
 
         return None
 
-    def execute_bar(self, ts: pd.Timestamp, bar: pd.Series, prev_bar: pd.Series = None) -> Dict[str, Any]:
-        """處理單根 1分K 棒"""
+    def execute_bar(self, ts: pd.Timestamp, bar: pd.Series, _prev_bar: pd.Series = None) -> Dict[str, Any]:
+        """處理單根 1分K 棒 (保留可選第三參數以向下相容舊呼叫端)"""
         c = float(bar['close'])
         o = float(bar.get('open', c))
         h = float(bar['high'])
