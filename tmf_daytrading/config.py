@@ -12,11 +12,11 @@ _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 os.makedirs(os.path.join(_BASE_DIR, "logs"), exist_ok=True)
 os.environ.setdefault("SJ_LOG_PATH", os.path.join(_BASE_DIR, "logs", "shioaji.log"))
 
-def _load_env_file():
-    """自動載入同目錄下的 .env 設定檔"""
-    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-    if os.path.exists(env_path):
-        with open(env_path, "r", encoding="utf-8") as f:
+def load_env_file(env_path: str = None, override: bool = False):
+    """自動載入 .env 設定檔 (預設僅填入尚未定義的環境變數)"""
+    path = env_path or os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line or line.startswith("#") or "=" not in line:
@@ -24,10 +24,11 @@ def _load_env_file():
                 key, val = line.split("=", 1)
                 key = key.strip()
                 val = val.strip().strip('"').strip("'")
-                if key not in os.environ:
+                if override or key not in os.environ:
                     os.environ[key] = val
 
-_load_env_file()
+_load_env_file = load_env_file
+load_env_file()
 
 
 def atomic_write_csv(df, target_path: str, **to_csv_kwargs) -> None:

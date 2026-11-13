@@ -11,6 +11,8 @@
 - LINE_NOTIFY_TOKEN
 """
 import os
+import time
+import html
 import json
 import ssl
 import smtplib
@@ -21,6 +23,8 @@ import urllib.parse
 import logging
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+
+from config import load_env_file
 
 logger = logging.getLogger("Notifier")
 
@@ -34,16 +38,8 @@ except Exception:
 
 class TradeNotifier:
     def __init__(self):
-        # 確保環境變數載入最新 .env
-        env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
-        if os.path.exists(env_path):
-            with open(env_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith("#") or "=" not in line:
-                        continue
-                    k, v = line.split("=", 1)
-                    os.environ[k.strip()] = v.strip().strip('"').strip("'")
+        # 共用設定檔載入器，不覆蓋已透過環境注入的測試/執行期變數
+        load_env_file(override=False)
 
         self.tg_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
         self.tg_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
@@ -135,12 +131,7 @@ class TradeNotifier:
                 logger.debug(f"Discord 推播失敗: {e}")
 
         # 4. LINE Messaging API (LINE 官方帳號 Push Message，具備熔斷降級機制)
-        if self.line_messaging_enabled:
-            import time
-            if time.time() < self._line_cooldown_until:
-                # 處於額度用盡或錯誤冷卻期，靜默略過避免無效消耗網路資源
-                return
-
+        if self.line_messaging_enabled and time.time() >= self._line_cooldown_until:
             try:
                 url = "https://api.line.me/v2/bot/message/push"
                 payload = json.dumps({
@@ -210,7 +201,7 @@ class TradeNotifier:
                     <h2 style="color: #1a73e8; margin: 0; font-size: 20px;">🤖 TMF 微型臺指期當沖系統</h2>
                 </div>
                 <div style="background-color: #f8f9fa; border-left: 4px solid #1a73e8; padding: 16px; border-radius: 4px; margin-bottom: 20px;">
-                    <pre style="margin: 0; font-size: 14px; white-space: pre-wrap; word-break: break-all; font-family: Consolas, Monaco, monospace; color: #1f1f1f;">{text}</pre>
+                    <pre style="margin: 0; font-size: 14px; white-space: pre-wrap; word-break: break-all; font-family: Consolas, Monaco, monospace; color: #1f1f1f;">{html.escape(text)}</pre>
                 </div>
                 <div style="font-size: 12px; color: #5f6368; border-top: 1px solid #eeeeee; padding-top: 12px; display: flex; justify-content: space-between;">
                     <span>⏱️ 發送時間: {now_str}</span>

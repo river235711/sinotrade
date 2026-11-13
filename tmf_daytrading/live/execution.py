@@ -15,6 +15,7 @@ logger = logging.getLogger("ShioajiTrader")
 
 FINAL_STATUSES = {"Filled", "Cancelled", "Failed", "Inactive"}
 PENDING_STATUSES = {"PendingSubmit", "PreSubmitted", "Submitted", "PartFilled"}
+_AUDIT_HEADER_CACHE: dict[str, tuple[bool, int]] = {}
 
 
 def status_name(s: Any) -> str:
@@ -128,12 +129,19 @@ def append_order_audit(
         is_new = not os.path.exists(path)
         has_signal_col = True
         if not is_new:
-            try:
-                with open(path, "r", encoding="utf-8") as rf:
-                    first_line = rf.readline().strip()
-                has_signal_col = "signal_price" in first_line.split(",")
-            except Exception:
-                has_signal_col = False
+            cur_size = os.path.getsize(path)
+            cached = _AUDIT_HEADER_CACHE.get(path)
+            if cached is not None and cur_size >= cached[1] > 0:
+                has_signal_col = cached[0]
+            else:
+                try:
+                    with open(path, "r", encoding="utf-8") as rf:
+                        first_line = rf.readline().strip()
+                    has_signal_col = "signal_price" in first_line.split(",")
+                    if cur_size > 0:
+                        _AUDIT_HEADER_CACHE[path] = (has_signal_col, cur_size)
+                except Exception:
+                    has_signal_col = False
 
         with open(path, "a", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
@@ -154,5 +162,9 @@ def append_order_audit(
                 sig_str = f"{float(signal_price):.0f}" if (signal_price is not None and float(signal_price) > 0) else ""
                 row.append(sig_str)
             w.writerow(row)
+        try:
+            _AUDIT_HEADER_CACHE[path] = (has_signal_col, os.path.getsize(path))
+        except OSError:
+            pass
     except Exception as e:
         logger.warning(f"寫入稽核紀錄失敗: {e}")

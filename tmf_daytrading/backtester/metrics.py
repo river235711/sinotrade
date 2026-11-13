@@ -59,6 +59,10 @@ class BacktestMetrics:
         total_net_ntd = tdf['net_ntd'].sum()
         
         # 計算權益曲線與最大回撤 (MDD)
+        tdf['cum_pts'] = tdf['points_pnl'].cumsum()
+        tdf['peak_pts'] = tdf['cum_pts'].cummax()
+        max_dd_pts = float((tdf['peak_pts'] - tdf['cum_pts']).max()) if len(tdf) > 0 else 0.0
+
         tdf['cum_ntd'] = tdf['net_ntd'].cumsum()
         tdf['peak_ntd'] = tdf['cum_ntd'].cummax()
         tdf['dd_ntd'] = tdf['peak_ntd'] - tdf['cum_ntd']
@@ -74,6 +78,7 @@ class BacktestMetrics:
             "total_points": total_points,
             "net_profit_ntd": total_net_ntd,
             "profit_factor": profit_factor,
+            "max_drawdown_pts": max_dd_pts,
             "max_drawdown_ntd": max_dd_ntd,
             "avg_trade_ntd": avg_trade_ntd,
             "trades_df": tdf

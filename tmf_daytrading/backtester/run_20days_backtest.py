@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-TMF (微型臺指期) 當沖交易程式 - 前 20 個交易日回測腳本
-回測區間: 2026-09-30 ~ 2026-10-30 (共 20 個交易日)
+TMF (微型臺指期) 當沖交易程式 - 近 20 個交易日滾動回測腳本
 商品: 微型臺指期近月主力合約 (TMF)
-策略: ORB 開盤區間突破策略 + 移動停利 (Trailing Stop)
+策略: ORB 現貨開盤區間突破策略 + VWAP/EMA 雙濾網 + 三階保本鎖利 + ATR 波動率自適應
 """
 import os
 import sys
@@ -41,10 +40,12 @@ def main():
     data_dir = os.path.join(base_dir, "data")
     cache_path = os.path.join(data_dir, "tmf_20days_1m_kbars.csv")
     cached_kbars_df = None
+    cached_by_date = {}
     if os.path.exists(cache_path):
         cached_kbars_df = pd.read_csv(cache_path, index_col=0, parse_dates=True)
         all_dates = sorted(cached_kbars_df['date'].unique())
         target_dates = all_dates[-20:]
+        cached_by_date = {d: g for d, g in cached_kbars_df.groupby('date', sort=False)}
     else:
         target_dates = [
             "2026-09-30", "2026-10-01", "2026-10-02", "2026-10-05", "2026-10-06",
@@ -79,10 +80,12 @@ def main():
 
     for file_date, target_date in trading_days:
         csv_path = os.path.join(base_dir, "data", f"Daily_{file_date}.csv")
+        day_date_fmt = f"{target_date[:4]}-{target_date[4:6]}-{target_date[6:]}"
+        day_cached_df = cached_by_date.get(day_date_fmt, cached_kbars_df)
         engine = BacktestEngine(
             data_path=csv_path,
             inst_config=inst_cfg,
-            cached_kbars_df=cached_kbars_df,
+            cached_kbars_df=day_cached_df,
             daily_history_df=daily_history_df,
             overnight_levels_df=overnight_levels_df,
         )
@@ -91,7 +94,6 @@ def main():
         metrics = engine.run_orb_strategy(strat_cfg)
 
         tdf = metrics["trades_df"]
-        day_date_fmt = f"{target_date[:4]}-{target_date[4:6]}-{target_date[6:]}"
         day_open = kbars.iloc[0]['open']
         day_high = kbars['high'].max()
         day_low = kbars['low'].min()

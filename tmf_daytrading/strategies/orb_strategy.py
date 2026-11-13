@@ -16,7 +16,7 @@
    若 11:00 前第一筆突破單觸發 90 點停損，且收盤價已反向跌破/站上 VWAP（確認為早盤誘多/誘空假突破），立即反手進場順應真趨勢（每日最多反手 1 次）。
 """
 import pandas as pd
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from config import ORBStrategyConfig, InstrumentConfig
 
 class ORBStrategy:
@@ -80,9 +80,131 @@ class ORBStrategy:
             return self.orb_high, self.orb_low
         return None, None
 
+    def _append_trade_record(
+        self, ts: pd.Timestamp, action: str, exit_price: float, pnl_pts: float, reason: str
+    ) -> Dict[str, Any]:
+        """建立並記錄單筆平倉成交明細"""
+        rec = {
+            "entry_time": self.entry_time,
+            "exit_time": ts,
+            "action": action,
+            "entry_price": self.entry_price,
+            "exit_price": exit_price,
+            "pnl_pts": pnl_pts,
+            "reason": reason,
+        }
+        self.trades.append(rec)
+        return rec
+
+    def _exit_position(
+        self, ts: pd.Timestamp, action: str, exit_price: float, pnl_pts: float, reason: str
+    ) -> Dict[str, Any]:
+        """記錄平倉並重置部位狀態為空手"""
+        rec = self._append_trade_record(ts, action, exit_price, pnl_pts, reason)
+        self.position = 0
+        return {"action": "EXIT", "record": rec}
+
+    def _enter_position(
+        self, side_sign: int, price: float, ts: pd.Timestamp, detail: str
+    ) -> Dict[str, Any]:
+        """建立多/空進場部位並重設當筆最高浮盈狀態"""
+        self.position = side_sign
+        self.entry_price = price
+        self.entry_time = ts
+        self.trade_count += 1
+        self.highest_profit = 0.0
+        return {
+            "action": "BUY" if side_sign == 1 else "SELL",
+            "price": price,
+            "time": ts,
+            "detail": detail,
+        }
+
+    def _evaluate_open_position(
+        self, ts: pd.Timestamp, o: float, h: float, l: float, c: float, vwap: float, t_str: str
+    ) -> Optional[Dict[str, Any]]:
+        """統一評估多/空持倉的移動停利、三階保本鎖利與初始停損 / SAR 反手"""
+        if self._hp_before_bar_ts != ts:
+            self._hp_before_bar_ts = ts
+            self._hp_before_bar_val = self.highest_profit
+        prev_hp = self._hp_before_bar_val
+
+        sign = 1 if self.position == 1 else -1
+        side_action = "BUY" if sign == 1 else "SELL"
+        favorable_px, adverse_px = (h, l) if sign == 1 else (l, h)
+        cur_profit = (h - self.entry_price) if sign == 1 else (self.entry_price - l)
+        if cur_profit > self.highest_profit:
+            self.highest_profit = cur_profit
+
+        cfg = self.config
+        t15_trig = getattr(cfg, "tier1_5_trigger_pts", 160.0)
+        t15_lock = getattr(cfg, "tier1_5_lock_pts", 100.0)
+
+        def _hit(px: float, level: float) -> bool:
+            return px <= level if sign == 1 else px >= level
+
+        # 同 K 棒高低點時序保護 (真實拉回才出場)：
+        # 若本根 K 棒為順勢創極值棒 (多單紅 K / 空單黑 K)，先確認進棒前浮盈 prev_hp 是否已能讓逆勢端觸價；
+        # 否則新跨過門檻的鎖利判定以當前收盤/即時價 c 為準。
+        pullback_px = adverse_px
+        is_favorable_candle = (c > o) if sign == 1 else (c < o)
+        if cur_profit > prev_hp and is_favorable_candle:
+            already_trig = (
+                (prev_hp >= cfg.trailing_activation_pts and _hit(adverse_px, (self.entry_price + sign * prev_hp) - sign * cfg.trailing_distance_pts)) or
+                (prev_hp >= cfg.tier2_trigger_pts and _hit(adverse_px, self.entry_price + sign * cfg.tier2_lock_pts)) or
+                (prev_hp >= t15_trig and _hit(adverse_px, self.entry_price + sign * t15_lock)) or
+                (prev_hp >= cfg.breakeven_trigger_pts and _hit(adverse_px, self.entry_price + sign * cfg.breakeven_lock_pts))
+            )
+            if not already_trig:
+                pullback_px = c
+
+        # (A) 三階：大波段移動停利
+        trail_lvl = (self.entry_price + sign * self.highest_profit) - sign * cfg.trailing_distance_pts
+        if self.highest_profit >= cfg.trailing_activation_pts and _hit(pullback_px, trail_lvl):
+            pnl_pts = (trail_lvl - self.entry_price) if sign == 1 else (self.entry_price - trail_lvl)
+            return self._exit_position(
+                ts, side_action, trail_lvl, pnl_pts,
+                f"三階波段移動停利 (極值+{self.highest_profit:.0f}點)"
+            )
+
+        # (B) 二階 / 1.5 階 / 一階：階梯式保本鎖利
+        for trig_pts, lock_pts, tier_name in (
+            (cfg.tier2_trigger_pts, cfg.tier2_lock_pts, "二階波段鎖利"),
+            (t15_trig, t15_lock, "中階保本鎖利"),
+            (cfg.breakeven_trigger_pts, cfg.breakeven_lock_pts, "一階保本鎖利"),
+        ):
+            if self.highest_profit >= trig_pts:
+                exit_p = self.entry_price + sign * lock_pts
+                if _hit(pullback_px, exit_p):
+                    return self._exit_position(
+                        ts, side_action, exit_p, lock_pts,
+                        f"{tier_name} (曾獲利+{self.highest_profit:.0f}點, 鎖定+{lock_pts:.0f}點)"
+                    )
+
+        # (C) 初始固定停損 (含假突破反手 SAR)
+        sl_lvl = self.entry_price - sign * cfg.stop_loss_pts
+        if _hit(adverse_px, sl_lvl):
+            trade_record = self._append_trade_record(
+                ts, side_action, sl_lvl, -cfg.stop_loss_pts,
+                f"初始停損 (-{cfg.stop_loss_pts:.0f}點)"
+            )
+            vwap_reversed = (c < vwap) if sign == 1 else (c > vwap)
+            if cfg.enable_sar and self.trade_count < 2 and t_str <= cfg.sar_end_time and vwap_reversed:
+                self.position = -sign
+                self.entry_price = sl_lvl
+                self.entry_time = ts
+                self.trade_count += 1
+                self.highest_profit = 0.0
+                self._hp_before_bar_ts = None
+                self._hp_before_bar_val = 0.0
+                return {"action": "SAR_SELL" if sign == 1 else "SAR_BUY", "record": trade_record}
+            self.position = 0
+            return {"action": "EXIT", "record": trade_record}
+
+        return None
+
     def execute_bar(self, ts: pd.Timestamp, bar: pd.Series, prev_bar: pd.Series = None) -> Dict[str, Any]:
         """處理單根 1分K 棒"""
-        t_str = ts.strftime('%H:%M:%S')
         c = float(bar['close'])
         o = float(bar.get('open', c))
         h = float(bar['high'])
@@ -90,396 +212,121 @@ class ORBStrategy:
         vwap = float(bar.get('vwap', c))
         ema9 = float(bar.get('ema9', c))
         ema21 = float(bar.get('ema21', c))
-        prev_c = float(prev_bar['close']) if prev_bar is not None else c
-        
-        action_result = {"action": "HOLD", "detail": ""}
+        return self.execute_values(ts, o, h, l, c, vwap, ema9, ema21)
 
-        # 1. 檢查 13:25 強制收盤平倉 (避開結算日 13:30 停止交易與現貨尾盤甩尾)
-        if t_str >= self.config.force_close_time:
+    def execute_values(
+        self,
+        ts: pd.Timestamp,
+        o: float,
+        h: float,
+        l: float,
+        c: float,
+        vwap: float,
+        ema9: float,
+        ema21: float,
+        t_str: str = None,
+    ) -> Dict[str, Any]:
+        """零 Series 開銷純標量版單根 K 棒策略執行 (與 execute_bar 結果 100% 等價)"""
+        if t_str is None:
+            t_str = ts.strftime('%H:%M:%S')
+        cfg = self.config
+
+        # 1. 檢查強制收盤平倉
+        if t_str >= cfg.force_close_time:
             if self.position != 0:
                 pnl_pts = (c - self.entry_price) if self.position == 1 else (self.entry_price - c)
-                trade_record = {
-                    "entry_time": self.entry_time,
-                    "exit_time": ts,
-                    "action": "BUY" if self.position == 1 else "SELL",
-                    "entry_price": self.entry_price,
-                    "exit_price": c,
-                    "pnl_pts": pnl_pts,
-                    "reason": f"{self.config.force_close_time[:5]} 收盤前安全平倉"
-                }
-                self.trades.append(trade_record)
-                action_result = {"action": "EXIT", "record": trade_record}
-                self.position = 0
-            return action_result
+                side_action = "BUY" if self.position == 1 else "SELL"
+                return self._exit_position(
+                    ts, side_action, c, pnl_pts, f"{cfg.force_close_time[:5]} 收盤前安全平倉"
+                )
+            return {"action": "HOLD", "detail": ""}
 
         # 2. 如果已有部位，依序檢查：大波段移動停利 -> 保本鎖利 -> 初始停損 (含假突破反手 SAR)
         if self.position != 0:
-            if self._hp_before_bar_ts != ts:
-                self._hp_before_bar_ts = ts
-                self._hp_before_bar_val = self.highest_profit
-            prev_hp = self._hp_before_bar_val
-
-            if self.position == 1:
-                cur_profit = h - self.entry_price
-                if cur_profit > self.highest_profit:
-                    self.highest_profit = cur_profit
-
-                t15_trig = getattr(self.config, "tier1_5_trigger_pts", 110.0)
-                t15_lock = getattr(self.config, "tier1_5_lock_pts", 75.0)
-
-                # 同K棒高低點時序保護 (真實拉回才出場)：
-                # 若本根 K 棒為順勢創高紅 K (cur_profit > prev_hp 且 c > o)，代表低點 l 發生在創高 h 之前（開盤起漲點）。
-                # 除非本根 K 棒開始前的 prev_hp 已經能讓 l 觸發鎖利/停損，否則新跨過門檻的鎖利判定以當前價格 c 為準。
-                pullback_l = l
-                if cur_profit > prev_hp and c > o:
-                    already_trig = (
-                        (prev_hp >= self.config.trailing_activation_pts and l <= (self.entry_price + prev_hp - self.config.trailing_distance_pts)) or
-                        (prev_hp >= self.config.tier2_trigger_pts and l <= (self.entry_price + self.config.tier2_lock_pts)) or
-                        (prev_hp >= t15_trig and l <= (self.entry_price + t15_lock)) or
-                        (prev_hp >= self.config.breakeven_trigger_pts and l <= (self.entry_price + self.config.breakeven_lock_pts))
-                    )
-                    if not already_trig:
-                        pullback_l = c
-
-                # (A) 三階：大波段移動停利 (+400點啟動)
-                if (self.highest_profit >= self.config.trailing_activation_pts and 
-                    pullback_l <= (self.entry_price + self.highest_profit - self.config.trailing_distance_pts)):
-                    exit_p = self.entry_price + self.highest_profit - self.config.trailing_distance_pts
-                    pnl_pts = exit_p - self.entry_price
-                    trade_record = {
-                        "entry_time": self.entry_time,
-                        "exit_time": ts,
-                        "action": "BUY",
-                        "entry_price": self.entry_price,
-                        "exit_price": exit_p,
-                        "pnl_pts": pnl_pts,
-                        "reason": f"三階波段移動停利 (極值+{self.highest_profit:.0f}點)"
-                    }
-                    self.trades.append(trade_record)
-                    self.position = 0
-                    return {"action": "EXIT", "record": trade_record}
-
-                # (B) 二階：中波段鎖利 (獲利曾達 +200 點，拉回時鎖住 +120 點)
-                if (self.highest_profit >= self.config.tier2_trigger_pts and 
-                    pullback_l <= (self.entry_price + self.config.tier2_lock_pts)):
-                    exit_p = self.entry_price + self.config.tier2_lock_pts
-                    trade_record = {
-                        "entry_time": self.entry_time,
-                        "exit_time": ts,
-                        "action": "BUY",
-                        "entry_price": self.entry_price,
-                        "exit_price": exit_p,
-                        "pnl_pts": self.config.tier2_lock_pts,
-                        "reason": f"二階波段鎖利 (曾獲利+{self.highest_profit:.0f}點, 鎖定+{self.config.tier2_lock_pts:.0f}點)"
-                    }
-                    self.trades.append(trade_record)
-                    self.position = 0
-                    return {"action": "EXIT", "record": trade_record}
-
-                # (B2) 1.5階：中階鎖利 (獲利曾達 +110 點，拉回時鎖住 +75 點，補齊 80~200 點真空區)
-                if (self.highest_profit >= t15_trig and 
-                    pullback_l <= (self.entry_price + t15_lock)):
-                    exit_p = self.entry_price + t15_lock
-                    trade_record = {
-                        "entry_time": self.entry_time,
-                        "exit_time": ts,
-                        "action": "BUY",
-                        "entry_price": self.entry_price,
-                        "exit_price": exit_p,
-                        "pnl_pts": t15_lock,
-                        "reason": f"中階保本鎖利 (曾獲利+{self.highest_profit:.0f}點, 鎖定+{t15_lock:.0f}點)"
-                    }
-                    self.trades.append(trade_record)
-                    self.position = 0
-                    return {"action": "EXIT", "record": trade_record}
-
-                # (C) 一階：保本鎖利機制 (獲利曾達 +80 點，拉回時鎖住 +30 點)
-                if (self.highest_profit >= self.config.breakeven_trigger_pts and 
-                    pullback_l <= (self.entry_price + self.config.breakeven_lock_pts)):
-                    exit_p = self.entry_price + self.config.breakeven_lock_pts
-                    trade_record = {
-                        "entry_time": self.entry_time,
-                        "exit_time": ts,
-                        "action": "BUY",
-                        "entry_price": self.entry_price,
-                        "exit_price": exit_p,
-                        "pnl_pts": self.config.breakeven_lock_pts,
-                        "reason": f"一階保本鎖利 (曾獲利+{self.highest_profit:.0f}點, 鎖定+{self.config.breakeven_lock_pts:.0f}點)"
-                    }
-                    self.trades.append(trade_record)
-                    self.position = 0
-                    return {"action": "EXIT", "record": trade_record}
-
-                # (C) 初始固定停損 (含假突破反手 SAR)
-                if l <= (self.entry_price - self.config.stop_loss_pts):
-                    exit_p = self.entry_price - self.config.stop_loss_pts
-                    trade_record = {
-                        "entry_time": self.entry_time,
-                        "exit_time": ts,
-                        "action": "BUY",
-                        "entry_price": self.entry_price,
-                        "exit_price": exit_p,
-                        "pnl_pts": -self.config.stop_loss_pts,
-                        "reason": f"初始停損 (-{self.config.stop_loss_pts:.0f}點)"
-                    }
-                    self.trades.append(trade_record)
-                    # 檢查假突破反手做空 (SAR)
-                    if (self.config.enable_sar and 
-                        self.trade_count < 2 and 
-                        t_str <= self.config.sar_end_time and 
-                        c < vwap):
-                        self.position = -1
-                        self.entry_price = exit_p
-                        self.entry_time = ts
-                        self.trade_count += 1
-                        self.highest_profit = 0.0
-                        self._hp_before_bar_ts = None
-                        self._hp_before_bar_val = 0.0
-                        return {"action": "SAR_SELL", "record": trade_record}
-                    else:
-                        self.position = 0
-                        return {"action": "EXIT", "record": trade_record}
-
-            elif self.position == -1:
-                cur_profit = self.entry_price - l
-                if cur_profit > self.highest_profit:
-                    self.highest_profit = cur_profit
-
-                t15_trig = getattr(self.config, "tier1_5_trigger_pts", 110.0)
-                t15_lock = getattr(self.config, "tier1_5_lock_pts", 75.0)
-
-                # 同K棒高低點時序保護 (真實拉回才出場)：
-                # 若本根 K 棒為順勢破底黑 K (cur_profit > prev_hp 且 c < o)，代表高點 h 發生在破底 l 之前（開盤起跌點）。
-                # 除非本根 K 棒開始前的 prev_hp 已經能讓 h 觸發鎖利/停損，否則新跨過門檻的鎖利判定以當前價格 c 為準。
-                pullback_h = h
-                if cur_profit > prev_hp and c < o:
-                    already_trig = (
-                        (prev_hp >= self.config.trailing_activation_pts and h >= (self.entry_price - prev_hp + self.config.trailing_distance_pts)) or
-                        (prev_hp >= self.config.tier2_trigger_pts and h >= (self.entry_price - self.config.tier2_lock_pts)) or
-                        (prev_hp >= t15_trig and h >= (self.entry_price - t15_lock)) or
-                        (prev_hp >= self.config.breakeven_trigger_pts and h >= (self.entry_price - self.config.breakeven_lock_pts))
-                    )
-                    if not already_trig:
-                        pullback_h = c
-
-                # (A) 三階：大波段移動停利 (+400點啟動)
-                if (self.highest_profit >= self.config.trailing_activation_pts and 
-                    pullback_h >= (self.entry_price - self.highest_profit + self.config.trailing_distance_pts)):
-                    exit_p = self.entry_price - self.highest_profit + self.config.trailing_distance_pts
-                    pnl_pts = self.entry_price - exit_p
-                    trade_record = {
-                        "entry_time": self.entry_time,
-                        "exit_time": ts,
-                        "action": "SELL",
-                        "entry_price": self.entry_price,
-                        "exit_price": exit_p,
-                        "pnl_pts": pnl_pts,
-                        "reason": f"三階波段移動停利 (極值+{self.highest_profit:.0f}點)"
-                    }
-                    self.trades.append(trade_record)
-                    self.position = 0
-                    return {"action": "EXIT", "record": trade_record}
-
-                # (B) 二階：中波段鎖利 (獲利曾達 +200 點，拉回時鎖住 +120 點)
-                if (self.highest_profit >= self.config.tier2_trigger_pts and 
-                    pullback_h >= (self.entry_price - self.config.tier2_lock_pts)):
-                    exit_p = self.entry_price - self.config.tier2_lock_pts
-                    trade_record = {
-                        "entry_time": self.entry_time,
-                        "exit_time": ts,
-                        "action": "SELL",
-                        "entry_price": self.entry_price,
-                        "exit_price": exit_p,
-                        "pnl_pts": self.config.tier2_lock_pts,
-                        "reason": f"二階波段鎖利 (曾獲利+{self.highest_profit:.0f}點, 鎖定+{self.config.tier2_lock_pts:.0f}點)"
-                    }
-                    self.trades.append(trade_record)
-                    self.position = 0
-                    return {"action": "EXIT", "record": trade_record}
-
-                # (B2) 1.5階：中階鎖利 (獲利曾達 +110 點，拉回時鎖住 +75 點，補齊 80~200 點真空區)
-                if (self.highest_profit >= t15_trig and 
-                    pullback_h >= (self.entry_price - t15_lock)):
-                    exit_p = self.entry_price - t15_lock
-                    trade_record = {
-                        "entry_time": self.entry_time,
-                        "exit_time": ts,
-                        "action": "SELL",
-                        "entry_price": self.entry_price,
-                        "exit_price": exit_p,
-                        "pnl_pts": t15_lock,
-                        "reason": f"中階保本鎖利 (曾獲利+{self.highest_profit:.0f}點, 鎖定+{t15_lock:.0f}點)"
-                    }
-                    self.trades.append(trade_record)
-                    self.position = 0
-                    return {"action": "EXIT", "record": trade_record}
-
-                # (C) 一階：保本鎖利機制 (獲利曾達 +80 點，拉回時鎖住 +30 點)
-                if (self.highest_profit >= self.config.breakeven_trigger_pts and 
-                    pullback_h >= (self.entry_price - self.config.breakeven_lock_pts)):
-                    exit_p = self.entry_price - self.config.breakeven_lock_pts
-                    trade_record = {
-                        "entry_time": self.entry_time,
-                        "exit_time": ts,
-                        "action": "SELL",
-                        "entry_price": self.entry_price,
-                        "exit_price": exit_p,
-                        "pnl_pts": self.config.breakeven_lock_pts,
-                        "reason": f"一階保本鎖利 (曾獲利+{self.highest_profit:.0f}點, 鎖定+{self.config.breakeven_lock_pts:.0f}點)"
-                    }
-                    self.trades.append(trade_record)
-                    self.position = 0
-                    return {"action": "EXIT", "record": trade_record}
-
-                # (C) 初始固定停損 (含假跌破反手 SAR)
-                if h >= (self.entry_price + self.config.stop_loss_pts):
-                    exit_p = self.entry_price + self.config.stop_loss_pts
-                    trade_record = {
-                        "entry_time": self.entry_time,
-                        "exit_time": ts,
-                        "action": "SELL",
-                        "entry_price": self.entry_price,
-                        "exit_price": exit_p,
-                        "pnl_pts": -self.config.stop_loss_pts,
-                        "reason": f"初始停損 (-{self.config.stop_loss_pts:.0f}點)"
-                    }
-                    self.trades.append(trade_record)
-                    # 檢查假跌破反手做多 (SAR)
-                    if (self.config.enable_sar and 
-                        self.trade_count < 2 and 
-                        t_str <= self.config.sar_end_time and 
-                        c > vwap):
-                        self.position = 1
-                        self.entry_price = exit_p
-                        self.entry_time = ts
-                        self.trade_count += 1
-                        self.highest_profit = 0.0
-                        self._hp_before_bar_ts = None
-                        self._hp_before_bar_val = 0.0
-                        return {"action": "SAR_BUY", "record": trade_record}
-                    else:
-                        self.position = 0
-                        return {"action": "EXIT", "record": trade_record}
+            res = self._evaluate_open_position(ts, o, h, l, c, vwap, t_str)
+            if res is not None:
+                return res
 
         # 3A. 09:01 ~ 09:15 早盤強勢爆發突破進場 (方案 B 精準改良版：空間未過度耗盡 + 蓄勢二次突破位置濾網)
-        if (getattr(self.config, "enable_early_super_breakout", True) and
+        if (getattr(cfg, "enable_early_super_breakout", True) and
             self.position == 0 and
             self.pre_orb_high is not None and
-            self.trade_count < self.config.max_initial_trades and
-            "09:01:00" <= t_str <= self.config.orb_end_time):
+            self.trade_count < cfg.max_initial_trades and
+            "09:01:00" <= t_str <= cfg.orb_end_time):
 
-            long_filter = (not self.config.use_vwap_ema_filter) or (c > vwap and ema9 > ema21)
-            short_filter = (not self.config.use_vwap_ema_filter) or (c < vwap and ema9 < ema21)
-            sb = self.config.early_super_breakout_pts
+            long_filter = (not cfg.use_vwap_ema_filter) or (c > vwap and ema9 > ema21)
+            short_filter = (not cfg.use_vwap_ema_filter) or (c < vwap and ema9 < ema21)
+            sb = cfg.early_super_breakout_pts
 
-            # 方案 B 位置與動能保護濾網 (當 09:15 ORB 已鎖定時生效):
-            # 1. 空間未過度耗盡: orb_range <= max_orb_range * 1.25 (過濾如 10/30, 11/05 已狂瀉 500~840 點之地板衰竭追空)
-            # 2. 蓄勢位置確認: 緊貼 ORB 突破邊緣 (<= max_chase)，且當根非急拉/急殺極值棒 (h < orb_high / l > orb_low)，且 K 棒實體順勢
             pos_long_ok = True
             pos_short_ok = True
             if self.orb_calculated and self.orb_high is not None and self.orb_low is not None:
                 orb_range_3a = self.orb_high - self.orb_low
-                max_orb_3a = getattr(self.config, "max_orb_range_pts", 320.0)
-                max_ratio_3a = getattr(self.config, "early_breakout_max_range_ratio", 1.25)
-                max_chase_3a = getattr(self.config, "max_breakout_chase_pts", 60.0)
+                max_orb_3a = getattr(cfg, "max_orb_range_pts", 320.0)
+                max_ratio_3a = getattr(cfg, "early_breakout_max_range_ratio", 1.25)
+                max_chase_3a = getattr(cfg, "max_breakout_chase_pts", 60.0)
                 range_ok = (orb_range_3a <= max_orb_3a * max_ratio_3a)
                 pos_long_ok = range_ok and ((self.orb_high - c) <= max_chase_3a) and (h < self.orb_high) and (c > o)
                 pos_short_ok = range_ok and ((c - self.orb_low) <= max_chase_3a) and (l > self.orb_low) and (c < o)
 
             if c >= (self.pre_orb_high + sb) and long_filter and pos_long_ok:
-                self.position = 1
-                self.entry_price = c
-                self.entry_time = ts
-                self.trade_count += 1
-                self.highest_profit = 0.0
-                return {
-                    "action": "BUY",
-                    "price": c,
-                    "time": ts,
-                    "detail": f"早盤強勢蓄勢突破 ({self.pre_orb_high}+{sb:.0f}點) + 位置/VWAP/EMA 多頭確認"
-                }
+                return self._enter_position(
+                    1, c, ts,
+                    f"早盤強勢蓄勢突破 ({self.pre_orb_high}+{sb:.0f}點) + 位置/VWAP/EMA 多頭確認"
+                )
             elif c <= (self.pre_orb_low - sb) and short_filter and pos_short_ok:
-                self.position = -1
-                self.entry_price = c
-                self.entry_time = ts
-                self.trade_count += 1
-                self.highest_profit = 0.0
-                return {
-                    "action": "SELL",
-                    "price": c,
-                    "time": ts,
-                    "detail": f"早盤強勢蓄勢跳水 ({self.pre_orb_low}-{sb:.0f}點) + 位置/VWAP/EMA 空頭確認"
-                }
+                return self._enter_position(
+                    -1, c, ts,
+                    f"早盤強勢蓄勢跳水 ({self.pre_orb_low}-{sb:.0f}點) + 位置/VWAP/EMA 空頭確認"
+                )
 
         # 3B. 09:16 ~ 11:30 標準現貨開盤區間突破 + ORB 寬度空間保護 + VWAP & EMA 延遲共振進場
         orb_range = (self.orb_high - self.orb_low) if self.orb_calculated else 0.0
-        max_orb_range = getattr(self.config, "max_orb_range_pts", 320.0)
-        max_chase = getattr(self.config, "max_breakout_chase_pts", 60.0)
+        max_orb_range = getattr(cfg, "max_orb_range_pts", 320.0)
+        max_chase = getattr(cfg, "max_breakout_chase_pts", 60.0)
 
-        if (self.position == 0 and 
-            self.orb_calculated and 
+        if (self.position == 0 and
+            self.orb_calculated and
             orb_range <= max_orb_range and
-            self.trade_count < self.config.max_initial_trades and
-            self.config.entry_start_time <= t_str <= self.config.entry_end_time):
+            self.trade_count < cfg.max_initial_trades and
+            cfg.entry_start_time <= t_str <= cfg.entry_end_time):
 
-            long_filter = (not self.config.use_vwap_ema_filter) or (c > vwap and ema9 > ema21)
-            short_filter = (not self.config.use_vwap_ema_filter) or (c < vwap and ema9 < ema21)
+            long_filter = (not cfg.use_vwap_ema_filter) or (c > vwap and ema9 > ema21)
+            short_filter = (not cfg.use_vwap_ema_filter) or (c < vwap and ema9 < ema21)
 
-            # 計算進場門檻 (含夜盤防撞牆保護 Wall Filter)
             buy_threshold = self.orb_high
             sell_threshold = self.orb_low
             wall_filter_active_long = False
             wall_filter_active_short = False
 
-            if getattr(self.config, "use_overnight_wall_filter", False):
-                thresh_pts = getattr(self.config, "overnight_wall_threshold_pts", 40.0)
-                # 做多防撞牆：若 ORB 上界在夜高下方且距離 <= 門檻點數，需突破夜高才進場
-                if (self.overnight_high is not None and 
-                    self.orb_high < self.overnight_high and 
+            if getattr(cfg, "use_overnight_wall_filter", False):
+                thresh_pts = getattr(cfg, "overnight_wall_threshold_pts", 40.0)
+                if (self.overnight_high is not None and
+                    self.orb_high < self.overnight_high and
                     (self.overnight_high - self.orb_high) <= thresh_pts):
                     buy_threshold = self.overnight_high
                     wall_filter_active_long = True
 
-                # 做空防撞地：若 ORB 下界在夜檔上方且距離 <= 門檻點數，需跌破夜低才進場
-                if (self.overnight_low is not None and 
-                    self.orb_low > self.overnight_low and 
+                if (self.overnight_low is not None and
+                    self.orb_low > self.overnight_low and
                     (self.orb_low - self.overnight_low) <= thresh_pts):
                     sell_threshold = self.overnight_low
                     wall_filter_active_short = True
 
-            can_buy = (buy_threshold < c <= (buy_threshold + max_chase)) and long_filter
-            can_sell = ((sell_threshold - max_chase) <= c < sell_threshold) and short_filter
+            if (buy_threshold < c <= (buy_threshold + max_chase)) and long_filter:
+                detail_str = (
+                    f"突破夜高防撞牆 ({self.overnight_high:.0f}，原ORB上界{self.orb_high:.0f})"
+                    if wall_filter_active_long
+                    else f"突破現貨開盤高點 ({self.orb_high:.0f})"
+                )
+                return self._enter_position(1, c, ts, f"{detail_str} + VWAP/EMA 多頭確認")
 
-            if can_buy:
-                self.position = 1
-                self.entry_price = c
-                self.entry_time = ts
-                self.trade_count += 1
-                self.highest_profit = 0.0
-                detail_str = f"突破現貨開盤高點 ({self.orb_high:.0f})"
-                if wall_filter_active_long:
-                    detail_str = f"突破夜高防撞牆 ({self.overnight_high:.0f}，原ORB上界{self.orb_high:.0f})"
-                return {
-                    "action": "BUY", 
-                    "price": c, 
-                    "time": ts,
-                    "detail": f"{detail_str} + VWAP/EMA 多頭確認"
-                }
+            elif ((sell_threshold - max_chase) <= c < sell_threshold) and short_filter:
+                detail_str = (
+                    f"跌破夜低防撞牆 ({self.overnight_low:.0f}，原ORB下界{self.orb_low:.0f})"
+                    if wall_filter_active_short
+                    else f"跌破現貨開盤低點 ({self.orb_low:.0f})"
+                )
+                return self._enter_position(-1, c, ts, f"{detail_str} + VWAP/EMA 空頭確認")
 
-            elif can_sell:
-                self.position = -1
-                self.entry_price = c
-                self.entry_time = ts
-                self.trade_count += 1
-                self.highest_profit = 0.0
-                detail_str = f"跌破現貨開盤低點 ({self.orb_low:.0f})"
-                if wall_filter_active_short:
-                    detail_str = f"跌破夜低防撞牆 ({self.overnight_low:.0f}，原ORB下界{self.orb_low:.0f})"
-                return {
-                    "action": "SELL", 
-                    "price": c, 
-                    "time": ts,
-                    "detail": f"{detail_str} + VWAP/EMA 空頭確認"
-                }
-
-        return action_result
+        return {"action": "HOLD", "detail": ""}

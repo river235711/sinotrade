@@ -17,7 +17,7 @@ import signal
 import datetime
 import logging
 import threading
-from typing import Optional
+from typing import Any, Optional
 
 import pandas as pd
 from config import InstrumentConfig, ORBStrategyConfig, ShioajiConfig
@@ -39,14 +39,16 @@ from live.execution import (
 from live.market_data import (
     resolve_tmf_contract,
     normalize_shioaji_kbars,
-    fetch_cnyes_history,
     fetch_cnyes_day_kbars,
     is_today_day_session_snapshot,
-    save_overnight_level_to_csv,
     load_or_fetch_overnight_levels,
     max_trades_for_config,
     build_0915_orb_report,
 )
+
+_UNSET = object()
+_ALPHA_EMA9 = 2.0 / (9.0 + 1.0)
+_ALPHA_EMA21 = 2.0 / (21.0 + 1.0)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger("ShioajiTrader")
@@ -260,17 +262,21 @@ class ShioajiTMFTrader:
             logger.error(f"獲取合約失敗: {e}")
             return None
 
+    def _is_in_day_session_window(self, now: datetime.datetime) -> bool:
+        """判斷目前是否處於週一至週五非休市之日盤連線檢查時段 (08:30:00 ~ 13:45:00)"""
+        now_str = now.strftime("%H:%M:%S")
+        return (now.weekday() < 5) and ("08:30:00" <= now_str <= "13:45:00") and not getattr(self, "_holiday_detected", False)
+
     def reconnect(self) -> bool:
         """盤中斷線自動重連機制 (含 15 秒冷卻保護，非交易時段且零部位時不重連)"""
         now = datetime.datetime.now()
-        now_str = now.strftime("%H:%M:%S")
-        is_trading_window = (now.weekday() < 5) and ("08:30:00" <= now_str <= "13:45:00") and not getattr(self, "_holiday_detected", False)
+        is_trading_window = self._is_in_day_session_window(now)
         strat = getattr(self, "_active_strategy", None)
         has_pos = (strat is not None and strat.position != 0) or getattr(self, "pending_flatten", False)
 
         # 非開盤交易時段且無持倉時，拒絕夜間不必要的重登報警
         if not is_trading_window and not has_pos:
-            logger.debug(f"目前為非交易時段 ({now_str}) 且無部位，略過自動重連。")
+            logger.debug(f"目前為非交易時段 ({now.strftime('%H:%M:%S')}) 且無部位，略過自動重連。")
             return False
 
         if time.time() - self._last_reconnect_time < 15.0:
@@ -320,11 +326,7 @@ class ShioajiTMFTrader:
 
     def keep_alive_heartbeat(self):
         """主動向券商主機發送輕量保活查詢 (Ping)，維持 TCP Session 熱連線，防閒置逾時 (僅在盤中在線時運作)"""
-        if self.api is None or self.simulation or getattr(self, "_holiday_detected", False):
-            return
-        now = datetime.datetime.now()
-        now_str = now.strftime("%H:%M:%S")
-        if not ((now.weekday() < 5) and ("08:30:00" <= now_str <= "13:45:00")):
+        if self.api is None or self.simulation or not self._is_in_day_session_window(datetime.datetime.now()):
             return
         try:
             acc = getattr(self.api, "futopt_account", None)
@@ -444,6 +446,25 @@ class ShioajiTMFTrader:
         }
         return self.state_manager.save_state(strategy, entries_halted=self.entries_halted, custom_fields=custom)
 
+    def _reset_flat_state(
+        self,
+        strategy: ORBStrategy,
+        clear_sar: bool = True,
+        clear_pending_flatten: bool = False,
+        save: bool = True,
+    ):
+        """統一歸零策略空手與反手暫存狀態，避免多處重複重設與漏存檔"""
+        if clear_pending_flatten:
+            self.pending_flatten = False
+        strategy.position = 0
+        strategy.highest_profit = 0.0
+        strategy._hp_before_bar_val = 0.0
+        strategy.entry_time = None
+        if clear_sar:
+            self._intrabar_sar_state = None
+        if save:
+            self._save_state(strategy)
+
     def _load_state(self) -> Optional[dict]:
         """讀取當日策略狀態檔 logs/state_YYYYMMDD.json (委由 StateManager 管理)"""
         return self.state_manager.load_state()
@@ -538,10 +559,8 @@ class ShioajiTMFTrader:
             self.state_manager.restore_strategy_state(strategy, saved_state)
             if was_pos:
                 logger.warning("⚠️ 本地紀錄原為持倉，但券商帳上已無部位 (可能已由手機App手動平倉或由券商停損)，策略拉回空手。")
-        strategy.position = 0
-        strategy.highest_profit = 0.0
         strategy._hp_before_bar_val = 0.0
-        strategy.entry_time = None
+        self._reset_flat_state(strategy, clear_sar=False, save=False)
 
         if saved_state and (strategy.trade_count >= max_trades or saved_state.get("entries_halted", False)):
             reason = (
@@ -628,11 +647,8 @@ class ShioajiTMFTrader:
                 self.order_failures = 0
                 return
             # 開倉單或 SAR 反手單未完全成交，帳上已成 0 口：策略退回空手並同步清除同分 SAR 狀態
-            strategy.position = 0
-            strategy.highest_profit = 0.0
-            strategy.entry_time = None
             strategy.trade_count = max(0, strategy.trade_count - 1)
-            self._intrabar_sar_state = None
+            self._reset_flat_state(strategy, save=False)
             self.order_failures += 1
             if is_sar and result.filled_qty > 0:
                 alert = (
@@ -656,10 +672,7 @@ class ShioajiTMFTrader:
             self.pending_flatten = True
             strategy.position = 1 if real > 0 else -1
         else:
-            self.pending_flatten = False
-            strategy.position = 0
-            strategy.highest_profit = 0.0
-            strategy.entry_time = None
+            self._reset_flat_state(strategy, clear_pending_flatten=True, save=False)
         self._halt_entries("成交結果與預期不符")
         self.notifier.send(
             f"🚨 [部位對帳異常] {act} 後帳上為 {real:+d} 口 (預期 {expected:+d} 口)，已介入安全平倉與停開新倉，請確認帳務。"
@@ -676,17 +689,15 @@ class ShioajiTMFTrader:
             return
         logger.warning(f"⚠️ 定期對帳發現不一致: 帳上 {real:+d} 口，策略預期 {expected:+d} 口（可能有手動操作）")
         if real == 0:
-            strategy.position = 0
-            strategy.highest_profit = 0.0
-            self.pending_flatten = False
+            self._reset_flat_state(strategy, clear_sar=False, clear_pending_flatten=True, save=False)
         elif strategy.position != 0:
             strategy.position = 1 if real > 0 else -1
         self._halt_entries("帳上部位與策略不一致，需人工確認")
         self._save_state(strategy)
 
-    def _force_flatten_all(self, strategy: ORBStrategy, cur_price: float = 0.0) -> bool:
+    def _force_flatten_all(self, strategy: ORBStrategy, cur_price: float = 0.0, real_pos=_UNSET) -> bool:
         """強制平倉：以帳上真實部位為準，查不到才退回用策略部位；委託未確認成交時絕不誤清本地部位"""
-        real = self.get_real_position()
+        real = self.get_real_position() if real_pos is _UNSET else real_pos
         if real is None:
             if strategy.position == 0 and not self.pending_flatten:
                 return True
@@ -715,20 +726,16 @@ class ShioajiTMFTrader:
                 self._save_state(strategy)
                 return False
             self.pending_flatten = False
-        strategy.position = 0
-        strategy.highest_profit = 0.0
-        strategy.entry_time = None
-        self._intrabar_sar_state = None
-        self._save_state(strategy)
+        self._reset_flat_state(strategy, save=True)
         return True
 
-    def _relentless_flatten_step(self, strategy: ORBStrategy) -> bool:
+    def _relentless_flatten_step(self, strategy: ORBStrategy, real_pos=_UNSET) -> bool:
         """
         不死鳥追平單步執行：
         當盤中平倉未果 (pending_flatten=True) 或已過收盤時間仍有殘留部位時，
         不需等待下一根 1 分 K，每隔 1~2 秒自動檢測連線並以 MKT+IOC 持續追殺直到帳上歸零 (0 口)。
         """
-        real = self.get_real_position()
+        real = self.get_real_position() if real_pos is _UNSET else real_pos
         if real is None:
             if self.api is not None and not self.simulation:
                 self.reconnect()
@@ -739,11 +746,7 @@ class ShioajiTMFTrader:
         if real == 0:
             if self.pending_flatten or strategy.position != 0:
                 logger.info("🦅 [不死鳥追平完成] 確認券商帳上部位已歸零 (0 口)！")
-                self.pending_flatten = False
-                strategy.position = 0
-                strategy.highest_profit = 0.0
-                self._intrabar_sar_state = None
-                self._save_state(strategy)
+                self._reset_flat_state(strategy, clear_pending_flatten=True, save=True)
             return True
 
         action = "SELL" if real > 0 else "BUY"
@@ -755,11 +758,7 @@ class ShioajiTMFTrader:
         after_real = self.get_real_position()
         if after_real == 0:
             logger.info("🦅 [不死鳥追平成功] 帳上殘留部位已全數清零 (0 口)！")
-            self.pending_flatten = False
-            strategy.position = 0
-            strategy.highest_profit = 0.0
-            self._intrabar_sar_state = None
-            self._save_state(strategy)
+            self._reset_flat_state(strategy, clear_pending_flatten=True, save=True)
             return True
         return False
 
@@ -778,12 +777,13 @@ class ShioajiTMFTrader:
 
         cmd = str(data.get("cmd", "")).lower().strip()
         if cmd in ("close", "close_and_halt", "flatten"):
-            had_pos = (strategy.position != 0) or bool(self.get_real_position()) or self.pending_flatten
+            real_pos = self.get_real_position()
+            had_pos = (strategy.position != 0) or bool(real_pos) or self.pending_flatten
             pnl_str = ""
             if strategy.position != 0 and strategy.entry_price > 0 and cur_price > 0:
                 pnl = (cur_price - strategy.entry_price) if strategy.position == 1 else (strategy.entry_price - cur_price)
                 pnl_str = f" @ {cur_price:.0f} (約 {pnl:+.0f}點)"
-            flattened = self._force_flatten_all(strategy, cur_price=cur_price)
+            flattened = self._force_flatten_all(strategy, cur_price=cur_price, real_pos=real_pos)
             if cmd == "close_and_halt":
                 self._halt_entries("收到手動平倉並停開新倉指令")
             if had_pos:
@@ -803,23 +803,6 @@ class ShioajiTMFTrader:
     # ------------------------------------------------------------------
     # K 棒與主迴圈
     # ------------------------------------------------------------------
-    def _fetch_cnyes_history(self, timeout: int = 5) -> pd.DataFrame:
-        """從 CNYES 公開行情介面抓取近月大台指期 1分K 資料 (使用跨平台 SSL 上下文)"""
-        return fetch_cnyes_history(timeout=timeout)
-
-    def _fetch_backup_intraday_kbars(self, today_str: str) -> pd.DataFrame:
-        """當永豐模擬環境 api.kbars 壅塞逾時時，自動從高速大台指期 1分K 備援通道回補今日已收盤 K 棒"""
-        try:
-            df = self._fetch_cnyes_history(timeout=4)
-            if df.empty:
-                return pd.DataFrame()
-            df = df.set_index("ts").sort_index()
-            day_df = df[df.index.strftime("%Y-%m-%d") == today_str].between_time("08:45", "13:44")
-            return day_df[["open", "high", "low", "close", "volume"]].copy()
-        except Exception as e:
-            logger.debug(f"備援 K 棒回補失敗: {e}")
-            return pd.DataFrame()
-
     @staticmethod
     def _is_today_day_session_snapshot(snap, today_str: str) -> bool:
         """
@@ -828,10 +811,13 @@ class ShioajiTMFTrader:
         """
         return is_today_day_session_snapshot(snap, today_str)
 
-    def fetch_today_day_kbars(self) -> pd.DataFrame:
-        """從 Shioaji 抓取今日日盤 (08:45 ~ 13:45) 1分K 資料 (委由 BarAggregator 管理即時 Tick 串流合成 + Snapshot 快照防逾時)"""
+    def sync_today_market_data(self) -> Optional[str]:
+        """
+        同步今日日盤即時行情至 BarAggregator（歷史 kbars / CNYES 備援 / Snapshot 防逾時補齊），
+        不主動重建 DataFrame，供 Tick 熱路徑零開銷讀取。回傳今日日期字串或 None。
+        """
         if self.api is None or self.contract is None:
-            return pd.DataFrame()
+            return None
         today_str = datetime.date.today().strftime("%Y-%m-%d")
 
         # 1. 若尚未載入早盤歷史 K 棒，先嘗試 Shioaji kbars (限時 5 秒避免卡死，並統一 -1 分鐘對齊起始時間戳)
@@ -847,7 +833,11 @@ class ShioajiTMFTrader:
 
         # 2. 若模擬環境 kbars 壅塞且尚未載入今日早盤歷史 K 棒，從備援通道一次性補齊
         if self.bar_aggregator.kbars_disabled and not self.bar_aggregator.history_loaded:
-            backup_df = self._fetch_backup_intraday_kbars(today_str)
+            try:
+                backup_df = fetch_cnyes_day_kbars(today_str, timeout=4)
+            except Exception as e:
+                logger.debug(f"備援 K 棒回補失敗: {e}")
+                backup_df = pd.DataFrame()
             if not backup_df.empty:
                 now_min = pd.Timestamp(datetime.datetime.now().replace(second=0, microsecond=0))
                 self.bar_aggregator.load_backup_bars(backup_df, now_min=now_min, source_tag="CNYES_TXF")
@@ -871,12 +861,19 @@ class ShioajiTMFTrader:
                 if any(k in err_str for k in ("authenticated", "session", "token", "disconnect", "connect")):
                     self.reconnect()
 
+        return today_str
+
+    def fetch_today_day_kbars(self) -> pd.DataFrame:
+        """從 Shioaji 抓取並導出今日日盤 (08:45 ~ 13:45) 1分K DataFrame"""
+        today_str = self.sync_today_market_data()
+        if today_str is None:
+            return pd.DataFrame()
         day_df = self.bar_aggregator.to_dataframe(today_str=today_str, start_time="08:45", end_time="13:45")
         if day_df.empty:
             return pd.DataFrame()
         return day_df[["open", "high", "low", "close", "volume"]]
 
-    def _handle_action(self, strategy: ORBStrategy, res: dict, ts: pd.Timestamp, bar: pd.Series, prev_pos: int):
+    def _handle_action(self, strategy: ORBStrategy, res: dict, ts: pd.Timestamp, bar: Any, prev_pos: int):
         """依策略動作送單、確認成交，並對帳"""
         act = res.get("action", "HOLD")
         if act == "HOLD":
@@ -892,25 +889,19 @@ class ShioajiTMFTrader:
                 close_action = "SELL" if prev_pos == 1 else "BUY"
                 sig_p = float(rec.get("exit_price", 0) or 0)
                 self._send_and_verify(close_action, q, octype="Cover", price=sig_p, signal_price=sig_p)
-            strategy.position = 0
-            strategy.highest_profit = 0.0
-            self._intrabar_sar_state = None
+            self._reset_flat_state(strategy, save=False)
             if act in ("BUY", "SELL"):
                 strategy.trade_count = max(0, strategy.trade_count - 1)
             self._post_trade_check(strategy, act, FillResult(True, q, 0.0, "Skipped"))
             return
 
-        if act == "BUY":
+        if act in ("BUY", "SELL"):
             sig_p = float(bar["close"])
-            msg = f"🟢 [訊號觸發] {ts.strftime('%H:%M')} 做多進場 @ {sig_p:.0f} ({res.get('detail')})"
+            tag = "🟢 [訊號觸發]" if act == "BUY" else "🔴 [訊號觸發]"
+            side_txt = "做多進場" if act == "BUY" else "做空進場"
+            msg = f"{tag} {ts.strftime('%H:%M')} {side_txt} @ {sig_p:.0f} ({res.get('detail')})"
             logger.info(msg)
-            result = self._send_and_verify("BUY", q, price=sig_p, signal_price=sig_p)
-            self.notifier.send(f"{msg}\n成交均價: {result.avg_price:.0f} ({result.status})")
-        elif act == "SELL":
-            sig_p = float(bar["close"])
-            msg = f"🔴 [訊號觸發] {ts.strftime('%H:%M')} 做空進場 @ {sig_p:.0f} ({res.get('detail')})"
-            logger.info(msg)
-            result = self._send_and_verify("SELL", q, price=sig_p, signal_price=sig_p)
+            result = self._send_and_verify(act, q, price=sig_p, signal_price=sig_p)
             self.notifier.send(f"{msg}\n成交均價: {result.avg_price:.0f} ({result.status})")
         elif act == "EXIT":
             strategy.position = 0
@@ -921,17 +912,16 @@ class ShioajiTMFTrader:
             logger.info(msg)
             result = self._send_and_verify(close_action, q, octype="Cover", price=sig_p, signal_price=sig_p)
             self.notifier.send(msg)
-        elif act == "SAR_SELL":
+        elif act in ("SAR_BUY", "SAR_SELL"):
+            order_side = "BUY" if act == "SAR_BUY" else "SELL"
             sig_p = float(rec.get("exit_price", 0) or 0)
-            msg = f"🔄 [假突破反手做空 SAR] {ts.strftime('%H:%M')} 多單停損並反手做空 @ {sig_p:.0f}"
+            msg = (
+                f"🔄 [假跌破反手做多 SAR] {ts.strftime('%H:%M')} 空單停損並反手做多 @ {sig_p:.0f}"
+                if act == "SAR_BUY"
+                else f"🔄 [假突破反手做空 SAR] {ts.strftime('%H:%M')} 多單停損並反手做空 @ {sig_p:.0f}"
+            )
             logger.info(msg)
-            result = self._send_and_verify("SELL", q * 2, price=sig_p, signal_price=sig_p)
-            self.notifier.send(msg)
-        elif act == "SAR_BUY":
-            sig_p = float(rec.get("exit_price", 0) or 0)
-            msg = f"🔄 [假跌破反手做多 SAR] {ts.strftime('%H:%M')} 空單停損並反手做多 @ {sig_p:.0f}"
-            logger.info(msg)
-            result = self._send_and_verify("BUY", q * 2, price=sig_p, signal_price=sig_p)
+            result = self._send_and_verify(order_side, q * 2, price=sig_p, signal_price=sig_p)
             self.notifier.send(msg)
         else:
             return
@@ -944,10 +934,6 @@ class ShioajiTMFTrader:
 
         self._post_trade_check(strategy, act, result)
         self._save_state(strategy)
-
-    def _save_overnight_level_to_csv(self, data_dir: str, target_date_str: str, night_bars: pd.DataFrame):
-        """將抓到的前一日夜盤極值自動寫入 overnight_levels_summary.csv 永久保存"""
-        save_overnight_level_to_csv(data_dir, target_date_str, night_bars)
 
     def load_overnight_levels_for_strategy(self, strategy: ORBStrategy, target_date_str: str):
         """讀取或查詢指定交易日所對應的前一日夜盤 (15:00~05:00) 極值並注入策略 (防撞牆保護 Wall Filter)"""
@@ -1020,34 +1006,47 @@ class ShioajiTMFTrader:
         kbars: pd.DataFrame,
         processed_timestamps: set,
     ):
-        """依序處理已收完的 1分K 與最新進行中 K 棒的即時停損/鎖利/SAR 檢查"""
-        completed_bars = kbars.iloc[:-1]
+        """依序處理已收完的 1分K (跳過已處理 K 棒避免無謂 Series 建構)"""
+        n_bars = len(kbars)
+        if n_bars <= 1:
+            return None
+        comp_len = n_bars - 1
+        times = kbars.index
         prev_bar = None
-        for ts, bar in completed_bars.iterrows():
-            if ts not in processed_timestamps:
-                self._finalize_orb_if_closed(strategy, kbars, ts)
-                processed_timestamps.add(ts)
-                if self._intrabar_sar_state is not None and self._intrabar_sar_state["ts"] == ts:
-                    if strategy.position != 0:
-                        eval_bar = self._build_post_sar_bar(bar, self._intrabar_sar_state)
-                        prev_pos = strategy.position
-                        res = strategy.execute_bar(ts, eval_bar, prev_bar)
-                        self._handle_action(strategy, res, ts, eval_bar, prev_pos)
-                    self._intrabar_sar_state = None
-                else:
+        for idx in range(comp_len):
+            ts = times[idx]
+            if ts in processed_timestamps:
+                continue
+            bar = kbars.iloc[idx]
+            prev_bar = kbars.iloc[idx - 1] if idx > 0 else None
+            self._finalize_orb_if_closed(strategy, kbars, ts)
+            processed_timestamps.add(ts)
+            if self._intrabar_sar_state is not None and self._intrabar_sar_state["ts"] == ts:
+                if strategy.position != 0:
+                    eval_bar = self._build_post_sar_bar(bar, self._intrabar_sar_state)
                     prev_pos = strategy.position
-                    res = strategy.execute_bar(ts, bar, prev_bar)
-                    self._handle_action(strategy, res, ts, bar, prev_pos)
-            prev_bar = bar
-        return prev_bar
+                    res = strategy.execute_bar(ts, eval_bar, prev_bar)
+                    self._handle_action(strategy, res, ts, eval_bar, prev_pos)
+                self._intrabar_sar_state = None
+            else:
+                prev_pos = strategy.position
+                res = strategy.execute_bar(ts, bar, prev_bar)
+                self._handle_action(strategy, res, ts, bar, prev_pos)
+        return kbars.iloc[comp_len - 1]
 
-    def _evaluate_intrabar_tick(
+    def _evaluate_intrabar_core(
         self,
         strategy: ORBStrategy,
         latest_ts: pd.Timestamp,
-        latest: pd.Series,
-        prev_bar,
+        o: float,
+        h: float,
+        l: float,
+        c: float,
+        vwap: float,
+        ema9: float,
+        ema21: float,
         processed_timestamps: set,
+        bar_obj: Any = None,
     ):
         """持倉期間對當前進行中 K 棒即時檢查停損、鎖利與反手 (SAR)，並隔離同分鐘反手前後高低價"""
         if self._intrabar_sar_state is not None and self._intrabar_sar_state["ts"] != latest_ts:
@@ -1057,25 +1056,87 @@ class ShioajiTMFTrader:
             return
 
         if self._intrabar_sar_state is not None and self._intrabar_sar_state["ts"] == latest_ts:
-            eval_bar = self._build_post_sar_bar(latest, self._intrabar_sar_state)
+            sar_state = self._intrabar_sar_state
+            eval_h = max(float(sar_state["high"]), c)
+            eval_l = min(float(sar_state["low"]), c)
+            sar_state["high"] = eval_h
+            sar_state["low"] = eval_l
+            sar_state["close"] = c
             prev_pos = strategy.position
-            intrabar_res = strategy.execute_bar(latest_ts, eval_bar, prev_bar)
+            intrabar_res = strategy.execute_values(latest_ts, o, eval_h, eval_l, c, vwap, ema9, ema21)
             if intrabar_res.get("action", "HOLD") != "HOLD":
                 processed_timestamps.add(latest_ts)
                 self._intrabar_sar_state = None
+                if bar_obj is not None and hasattr(bar_obj, "copy"):
+                    eval_bar = bar_obj.copy()
+                    eval_bar["high"] = eval_h
+                    eval_bar["low"] = eval_l
+                    eval_bar["close"] = c
+                else:
+                    eval_bar = {"open": o, "high": eval_h, "low": eval_l, "close": c, "vwap": vwap, "ema9": ema9, "ema21": ema21}
                 self._handle_action(strategy, intrabar_res, latest_ts, eval_bar, prev_pos)
             return
 
         prev_pos = strategy.position
-        intrabar_res = strategy.execute_bar(latest_ts, latest, prev_bar)
+        intrabar_res = strategy.execute_values(latest_ts, o, h, l, c, vwap, ema9, ema21)
         act = intrabar_res.get("action", "HOLD")
         if act != "HOLD":
-            self._handle_action(strategy, intrabar_res, latest_ts, latest, prev_pos)
+            act_bar = bar_obj if bar_obj is not None else {"open": o, "high": h, "low": l, "close": c, "vwap": vwap, "ema9": ema9, "ema21": ema21}
+            self._handle_action(strategy, intrabar_res, latest_ts, act_bar, prev_pos)
             if act in ("SAR_BUY", "SAR_SELL") and strategy.position != 0:
-                px = float(latest["close"])
-                self._intrabar_sar_state = {"ts": latest_ts, "high": px, "low": px, "close": px}
+                self._intrabar_sar_state = {"ts": latest_ts, "high": c, "low": c, "close": c}
             else:
                 processed_timestamps.add(latest_ts)
+
+    def _evaluate_intrabar_tick(
+        self,
+        strategy: ORBStrategy,
+        latest_ts: pd.Timestamp,
+        latest: pd.Series,
+        prev_bar,
+        processed_timestamps: set,
+    ):
+        """pd.Series 介面包裝，供測試與收盤重建時檢查最新進行中 K 棒"""
+        c = float(latest["close"])
+        self._evaluate_intrabar_core(
+            strategy,
+            latest_ts,
+            float(latest.get("open", c)),
+            float(latest["high"]),
+            float(latest["low"]),
+            c,
+            float(latest.get("vwap", c)),
+            float(latest.get("ema9", c)),
+            float(latest.get("ema21", c)),
+            processed_timestamps,
+            bar_obj=latest,
+        )
+
+    @staticmethod
+    def _compute_prefix_state(kbars: pd.DataFrame) -> tuple:
+        """從已計算指標的 K 棒 (len >= 2) 快取已收盤前綴統計量，供分鐘內 O(1) 標量更新"""
+        comp = kbars.iloc[:-1]
+        pv_sum = float((comp["close"] * comp["volume"]).sum())
+        vol_sum = float(comp["volume"].sum())
+        ema9_prev = float(comp["ema9"].iloc[-1])
+        ema21_prev = float(comp["ema21"].iloc[-1])
+        return pv_sum, vol_sum, ema9_prev, ema21_prev
+
+    @staticmethod
+    def _compute_latest_indicators(
+        pv_sum: float,
+        vol_sum: float,
+        ema9_prev: float,
+        ema21_prev: float,
+        close: float,
+        volume: float,
+    ) -> tuple:
+        """O(1) 純標量計算最新進行中 K 棒之 (vwap, ema9, ema21)，與 ORBStrategy.prepare_indicators 數學等價"""
+        tot_vol = vol_sum + volume
+        vwap = ((pv_sum + close * volume) / tot_vol) if tot_vol > 0 else close
+        ema9 = _ALPHA_EMA9 * close + (1.0 - _ALPHA_EMA9) * ema9_prev
+        ema21 = _ALPHA_EMA21 * close + (1.0 - _ALPHA_EMA21) * ema21_prev
+        return vwap, ema9, ema21
 
     def run_intraday_bot(self, strat_cfg: ORBStrategyConfig = None):
         """
@@ -1126,14 +1187,13 @@ class ShioajiTMFTrader:
         self.notifier.send(f"🤖 TMF 自動當沖機器人已啟動 ({today_str})\n口數: {self.quantity}口 | {describe(strat_cfg, atr_info)}")
 
         # 1. 抓取今日日盤 K 棒，計算指標與 ORB 區間 (若已過 09:15)
-        _last_prepared_ver = -1
-        _cached_kbars = pd.DataFrame()
+        _last_struct_sig = None
+        _prefix_state = None
         kbars = self.fetch_today_day_kbars()
         now_init_orb = datetime.datetime.now().strftime("%H:%M:%S")
         if not kbars.empty and len(kbars) >= 2:
             kbars = strategy.prepare_indicators(kbars)
-            _last_prepared_ver = self.bar_aggregator.version
-            _cached_kbars = kbars
+            _prefix_state = self._compute_prefix_state(kbars)
             if now_init_orb >= strat_cfg.orb_end_time:
                 orb_h, orb_l = strategy.calculate_orb_levels(kbars)
                 self._orb_finalized = any(
@@ -1174,8 +1234,8 @@ class ShioajiTMFTrader:
                     self.bar_aggregator.clear()
                     self._intrabar_sar_state = None
                     self._orb_finalized = False
-                    _last_prepared_ver = -1
-                    _cached_kbars = pd.DataFrame()
+                    _last_struct_sig = None
+                    _prefix_state = None
                     processed_timestamps.clear()
                     self.entries_halted = False
                     self.pending_flatten = False
@@ -1230,7 +1290,8 @@ class ShioajiTMFTrader:
                         final_pos = self.get_real_position()
                     if final_pos or self.pending_flatten:
                         logger.critical(f"🚨 [收盤後不死鳥追平] 已過 {shutdown_time} 帳上仍有殘留部位 ({final_pos})，拒絕進入待機，每 2 秒持續以 MKT+IOC 強制追平直到 0 口！")
-                        self._relentless_flatten_step(strategy)
+                        real_hint = _UNSET if final_pos is None else final_pos
+                        self._relentless_flatten_step(strategy, real_pos=real_hint)
                         self._wake_event.clear()
                         self._wake_event.wait(timeout=2.0)
                         continue
@@ -1344,27 +1405,17 @@ class ShioajiTMFTrader:
                     self._save_state(strategy)
                     last_state_save = time.time()
 
-                kbars = self.fetch_today_day_kbars()
-                cur_quote = float(kbars.iloc[-1]["close"]) if not kbars.empty else 0.0
+                today_sync_str = self.sync_today_market_data()
+                snap = (
+                    self.bar_aggregator.get_latest_bar_state(today_sync_str, start_time="08:45", end_time="13:45")
+                    if today_sync_str is not None
+                    else None
+                )
+                cur_quote = snap[7] if snap is not None else 0.0
                 self._check_external_command(strategy, cur_price=cur_quote)
-                if not kbars.empty and len(kbars) >= 2:
+                if snap is not None and snap[2] >= 2:
                     holiday_empty_since = 0.0
-                    # 準備 VWAP 與 EMA9/EMA21 指標 (若 K 棒版號未變動則直接使用快取，省去每秒重算全表)
-                    cur_ver = self.bar_aggregator.version
-                    if cur_ver > 0 and cur_ver == _last_prepared_ver and not _cached_kbars.empty:
-                        kbars = _cached_kbars
-                    else:
-                        kbars = strategy.prepare_indicators(kbars)
-                        _last_prepared_ver = cur_ver
-                        _cached_kbars = kbars
-
-                    # 09:15 後計算並鎖定今日 ORB 上下界（延後至本輪已收完 K 棒處理後再發送完整 09:15 結論）
-                    just_locked_orb = False
-                    if now_str >= strat_cfg.orb_end_time and not strategy.orb_calculated:
-                        orb_h, orb_l = strategy.calculate_orb_levels(kbars)
-                        if orb_h and orb_l:
-                            just_locked_orb = True
-                            logger.info(f"📌 今日現貨開盤區間 ({strat_cfg.orb_start_time}~{strat_cfg.orb_end_time}) 已鎖定: 上界={orb_h:.0f}, 下界={orb_l:.0f} (振幅={orb_h-orb_l:.0f}點)")
+                    struct_sig, _, _, latest_ts, l_o, l_h, l_l, l_c, l_v = snap
 
                     # 11:30 首次進場截止通知
                     if now_str >= "11:30:00" and not getattr(self, "_noon_cutoff_sent", False):
@@ -1377,19 +1428,60 @@ class ShioajiTMFTrader:
                             f"• 今日累計交易: {strategy.trade_count} 次"
                         )
 
-                    # (A) 逐根處理已收完的 K 棒 (換分 0.2~1 秒內立即確認突破進場)
-                    prev_bar = self._evaluate_completed_and_intrabar(strategy, kbars, processed_timestamps)
+                    need_full_bar_eval = (
+                        struct_sig != _last_struct_sig
+                        or _prefix_state is None
+                        or (now_str >= strat_cfg.orb_end_time and not strategy.orb_calculated)
+                    )
 
-                    # 若本輪剛鎖定 09:15 ORB，於已收完 K 棒 (含 09:14 早盤強勢突破) 處理完畢後立即播報進場結論與停損/各階停利點
-                    if just_locked_orb:
-                        _, orb_report_msg = build_0915_orb_report(strategy, entries_halted=self.entries_halted)
-                        logger.info("\n" + orb_report_msg)
-                        self.notifier.send(orb_report_msg)
+                    if need_full_bar_eval:
+                        # 僅於新分鐘切換、歷史補齊或尚未鎖定 09:15 ORB 時，建表重算全表指標並推進已收盤 K 棒
+                        kbars = self.bar_aggregator.to_dataframe(today_str=today_sync_str, start_time="08:45", end_time="13:45")
+                        kbars = strategy.prepare_indicators(kbars)
+                        _last_struct_sig = struct_sig
+                        _prefix_state = self._compute_prefix_state(kbars)
 
-                    # (B) 持倉期間：不等待 1 分 K 收完，對當前最新 Tick K 棒即時檢查停損、保本鎖利與反手 (SAR)
-                    latest_ts = kbars.index[-1]
-                    latest = kbars.iloc[-1]
-                    self._evaluate_intrabar_tick(strategy, latest_ts, latest, prev_bar, processed_timestamps)
+                        just_locked_orb = False
+                        if now_str >= strat_cfg.orb_end_time and not strategy.orb_calculated:
+                            orb_h, orb_l = strategy.calculate_orb_levels(kbars)
+                            if orb_h and orb_l:
+                                just_locked_orb = True
+                                logger.info(f"📌 今日現貨開盤區間 ({strat_cfg.orb_start_time}~{strat_cfg.orb_end_time}) 已鎖定: 上界={orb_h:.0f}, 下界={orb_l:.0f} (振幅={orb_h-orb_l:.0f}點)")
+
+                        # (A) 逐根處理已收完的 K 棒 (換分 0.2~1 秒內立即確認突破進場)
+                        prev_bar = self._evaluate_completed_and_intrabar(strategy, kbars, processed_timestamps)
+
+                        # 若本輪剛鎖定 09:15 ORB，於已收完 K 棒 (含 09:14 早盤強勢突破) 處理完畢後立即播報進場結論與停損/各階停利點
+                        if just_locked_orb:
+                            _, orb_report_msg = build_0915_orb_report(strategy, entries_halted=self.entries_halted)
+                            logger.info("\n" + orb_report_msg)
+                            self.notifier.send(orb_report_msg)
+
+                        # (B) 持倉期間：對當前最新進行中 K 棒即時檢查停損、保本鎖利與反手 (SAR)
+                        latest = kbars.iloc[-1]
+                        self._evaluate_intrabar_tick(strategy, latest_ts, latest, prev_bar, processed_timestamps)
+                        latest_close = float(latest["close"])
+                        latest_vwap = float(latest["vwap"])
+                    else:
+                        # 分鐘內極速熱路徑：O(1) 純標量算最新 VWAP/EMA，零 DataFrame 建表與 iterrows()
+                        pv_sum, vol_sum, ema9_prev, ema21_prev = _prefix_state
+                        latest_vwap, latest_ema9, latest_ema21 = self._compute_latest_indicators(
+                            pv_sum, vol_sum, ema9_prev, ema21_prev, l_c, l_v
+                        )
+                        latest_close = l_c
+                        if strategy.position != 0 and latest_ts not in processed_timestamps:
+                            self._evaluate_intrabar_core(
+                                strategy,
+                                latest_ts,
+                                l_o,
+                                l_h,
+                                l_l,
+                                l_c,
+                                latest_vwap,
+                                latest_ema9,
+                                latest_ema21,
+                                processed_timestamps,
+                            )
 
                     # (C) 每 3 秒印出最新即時狀態列
                     if time.time() - last_log_time >= 3.0:
@@ -1399,12 +1491,12 @@ class ShioajiTMFTrader:
                         if strategy.position == 0:
                             pos_str = f"無部位 (最高浮盈:{strategy.highest_profit:+.0f}點)"
                         else:
-                            cur_pnl = (latest['close'] - strategy.entry_price) if strategy.position == 1 else (strategy.entry_price - latest['close'])
+                            cur_pnl = (latest_close - strategy.entry_price) if strategy.position == 1 else (strategy.entry_price - latest_close)
                             dir_str = "🟢多單" if strategy.position == 1 else "🔴空單"
                             pos_str = f"{dir_str}@{strategy.entry_price:.0f} (損益:{cur_pnl:+.0f}點 / 最高:{strategy.highest_profit:+.0f}點)"
-                        logger.info(f"⏱️ [{now_str}] 報價:{latest['close']:.0f} | VWAP:{latest['vwap']:.0f} | {orb_info} | 狀態:{pos_str}{halt_info}")
+                        logger.info(f"⏱️ [{now_str}] 報價:{latest_close:.0f} | VWAP:{latest_vwap:.0f} | {orb_info} | 狀態:{pos_str}{halt_info}")
                 else:
-                    if kbars.empty and now_str >= "09:05:00" and strategy.position == 0 and not self.pending_flatten:
+                    if snap is None and now_str >= "09:05:00" and strategy.position == 0 and not self.pending_flatten:
                         if holiday_empty_since == 0.0:
                             holiday_empty_since = time.time()
                         elif time.time() - holiday_empty_since >= 30.0:

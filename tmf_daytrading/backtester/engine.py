@@ -154,28 +154,49 @@ class BacktestEngine:
         # 實盤機器人 (shioaji_trader.py) 在換分至 09:15:00 時 (09:14 K棒收完 + 09:15 開盤首Tick)，
         # 立即鎖定 ORB 並評估剛收完的 09:14 K 棒；接著在 09:16:00 換分時完成 09:00~09:15 完整 ORB 上下界。
         orb_high, orb_low = None, None
-        prev_bar = None
-        bars_list = list(self.kbars.iterrows())
-        for idx, (ts, bar) in enumerate(bars_list):
-            t_str = ts.strftime('%H:%M:%S')
-            wall_clock_str = (ts + pd.Timedelta(minutes=1)).strftime('%H:%M:%S')
-            if wall_clock_str >= eff_cfg.orb_end_time and not strategy.orb_calculated:
-                slice_df = self.kbars.loc[:ts].copy()
-                if idx + 1 < len(bars_list):
-                    next_ts, next_bar = bars_list[idx + 1]
-                    if next_ts.strftime('%H:%M:%S') == eff_cfg.orb_end_time:
-                        open_p = float(next_bar['open'])
-                        open_row = next_bar.copy()
+        times = self.kbars.index
+        n_bars = len(times)
+        opens = self.kbars['open'].to_numpy(dtype=float)
+        highs = self.kbars['high'].to_numpy(dtype=float)
+        lows = self.kbars['low'].to_numpy(dtype=float)
+        closes = self.kbars['close'].to_numpy(dtype=float)
+        vwaps = self.kbars['vwap'].to_numpy(dtype=float)
+        ema9s = self.kbars['ema9'].to_numpy(dtype=float)
+        ema21s = self.kbars['ema21'].to_numpy(dtype=float)
+        t_strs = times.strftime('%H:%M:%S').tolist()
+        orb_end_time = eff_cfg.orb_end_time
+        one_min = pd.Timedelta(minutes=1)
+
+        for idx in range(n_bars):
+            ts = times[idx]
+            t_str = t_strs[idx]
+            if not strategy.orb_calculated:
+                wall_clock_str = (ts + one_min).strftime('%H:%M:%S')
+                if wall_clock_str >= orb_end_time:
+                    slice_df = self.kbars.iloc[:idx + 1].copy()
+                    if idx + 1 < n_bars and t_strs[idx + 1] == orb_end_time:
+                        next_ts = times[idx + 1]
+                        open_p = float(opens[idx + 1])
+                        open_row = self.kbars.iloc[idx + 1].copy()
                         open_row['high'] = open_p
                         open_row['low'] = open_p
                         open_row['close'] = open_p
                         slice_df.loc[next_ts] = open_row
-                orb_high, orb_low = strategy.calculate_orb_levels(slice_df)
-            elif t_str == eff_cfg.orb_end_time:
-                orb_high, orb_low = strategy.calculate_orb_levels(self.kbars.loc[:ts])
+                    orb_high, orb_low = strategy.calculate_orb_levels(slice_df)
+            elif t_str == orb_end_time:
+                orb_high, orb_low = strategy.calculate_orb_levels(self.kbars.iloc[:idx + 1])
 
-            strategy.execute_bar(ts, bar, prev_bar)
-            prev_bar = bar
+            strategy.execute_values(
+                ts,
+                opens[idx],
+                highs[idx],
+                lows[idx],
+                closes[idx],
+                vwaps[idx],
+                ema9s[idx],
+                ema21s[idx],
+                t_str=t_str,
+            )
 
         # 若資料未達 orb_end_time，補算以防 orb_high/low 為 None
         if not strategy.orb_calculated:
@@ -203,11 +224,15 @@ class BacktestEngine:
         times = kbars.index
         ax1.plot(times, kbars['close'], color='#2c3e50', linewidth=1.2, label='TMF Close Price')
         
-        # 標示 ORB 高低點區間
+        # 標示 ORB 高低點區間 (09:00 ~ 09:15)
         if orb_high is not None and orb_low is not None:
             ax1.axhline(orb_high, color='#e74c3c', linestyle='--', linewidth=1.2, label=f'ORB High ({orb_high:.0f})')
             ax1.axhline(orb_low, color='#27ae60', linestyle='--', linewidth=1.2, label=f'ORB Low ({orb_low:.0f})')
-            ax1.axvspan(times[0], times[min(15, len(times)-1)], color='#f39c12', alpha=0.15, label='ORB Window (08:45-09:00)')
+            t_strs = times.strftime('%H:%M:%S')
+            orb_span = times[(t_strs >= '09:00:00') & (t_strs <= '09:15:00')]
+            span_start = orb_span[0] if len(orb_span) > 0 else times[0]
+            span_end = orb_span[-1] if len(orb_span) > 0 else times[min(15, len(times)-1)]
+            ax1.axvspan(span_start, span_end, color='#f39c12', alpha=0.15, label='ORB Window (09:00-09:15)')
 
         # 標記進出場點
         if not trades_df.empty:
@@ -239,7 +264,8 @@ class BacktestEngine:
                     bbox=dict(boxstyle="round,pad=0.2", fc="white", ec=exit_color, alpha=0.9)
                 )
 
-        ax1.set_title(f"TMF Micro Taiwan Index Day Trading - ORB Strategy Backtest (2026-10-30)", fontsize=14, fontweight='bold', pad=12)
+        plot_date = self.target_date_fmt or (times[0].strftime('%Y-%m-%d') if len(times) > 0 else '')
+        ax1.set_title(f"TMF Micro Taiwan Index Day Trading - ORB Strategy Backtest ({plot_date})", fontsize=14, fontweight='bold', pad=12)
         ax1.set_ylabel("Price (Points)", fontsize=11)
         ax1.legend(loc='upper right', frameon=True)
         ax1.grid(True, linestyle=':', alpha=0.6)

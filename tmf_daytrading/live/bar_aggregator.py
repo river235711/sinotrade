@@ -9,6 +9,7 @@ K 棒合成器模組 (Bar Aggregator)
 """
 
 import time
+import bisect
 import datetime
 import logging
 import threading
@@ -31,12 +32,42 @@ class BarAggregator:
         self.last_tick_time: float = 0.0
         self.last_snap_time: float = 0.0
         self.version: int = 0
+        self.structure_version: int = 0
         self._cached_df: Optional[pd.DataFrame] = None
         self._cached_key: Optional[tuple] = None
+        self._sorted_keys: Optional[list] = None
+        self._sorted_keys_ref: Optional[dict] = None
+        self._window_bounds_cache: Dict[tuple, tuple] = {}
 
-    def _bump_version(self) -> None:
+    def _bump_version(self, structural: bool = False) -> None:
         self.version += 1
         self._cached_df = None
+        if structural:
+            self.structure_version += 1
+            self._sorted_keys = None
+            self._sorted_keys_ref = None
+
+    def _get_sorted_keys(self) -> list:
+        """取得已排序 K 棒時間戳清單 (僅在結構變動或外部直接修改 _bars 時重排)"""
+        if (
+            self._sorted_keys is None
+            or self._sorted_keys_ref is not self._bars
+            or len(self._sorted_keys) != len(self._bars)
+        ):
+            self._sorted_keys = sorted(self._bars.keys())
+            self._sorted_keys_ref = self._bars
+        return self._sorted_keys
+
+    def _window_bounds(self, today_str: str, start_time: str, end_time: str) -> tuple:
+        key = (today_str, start_time, end_time)
+        bounds = self._window_bounds_cache.get(key)
+        if bounds is None:
+            bounds = (
+                pd.Timestamp(f"{today_str} {start_time}:00"),
+                pd.Timestamp(f"{today_str} {end_time}:59"),
+            )
+            self._window_bounds_cache[key] = bounds
+        return bounds
 
     def update_tick(self, price: float, volume: int, dt: datetime.datetime) -> Optional[pd.Timestamp]:
         """
@@ -62,6 +93,7 @@ class BarAggregator:
                     "close": price,
                     "volume": int(volume),
                 }
+                self._bump_version(structural=True)
             else:
                 if price > b["high"]:
                     b["high"] = price
@@ -69,8 +101,7 @@ class BarAggregator:
                     b["low"] = price
                 b["close"] = price
                 b["volume"] += int(volume)
-
-            self._bump_version()
+                self._bump_version(structural=False)
         return bar_ts
 
     def update_snapshot(self, price: float, volume: int = 1, dt: Optional[datetime.datetime] = None) -> Optional[pd.Timestamp]:
@@ -98,7 +129,7 @@ class BarAggregator:
                     "close": price,
                     "volume": int(volume or 1),
                 }
-                self._bump_version()
+                self._bump_version(structural=True)
             else:
                 changed = False
                 if price > b["high"]:
@@ -111,7 +142,7 @@ class BarAggregator:
                     b["close"] = price
                     changed = True
                 if changed:
-                    self._bump_version()
+                    self._bump_version(structural=False)
 
         return now_ts
 
@@ -145,7 +176,7 @@ class BarAggregator:
             if len(target_df) > 0:
                 self.history_loaded = True
             if loaded_count > 0:
-                self._bump_version()
+                self._bump_version(structural=True)
 
         return loaded_count
 
@@ -178,7 +209,7 @@ class BarAggregator:
             self.history_loaded = True
             self.backup_source = source_tag
             if count > 0:
-                self._bump_version()
+                self._bump_version(structural=True)
         return count
 
     def needs_snapshot_sync(self, now_ts: pd.Timestamp, tick_timeout_sec: float = 3.0, snap_interval_sec: float = 2.0) -> bool:
@@ -194,9 +225,67 @@ class BarAggregator:
             interval_ok = (now - self.last_snap_time >= snap_interval_sec)
             return no_tick and interval_ok
 
+    def _window_key_slice(self, today_str: str, start_time: str, end_time: str) -> list:
+        keys = self._get_sorted_keys()
+        t0, t1 = self._window_bounds(today_str, start_time, end_time)
+        lo = bisect.bisect_left(keys, t0)
+        hi = bisect.bisect_right(keys, t1)
+        return keys[lo:hi]
+
+    def _build_dataframe_from_keys(self, keys: list) -> pd.DataFrame:
+        if not keys:
+            return pd.DataFrame()
+        bars = self._bars
+        opens = []
+        highs = []
+        lows = []
+        closes = []
+        vols = []
+        for ts in keys:
+            b = bars[ts]
+            opens.append(b["open"])
+            highs.append(b["high"])
+            lows.append(b["low"])
+            closes.append(b["close"])
+            vols.append(b["volume"])
+        return pd.DataFrame(
+            {"open": opens, "high": highs, "low": lows, "close": closes, "volume": vols},
+            index=pd.DatetimeIndex(keys, name="ts"),
+        )
+
+    def get_latest_bar_state(self, today_str: str, start_time: str = "08:45", end_time: str = "13:45") -> Optional[tuple]:
+        """
+        零 DataFrame 開銷快速讀取當日最新一根 K 棒與結構簽章，供盤中 Tick 熱路徑使用。
+        回傳 (struct_sig, version, bar_count, latest_ts, open, high, low, close, volume) 或 None。
+        """
+        with self._lock:
+            if not self._bars:
+                return None
+            keys = self._get_sorted_keys()
+            t0, t1 = self._window_bounds(today_str, start_time, end_time)
+            lo = bisect.bisect_left(keys, t0)
+            hi = bisect.bisect_right(keys, t1)
+            bar_count = hi - lo
+            if bar_count <= 0:
+                return None
+            latest_ts = keys[hi - 1]
+            b = self._bars[latest_ts]
+            struct_sig = (self.structure_version, len(self._bars))
+            return (
+                struct_sig,
+                self.version,
+                bar_count,
+                latest_ts,
+                float(b["open"]),
+                float(b["high"]),
+                float(b["low"]),
+                float(b["close"]),
+                int(b["volume"]),
+            )
+
     def to_dataframe(self, today_str: Optional[str] = None, start_time: str = "08:45", end_time: str = "13:45") -> pd.DataFrame:
         """
-        將目前聚合的記憶體 K 棒導出為標準格式 DataFrame (含版號快取與時間戳直接過濾優化)
+        將目前聚合的記憶體 K 棒導出為標準格式 DataFrame (含版號快取、二分搜尋與欄位式直接建表優化)
         :param today_str: 限制之日期字串 (YYYY-MM-DD)，若為 None 則不限制日期
         :param start_time: 起始時段 (預設 08:45)
         :param end_time: 結束時段 (預設 13:45)
@@ -211,22 +300,13 @@ class BarAggregator:
                 return self._cached_df
 
             if today_str and start_time and end_time:
-                t0 = pd.Timestamp(f"{today_str} {start_time}:00")
-                t1 = pd.Timestamp(f"{today_str} {end_time}:59")
-                filtered = {ts: v for ts, v in self._bars.items() if t0 <= ts <= t1}
-                if not filtered:
-                    out_df = pd.DataFrame()
-                else:
-                    out_df = pd.DataFrame.from_dict(filtered, orient="index")
-                    out_df.index.name = "ts"
-                    out_df = out_df.sort_index()
+                keys = self._window_key_slice(today_str, start_time, end_time)
+                out_df = self._build_dataframe_from_keys(keys)
             else:
-                out_df = pd.DataFrame.from_dict(self._bars, orient="index")
-                out_df.index.name = "ts"
-                out_df = out_df.sort_index()
-                if today_str:
-                    day_mask = (out_df.index.strftime("%Y-%m-%d") == today_str)
-                    out_df = out_df[day_mask]
+                keys = self._get_sorted_keys()
+                out_df = self._build_dataframe_from_keys(keys)
+                if today_str and not out_df.empty:
+                    out_df = out_df[out_df.index.strftime("%Y-%m-%d") == today_str]
                 if start_time and end_time and not out_df.empty:
                     out_df = out_df.between_time(start_time, end_time)
 
@@ -248,7 +328,8 @@ class BarAggregator:
             self.backup_source = None
             self.last_tick_time = 0.0
             self.last_snap_time = 0.0
-            self._bump_version()
+            self._window_bounds_cache.clear()
+            self._bump_version(structural=True)
 
     def __len__(self) -> int:
         with self._lock:
