@@ -91,6 +91,7 @@ class SessionFSM:
         state_repo: Optional[StateRepo] = None,
         eod_roll_fn: Optional[Callable[[str], bool]] = None,
         holiday_grace_seconds: float = 30.0,
+        login_retry_cooldown: float = 15.0,
     ):
         self.gateway = gateway
         self.base_dir = base_dir
@@ -105,6 +106,7 @@ class SessionFSM:
         self.state_repo = state_repo or StateRepo(log_dir=log_dir)
         self._eod_roll_fn = eod_roll_fn
         self.holiday_grace_seconds = float(holiday_grace_seconds)
+        self.login_retry_cooldown = float(login_retry_cooldown)
         self.online_ind = OnlineIndicators()
 
         self._stop_requested = False
@@ -116,6 +118,8 @@ class SessionFSM:
         self._pending_flatten: bool = False
         self._initial_history_synced: bool = False
         self._last_history_sync_attempt_ts: float = 0.0
+        self._last_login_fail_ts: float = 0.0
+        self._last_loop_error_alert_ts: float = 0.0
         self.state: TradingDayState = self.rollover_day(datetime.date.today().strftime("%Y-%m-%d"))
 
     @staticmethod
@@ -134,27 +138,30 @@ class SessionFSM:
         logger.info(f"💤 [{reason}] 安全登出券商 API，進入離線深度省電睡眠...")
         self.gateway.close()
 
-    def wake_and_login(self, reason: str = "") -> bool:
-        """盤前 / 盤中喚醒：重新登入、重解析當月主力合約、重訂閱 Tick 並同步夜盤與部位"""
-        if self.gateway.connected:
-            return True
-        logger.info(f"🌅 [{reason}] 正在喚醒並重新登入券商 API、重抓主力合約...")
-        if not self.gateway.connect():
-            logger.error(f"❌ [{reason}] 喚醒登入失敗，將於下一輪重試。")
-            return False
+    def _sync_after_connect(
+        self,
+        *,
+        mark_morning_wake: bool,
+        force_refresh_overnight: bool,
+        reset_history_sync: bool,
+    ) -> None:
+        """連線成功後的共用同步步驟：訂閱 Tick、補齊夜盤高低點與帳務對帳"""
         self.gateway.subscribe_ticks(self._on_tick)
         c_code = getattr(self.gateway, "contract_code", "") or self.state.contract_code
-        oh, ol, _ = load_or_fetch_overnight_levels(
-            self.data_dir,
-            self.state.trading_date,
-            gateway=self.gateway if self.gateway.connected else None,
-            allow_cnyes_fallback=True,
-        )
-        updates: dict = {"contract_code": c_code, "morning_wake_logged": True}
-        if oh is not None:
-            updates["overnight_high"] = oh
-        if ol is not None:
-            updates["overnight_low"] = ol
+        updates: dict = {"contract_code": c_code}
+        if mark_morning_wake:
+            updates["morning_wake_logged"] = True
+        if force_refresh_overnight or self.state.overnight_high is None or self.state.overnight_low is None:
+            oh, ol, _ = load_or_fetch_overnight_levels(
+                self.data_dir,
+                self.state.trading_date,
+                gateway=self.gateway if self.gateway.connected else None,
+                allow_cnyes_fallback=True,
+            )
+            if oh is not None:
+                updates["overnight_high"] = oh
+            if ol is not None:
+                updates["overnight_low"] = ol
         self.state = dataclasses.replace(self.state, **updates)
         self.state = self.position_guard.startup_reconcile(
             self.state,
@@ -164,9 +171,39 @@ class SessionFSM:
             notifier=self.notifier,
             cfg=self.state.effective_config or self.base_cfg,
         )
-        # 重連後重啟歷史 K 棒回補，以自動補齊斷線期間缺漏的 1 分 K (但不重播已收盤舊訊號下單)
-        self.bar_aggregator.history_loaded = False
-        self._last_history_sync_attempt_ts = 0.0
+        if reset_history_sync:
+            # 重連後重啟歷史 K 棒回補，以自動補齊斷線期間缺漏的 1 分 K (但不重播已收盤舊訊號下單)
+            self.bar_aggregator.history_loaded = False
+            self._last_history_sync_attempt_ts = 0.0
+
+    def wake_and_login(self, reason: str = "", force: bool = False) -> bool:
+        """盤前 / 盤中喚醒：重新登入、重解析當月主力合約、重訂閱 Tick 並同步夜盤與部位"""
+        if self.gateway.connected:
+            if not force:
+                return True
+            logger.warning(f"🔌 [{reason}] 強制關閉舊連線後重新登入...")
+            try:
+                self.gateway.close()
+            except Exception:
+                self.gateway.connected = False
+
+        cooldown = min(self.login_retry_cooldown, 3.0) if self._pending_flatten else self.login_retry_cooldown
+        now_epoch = time.time()
+        if not force and self._last_login_fail_ts > 0 and (now_epoch - self._last_login_fail_ts) < cooldown:
+            return False
+
+        logger.info(f"🌅 [{reason}] 正在喚醒並重新登入券商 API、重抓主力合約...")
+        if not self.gateway.connect():
+            self._last_login_fail_ts = time.time()
+            logger.error(f"❌ [{reason}] 喚醒登入失敗，將於冷卻 {cooldown:.0f} 秒後重試。")
+            return False
+
+        self._last_login_fail_ts = 0.0
+        self._sync_after_connect(
+            mark_morning_wake=True,
+            force_refresh_overnight=True,
+            reset_history_sync=True,
+        )
         logger.info(f"✅ [{reason}] 券商重連與合約同步完成！合約={self.state.contract_code}")
         return True
 
@@ -285,6 +322,7 @@ class SessionFSM:
         self._pending_flatten = False
         self._initial_history_synced = False
         self._last_history_sync_attempt_ts = 0.0
+        self._last_login_fail_ts = 0.0
         return new_state
 
     def execute_order_intent(
@@ -432,6 +470,10 @@ class SessionFSM:
                 self.state = dataclasses.replace(self.state, open_qty=rem_qty)
                 self.state_repo.save_state(self.state)
                 logger.error(f"⚠️ SAR 第一腳僅部分平倉 ({close_filled}/{cover_qty}口)，暫停反手並啟動不死鳥追平剩餘部位！")
+                self.notifier.send(
+                    f"⚠️ [SAR 部分平倉] {close_act} 已平 {close_filled}/{cover_qty} 口 @ {close_res.avg_price:.0f}，暫停反手並追平剩餘 {rem_qty} 口。",
+                    async_send=True,
+                )
                 self.state = self.position_guard.post_trade_verify(
                     self.state,
                     self.gateway,
@@ -870,40 +912,41 @@ class SessionFSM:
             self._stop_requested = True
             self._wake_event.set()
 
-        signal.signal(signal.SIGINT, _stop_handler)
-        signal.signal(signal.SIGTERM, _stop_handler)
+        if threading.current_thread() is threading.main_thread():
+            signal.signal(signal.SIGINT, _stop_handler)
+            signal.signal(signal.SIGTERM, _stop_handler)
 
         if not self.gateway.connect():
-            logger.error("❌ 無法連線至 Shioaji，無法啟動盤中監控。")
-            return
-
-        c_code = getattr(self.gateway, "contract_code", "")
-        updates: dict = {"contract_code": c_code}
-        if self.state.overnight_high is None or self.state.overnight_low is None:
-            oh, ol, _ = load_or_fetch_overnight_levels(
-                self.data_dir,
-                self.state.trading_date,
-                gateway=self.gateway,
-                allow_cnyes_fallback=True,
+            now_init = datetime.datetime.now()
+            now_init_str = now_init.strftime("%H:%M:%S")
+            is_init_off_hours = (
+                now_init.weekday() >= 5
+                or now_init_str >= "13:50:00"
+                or now_init_str < "08:30:00"
             )
-            if oh is not None:
-                updates["overnight_high"] = oh
-            if ol is not None:
-                updates["overnight_low"] = ol
-        self.state = dataclasses.replace(self.state, **updates)
-
-        self.gateway.subscribe_ticks(self._on_tick)
-        self.state = self.position_guard.startup_reconcile(
-            self.state,
-            self.gateway,
-            self.quantity,
-            state_repo=self.state_repo,
-            notifier=self.notifier,
-            cfg=self.state.effective_config or self.base_cfg,
-        )
+            self._last_login_fail_ts = time.time()
+            if is_init_off_hours:
+                logger.warning(
+                    "⚠️ 啟動時處於非交易時段且券商連線失敗（可能為夜間維護），進入離線待命迴圈，將於 08:30 自動喚醒。"
+                )
+            else:
+                logger.error("❌ 啟動時無法連線至 Shioaji，保留主迴圈並依冷卻週期持續重試。")
+                try:
+                    self.notifier.send(
+                        "⚠️ [V2 啟動連線異常] 盤中啟動登入 Shioaji 失敗，系統將持續於背景重試連線！",
+                        async_send=True,
+                    )
+                except Exception:
+                    pass
+        else:
+            self._sync_after_connect(
+                mark_morning_wake=False,
+                force_refresh_overnight=False,
+                reset_history_sync=False,
+            )
 
         eff_cfg = self.state.effective_config or self.base_cfg
-        logger.info(f"🚀 V2 交易引擎啟動成功 | 合約: {self.state.contract_code} | {describe(eff_cfg, self.state.atr_info or {})}")
+        logger.info(f"🚀 V2 交易引擎啟動成功 | 合約: {self.state.contract_code or '離線待命'} | {describe(eff_cfg, self.state.atr_info or {})}")
 
         last_reconcile = time.time()
         last_heartbeat = time.time()
@@ -916,25 +959,35 @@ class SessionFSM:
         )
         try:
             while not self._stop_requested:
-                phase = self.step()
-                now_ts = time.time()
-                if now_ts - last_reconcile >= 60.0 and phase in active_phases and self.gateway.connected:
-                    self.state = self.position_guard.periodic_reconcile(
-                        self.state,
-                        self.gateway,
-                        state_repo=self.state_repo,
-                        notifier=self.notifier,
-                        cfg=self.state.effective_config or self.base_cfg,
-                    )
-                    last_reconcile = now_ts
-                if now_ts - last_heartbeat >= 900.0 and phase in active_phases and self.gateway.connected:
-                    prev_api = getattr(self.gateway, "api", None)
-                    hb_ok = self.gateway.keep_alive()
-                    if not hb_ok:
-                        self.wake_and_login("保活心跳失敗自動重連")
-                    elif getattr(self.gateway, "api", None) is not prev_api:
-                        self.bar_aggregator.history_loaded = False
-                    last_heartbeat = now_ts
+                try:
+                    phase = self.step()
+                    now_ts = time.time()
+                    if now_ts - last_reconcile >= 60.0 and phase in active_phases and self.gateway.connected:
+                        self.state = self.position_guard.periodic_reconcile(
+                            self.state,
+                            self.gateway,
+                            state_repo=self.state_repo,
+                            notifier=self.notifier,
+                            cfg=self.state.effective_config or self.base_cfg,
+                        )
+                        last_reconcile = now_ts
+                    if now_ts - last_heartbeat >= 900.0 and phase in active_phases and self.gateway.connected:
+                        prev_api = getattr(self.gateway, "api", None)
+                        hb_ok = self.gateway.keep_alive()
+                        if not hb_ok:
+                            self.wake_and_login("保活心跳失敗自動重連", force=True)
+                        elif getattr(self.gateway, "api", None) is not prev_api:
+                            self.bar_aggregator.history_loaded = False
+                        last_heartbeat = now_ts
+                except Exception as e:
+                    logger.exception(f"🚨 [主迴圈異常防護] 捕捉未預期例外（系統持續守護不中斷）: {e}")
+                    now_err_ts = time.time()
+                    if now_err_ts - self._last_loop_error_alert_ts >= 60.0:
+                        self._last_loop_error_alert_ts = now_err_ts
+                        try:
+                            self.notifier.send(f"🚨 [V2 主迴圈異常] {type(e).__name__}: {e}", async_send=True)
+                        except Exception:
+                            pass
                 self._wake_event.clear()
                 if not self._stop_requested:
                     self._wake_event.wait(timeout=poll_seconds)

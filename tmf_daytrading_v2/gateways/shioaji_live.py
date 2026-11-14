@@ -359,6 +359,11 @@ class ShioajiLiveGateway(BrokerGateway):
             logger.warning(f"⚠️ Shioaji 實盤保活心跳異常: {e}")
             if any(k in err_str for k in ("authenticated", "session", "token", "disconnect", "connect", "timeout")):
                 return self.reconnect()
+            # 非預期例外 (例如 SSL/底層 Socket 錯誤) 仍需主動清理舊 Session，確保上層偵測 connected=False 並確實重連
+            try:
+                self.close()
+            except Exception:
+                self.connected = False
             return False
 
     def resolve_contract(self, code: str = "TMFR1", allow_fallback: bool = True) -> Any:

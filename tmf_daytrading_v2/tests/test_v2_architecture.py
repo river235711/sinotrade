@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from typing import Any, Dict, List, Optional, Tuple
 from unittest.mock import MagicMock, patch
@@ -927,6 +928,79 @@ class TestRuntimeFSMAndGuards(unittest.TestCase):
 
                 fsm.step(datetime.datetime(2026, 11, 16, 8, 47, 31))
                 self.assertEqual(spy_k.call_count, 2)
+
+    def test_run_loop_exception_guard_offhours_boot_and_wake_login_backoff(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "data"), exist_ok=True)
+            log_dir = os.path.join(tmp, "logs", "live")
+            gw = FakeBrokerGateway()
+            mock_notifier = MagicMock()
+            fsm = SessionFSM(
+                gateway=gw,
+                base_dir=tmp,
+                log_dir=log_dir,
+                quantity=1,
+                notifier=mock_notifier,
+                login_retry_cooldown=15.0,
+            )
+
+            # 1) 啟動連線失敗時不可直接 return 結束，應進入主迴圈；且 step() 拋出未預期例外不可打死主迴圈
+            calls = {"step": 0}
+
+            def flaky_step():
+                calls["step"] += 1
+                if calls["step"] == 1:
+                    raise RuntimeError("transient pandas/network hiccup")
+                fsm._stop_requested = True
+                return SessionPhase.PREMARKET_STANDBY
+
+            with patch.object(gw, "connect", return_value=False), patch.object(fsm, "step", side_effect=flaky_step):
+                fsm.run(poll_seconds=0.01)
+
+            self.assertEqual(calls["step"], 2)
+            self.assertGreaterEqual(mock_notifier.send.call_count, 1)
+
+            # 2) wake_and_login 失敗冷卻保護：連續失敗在冷卻期內不重打 gateway.connect()
+            gw.connected = False
+            fsm._last_login_fail_ts = 0.0
+            with patch.object(gw, "connect", return_value=False) as spy_conn:
+                self.assertFalse(fsm.wake_and_login("測試重連 #1"))
+                self.assertFalse(fsm.wake_and_login("測試重連 #2 (冷卻內應跳過)"))
+                self.assertEqual(spy_conn.call_count, 1)
+
+                fsm._last_login_fail_ts = time.time() - 20.0
+                self.assertFalse(fsm.wake_and_login("測試重連 #3 (冷卻期滿應重試)"))
+                self.assertEqual(spy_conn.call_count, 2)
+
+    def test_keep_alive_non_keyword_error_closes_and_forces_reconnect(self):
+        from config import ShioajiConfig
+        from gateways.shioaji_live import ShioajiLiveGateway
+
+        # 1) Live keep_alive 遇未列於關鍵字的例外時，仍應主動 close() 並設 connected=False
+        cfg = ShioajiConfig(api_key="k", secret_key="s", ca_path="", ca_passwd="", person_id="")
+        live_gw = ShioajiLiveGateway(sj_cfg=cfg)
+        fake_api = MagicMock()
+        fake_api.futopt_account = object()
+        fake_api.margin.side_effect = RuntimeError("unexpected SSL reset")
+        live_gw.api = fake_api
+        live_gw.connected = True
+
+        self.assertFalse(live_gw.keep_alive())
+        self.assertFalse(live_gw.connected)
+        self.assertIsNone(live_gw.api)
+        fake_api.logout.assert_called()
+
+        # 2) 若 gateway.keep_alive() 回傳 False 且 connected 仍為 True，wake_and_login(..., force=True) 必須關閉重連而非略過
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "data"), exist_ok=True)
+            gw = FakeBrokerGateway()
+            gw.connected = True
+            fsm = SessionFSM(gateway=gw, base_dir=tmp, log_dir=os.path.join(tmp, "logs", "live"), quantity=1)
+            with patch.object(gw, "close", wraps=gw.close) as spy_close, patch.object(gw, "connect", wraps=gw.connect) as spy_conn:
+                self.assertTrue(fsm.wake_and_login("保活心跳失敗自動重連", force=True))
+                self.assertEqual(spy_close.call_count, 1)
+                self.assertEqual(spy_conn.call_count, 1)
+                self.assertTrue(gw.connected)
 
 
 class TestV1V2BacktestParity(unittest.TestCase):
