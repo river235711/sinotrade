@@ -370,6 +370,7 @@ def apply_intent_fill(
         new_state = dataclasses.replace(
             state,
             position=0,
+            open_qty=0,
             highest_profit=intent.new_highest_profit,
             hp_before_bar_ts=intent.hp_before_bar_ts,
             hp_before_bar_val=intent.hp_before_bar_val,
@@ -436,6 +437,7 @@ def apply_exit_only(
     new_state = dataclasses.replace(
         state,
         position=0,
+        open_qty=0,
         highest_profit=0.0,
         hp_before_bar_ts=None,
         hp_before_bar_val=0.0,

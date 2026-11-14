@@ -13,6 +13,7 @@ TMF DayTrading V2 架構與策略等價性完整測試套件
 """
 import ast
 import contextlib
+import dataclasses
 import datetime
 import importlib.util
 import io
@@ -50,6 +51,7 @@ from gateways.shioaji_paper import ShioajiPaperGateway
 from backtester.engine import BacktestEngine as V2BacktestEngine
 from backtester.run_20days_backtest import _preload_overnight_levels
 from runtime.bar_aggregator import BarAggregator
+from runtime.notifier import TradeNotifier
 from runtime.position_guard import PositionGuard
 from runtime.session_fsm import SessionFSM
 
@@ -78,6 +80,8 @@ class FakeBrokerGateway(BrokerGateway):
         self.resolve_calls: List[Tuple[str, bool]] = []
         self.contracts_map: Dict[str, Any] = {"TMFK6": self.contract, "TMFR1": self.contract}
         self.query_sequence: List[Dict[str, Any]] = []
+        self.order_sequence: List[FillResult] = []
+        self.kbars_df: pd.DataFrame = pd.DataFrame()
         self.position_details: Dict[str, Any] = {
             "net": 0,
             "avg_price": 0.0,
@@ -110,7 +114,7 @@ class FakeBrokerGateway(BrokerGateway):
         return True
 
     def fetch_kbars(self, start_date: str, end_date: str, timeout: int = 5000) -> pd.DataFrame:
-        return pd.DataFrame()
+        return self.kbars_df.copy() if not self.kbars_df.empty else pd.DataFrame()
 
     def fetch_snapshot_price(self, today_str: str):
         return None
@@ -134,6 +138,16 @@ class FakeBrokerGateway(BrokerGateway):
             "price": price,
             "contract_override": getattr(contract_override, "code", None),
         })
+        if self.order_sequence:
+            res = self.order_sequence.pop(0)
+            if self.update_ledger_on_fill and contract_override is None and res.filled_qty > 0:
+                delta = int(res.filled_qty) if action == "BUY" else -int(res.filled_qty)
+                new_net = int(self.position_details.get("net", 0)) + delta
+                px_fill = res.avg_price if res.avg_price > 0 else price
+                self.position_details["net"] = new_net
+                self.position_details["avg_price"] = px_fill if new_net != 0 else 0.0
+                self.position_details["direction"] = "Buy" if new_net > 0 else ("Sell" if new_net < 0 else "Flat")
+            return res
         if not self.fill_ok:
             return FillResult(ok=False, filled_qty=0, avg_price=0.0, status="Cancelled")
         px = self.fill_price if self.fill_price > 0 else price
@@ -290,6 +304,12 @@ class TestCorePurityAndStrategy(unittest.TestCase):
 
 
 class TestRuntimeFSMAndGuards(unittest.TestCase):
+    def setUp(self):
+        # 預設攔截所有單元測試期間之真實 Telegram/Email 推播，避免寄出測試警訊
+        p = patch.object(TradeNotifier, "send", return_value=None)
+        p.start()
+        self.addCleanup(p.stop)
+
     def test_session_fsm_9_phases_and_rollover_resets_all_flags(self):
         cfg = ORBStrategyConfig()
         expected = [
@@ -646,6 +666,162 @@ class TestRuntimeFSMAndGuards(unittest.TestCase):
                 fsm.bar_aggregator.update_tick(23085.0, 1, datetime.datetime(2026, 11, 16, 9, 2, 0))
                 fsm.step(datetime.datetime(2026, 11, 16, 9, 2, 0))
                 self.assertEqual(spy_prep.call_count, 2)
+
+    def test_intraday_restart_does_not_replay_historical_orders_and_backfills_on_reconnect(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "data"), exist_ok=True)
+            log_dir = os.path.join(tmp, "logs", "live")
+            gw = FakeBrokerGateway(fill_ok=True)
+
+            # 準備 08:45 ~ 10:04 的歷史 K 棒：包含 09:20 突破進場訊號、以及 08:50 低點 (不應誤觸停損)
+            times = pd.date_range("2026-11-16 08:45:00", periods=80, freq="1min")
+            rows = []
+            for ts in times:
+                hhmm = ts.strftime("%H:%M")
+                if "08:45" <= hhmm <= "08:59":
+                    px = 22950.0 if hhmm == "08:50" else 23050.0
+                    rows.append((px + 10, px + 10, px - 10, px, 20))
+                elif "09:00" <= hhmm <= "09:15":
+                    rows.append((23050.0, 23100.0, 23000.0, 23050.0, 20))
+                elif hhmm == "09:20":
+                    rows.append((23090.0, 23130.0, 23085.0, 23125.0, 60))
+                elif hhmm == "09:45":
+                    # 09:40 進場後的波段高點 (+90)
+                    rows.append((23160.0, 23190.0, 23150.0, 23170.0, 30))
+                else:
+                    rows.append((23130.0, 23140.0, 23120.0, 23135.0, 20))
+            gw.kbars_df = pd.DataFrame(rows, columns=["open", "high", "low", "close", "volume"], index=times)
+
+            cfg = ORBStrategyConfig(use_atr_scaling=False, use_overnight_wall_filter=False, use_vwap_ema_filter=False)
+
+            # 情境 A：10:05 空手重啟 -> 載入歷史計算 ORB 與指標，但絕不拿 09:20 歷史訊號下單
+            fsm_flat = SessionFSM(gateway=gw, base_dir=tmp, log_dir=log_dir, quantity=1, base_cfg=cfg)
+            fsm_flat.rollover_day("2026-11-16")
+            fsm_flat.step(datetime.datetime(2026, 11, 16, 10, 5, 10))
+            self.assertTrue(fsm_flat.state.orb_calculated)
+            self.assertTrue(fsm_flat.state.orb_finalized)
+            self.assertEqual(fsm_flat.state.orb_high, 23100.0)
+            self.assertEqual(len(gw.orders_placed), 0)
+
+            # 斷線再透過 wake_and_login 重連 -> 會自動重啟 history_loaded 進行缺漏 K 棒回補，仍不重播舊單
+            fsm_flat.logout_and_sleep("測試斷線")
+            self.assertFalse(gw.connected)
+            self.assertTrue(fsm_flat.wake_and_login("測試重連"))
+            self.assertFalse(fsm_flat.bar_aggregator.history_loaded)
+            extra_ts = pd.Timestamp("2026-11-16 10:05:00")
+            gw.kbars_df.loc[extra_ts] = [23140.0, 23148.0, 23135.0, 23142.0, 25]
+            fsm_flat.step(datetime.datetime(2026, 11, 16, 10, 6, 5))
+            self.assertTrue(fsm_flat.bar_aggregator.has_bar(extra_ts))
+            self.assertEqual(len(gw.orders_placed), 0)
+
+            # 情境 B：10:05 持多單 (09:40 @ 23100) 重啟接管 -> 不被 08:50 (22940) 誤觸停損，且最高浮盈回補 +90
+            fsm_hold = SessionFSM(gateway=gw, base_dir=tmp, log_dir=log_dir, quantity=1, base_cfg=cfg)
+            fsm_hold.rollover_day("2026-11-16")
+            fsm_hold.state = dataclasses.replace(
+                fsm_hold.state,
+                position=1,
+                open_qty=1,
+                entry_price=23100.0,
+                entry_time=pd.Timestamp("2026-11-16 09:40:00"),
+                trade_count=1,
+            )
+            fsm_hold.step(datetime.datetime(2026, 11, 16, 10, 5, 10))
+            self.assertEqual(fsm_hold.state.position, 1)
+            self.assertEqual(len(gw.orders_placed), 0)
+            self.assertEqual(fsm_hold.state.highest_profit, 90.0)
+
+    def test_force_close_1308_no_blind_spot_and_failsafe_mkt_escalation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "data"), exist_ok=True)
+            log_dir = os.path.join(tmp, "logs", "live")
+            cfg = ORBStrategyConfig(use_atr_scaling=False, use_overnight_wall_filter=False)
+            gw = FakeBrokerGateway(fill_ok=True, fill_price=23120.0)
+            gw.position_details["net"] = 1
+
+            fsm = SessionFSM(gateway=gw, base_dir=tmp, log_dir=log_dir, quantity=1, base_cfg=cfg)
+            fsm.rollover_day("2026-11-16")
+            fsm.bar_aggregator.history_loaded = True
+            fsm.state = dataclasses.replace(
+                fsm.state,
+                position=1,
+                open_qty=1,
+                entry_price=23000.0,
+                entry_time=pd.Timestamp("2026-11-16 09:20:00"),
+                trade_count=1,
+            )
+            # 在 13:07:30 建立一根尚未進入 13:08 的前分鐘 K 棒 -> 到 13:08:00 應立刻觸發收盤前平倉，不需苦等 13:09
+            fsm.bar_aggregator.update_tick(23120.0, 5, datetime.datetime(2026, 11, 16, 13, 7, 30))
+            phase = fsm.step(datetime.datetime(2026, 11, 16, 13, 8, 0))
+            self.assertEqual(phase, SessionPhase.FORCE_CLOSE)
+            self.assertEqual(fsm.state.position, 0)
+            self.assertEqual(len(gw.orders_placed), 1)
+            self.assertEqual(gw.orders_placed[0]["action"], "SELL")
+            self.assertEqual(gw.orders_placed[0]["octype"], "Cover")
+
+            # 測試 13:09 enforce_failsafe_close: 前兩次 MKP 未成交 + 第 1 次查帳回傳 None 重連恢復後，第 3 次升級 MKT 成功補平
+            repo = StateRepo(log_dir=tmp)
+            guard = PositionGuard(log_dir=tmp, post_trade_retries=1, post_trade_retry_delay=0.0)
+            gw_esc = FakeBrokerGateway(fill_ok=True, fill_price=23110.0)
+            gw_esc.query_sequence = [
+                {"net": None, "avg_price": 0.0, "other_positions": []},
+                {"net": 1, "avg_price": 23000.0, "other_positions": []},
+                {"net": 1, "avg_price": 23000.0, "other_positions": []},
+            ]
+            gw_esc.order_sequence = [
+                FillResult(ok=False, filled_qty=0, avg_price=0.0, status="Cancelled"),
+                FillResult(ok=True, filled_qty=1, avg_price=23110.0, status="Filled"),
+            ]
+            s_open = TradingDayState(trading_date="2026-11-16", contract_code="TMFK6", position=1, open_qty=1, entry_price=23000.0)
+            s_done = guard.enforce_failsafe_close(s_open, gw_esc, state_repo=repo, max_attempts=3)
+            self.assertEqual(s_done.position, 0)
+            self.assertEqual(s_done.open_qty, 0)
+            self.assertTrue(guard.last_failsafe_verified_flat)
+            self.assertEqual([o["price_type"] for o in gw_esc.orders_placed], ["MKP", "MKT"])
+
+    def test_multi_lot_partial_fill_and_periodic_reconcile_direction_qty_sync(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "data"), exist_ok=True)
+            log_dir = os.path.join(tmp, "logs", "live")
+            gw = FakeBrokerGateway(fill_ok=True, fill_price=23105.0)
+            # 進場下 2 口僅部分成交 1 口 -> 不可被 post_trade_verify 誤平，且後續平倉只能送 1 口 Cover！
+            gw.order_sequence = [
+                FillResult(ok=False, filled_qty=1, avg_price=23105.0, status="Cancelled"),
+                FillResult(ok=True, filled_qty=1, avg_price=23150.0, status="Filled"),
+            ]
+            cfg = ORBStrategyConfig(use_atr_scaling=False, use_overnight_wall_filter=False)
+            fsm = SessionFSM(gateway=gw, base_dir=tmp, log_dir=log_dir, quantity=2, base_cfg=cfg)
+            fsm.rollover_day("2026-11-16")
+
+            st_in, _ = fsm.execute_order_intent(
+                OrderIntent(action="BUY", side_sign=1, price=23105.0, reason="PartialFillTest"),
+                pd.Timestamp("2026-11-16 09:25:00"),
+            )
+            self.assertEqual(st_in.position, 1)
+            self.assertEqual(st_in.open_qty, 1)
+            self.assertEqual(len(gw.orders_placed), 1)
+            self.assertEqual(gw.orders_placed[0]["qty"], 2)
+
+            st_out, rec = fsm.execute_order_intent(
+                OrderIntent(action="EXIT", side_sign=0, price=23150.0, reason="ExitExactQty", pnl_pts=45.0),
+                pd.Timestamp("2026-11-16 09:30:00"),
+            )
+            self.assertIsNotNone(rec)
+            self.assertEqual(st_out.position, 0)
+            self.assertEqual(st_out.open_qty, 0)
+            self.assertEqual(gw.orders_placed[-1]["qty"], 1)
+
+            # 盤中定期對帳：偵測口數縮減 (2->1) 與方向衝突 (+1 變 -2)
+            guard = fsm.position_guard
+            s_qty = TradingDayState(trading_date="2026-11-16", contract_code="TMFK6", position=1, open_qty=2, entry_price=23100.0)
+            gw.position_details = {"net": 1, "avg_price": 23100.0, "other_positions": []}
+            s_qty = guard.periodic_reconcile(s_qty, gw, state_repo=fsm.state_repo)
+            self.assertEqual(s_qty.open_qty, 1)
+
+            gw.position_details = {"net": -2, "avg_price": 23200.0, "other_positions": []}
+            s_flip = guard.periodic_reconcile(s_qty, gw, state_repo=fsm.state_repo)
+            self.assertEqual(s_flip.position, -1)
+            self.assertEqual(s_flip.open_qty, 2)
+            self.assertTrue(s_flip.entries_halted)
 
 
 class TestV1V2BacktestParity(unittest.TestCase):

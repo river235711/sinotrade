@@ -103,6 +103,7 @@ class TradingDayState:
     overnight_low: Optional[float] = None
 
     position: int = 0                   # 0: 空手, 1: 多單, -1: 空單
+    open_qty: int = 0                   # 實際成交持有口數 (多口/部分成交/減倉對帳用)
     entry_price: float = 0.0
     entry_time: Optional[pd.Timestamp] = None
     highest_profit: float = 0.0

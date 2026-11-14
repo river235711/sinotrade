@@ -27,6 +27,7 @@ from gateways.data_repo import (
     StateRepo,
     append_order_audit,
     config_for_date,
+    fetch_cnyes_day_kbars,
     load_command,
     load_or_fetch_overnight_levels,
 )
@@ -160,8 +161,67 @@ class SessionFSM:
             notifier=self.notifier,
             cfg=self.state.effective_config or self.base_cfg,
         )
+        # 重連後重啟歷史 K 棒回補，以自動補齊斷線期間缺漏的 1 分 K (但不重播已收盤舊訊號下單)
+        self.bar_aggregator.history_loaded = False
         logger.info(f"✅ [{reason}] 券商重連與合約同步完成！合約={self.state.contract_code}")
         return True
+
+    def _sync_intraday_history(self, today_str: str, now_ts: pd.Timestamp) -> None:
+        """
+        載入或回補當日歷史 1 分 K，並將啟動/斷線重連前已收盤的時間戳預先標記為已處理，
+        嚴防盤中重啟時誤把數分鐘或數小時前的歷史 K 棒訊號重播下單；
+        若已有持倉且具真實 entry_time，順便回補該段期間之 MFE 最高浮盈。
+        """
+        if self.bar_aggregator.history_loaded or not self.gateway.connected:
+            return
+
+        loaded = 0
+        try:
+            hist_df = self.gateway.fetch_kbars(today_str, today_str, timeout=5000)
+            if not hist_df.empty:
+                loaded = self.bar_aggregator.load_history_kbars(hist_df, today_str=today_str, now_min=now_ts)
+        except Exception as e:
+            logger.warning(f"⚠️ 抓取券商當日歷史 K 棒失敗: {e}")
+
+        if not self.bar_aggregator.history_loaded and getattr(self.gateway, "api", None) is not None:
+            if now_ts.strftime("%H:%M:%S") >= "08:47:00":
+                try:
+                    bk_df = fetch_cnyes_day_kbars(today_str, timeout=5)
+                    if not bk_df.empty:
+                        loaded = self.bar_aggregator.load_backup_bars(
+                            bk_df, now_min=now_ts, source_tag="CNYES_TXF"
+                        )
+                        if loaded > 0:
+                            logger.warning(f"🛟 [CNYES 備援] 已補齊 {loaded} 根當日缺漏 1 分 K。")
+                except Exception as e:
+                    logger.warning(f"⚠️ CNYES 備援 K 棒抓取失敗: {e}")
+
+        if not self.bar_aggregator.history_loaded and loaded <= 0:
+            return
+
+        synced_df = self.bar_aggregator.to_dataframe(today_str=today_str)
+        if synced_df.empty:
+            return
+
+        for ts in synced_df.index:
+            if ts < now_ts:
+                self._processed_timestamps.add(ts)
+
+        if self.state.position != 0 and self.state.entry_time is not None and self.state.entry_price > 0:
+            entry_ts = pd.Timestamp(self.state.entry_time)
+            post_entry = synced_df[(synced_df.index > entry_ts) & (synced_df.index < now_ts)]
+            if not post_entry.empty:
+                if self.state.position == 1:
+                    mfe = float(post_entry["high"].max()) - self.state.entry_price
+                else:
+                    mfe = self.state.entry_price - float(post_entry["low"].min())
+                if mfe > self.state.highest_profit:
+                    self.state = dataclasses.replace(
+                        self.state,
+                        highest_profit=mfe,
+                        hp_before_bar_val=max(self.state.hp_before_bar_val, mfe),
+                    )
+                    self.state_repo.save_state(self.state)
 
     def rollover_day(self, new_date_str: str) -> TradingDayState:
         """
@@ -220,10 +280,13 @@ class SessionFSM:
                 logger.error(f"❌ 進場委託未成交 ({intent.action}): {res.status}，保持空手不更新策略狀態。")
                 return self.state, None
 
+            actual_qty = int(res.filled_qty) if res.filled_qty > 0 else self.quantity
             fill_px = res.avg_price if res.avg_price > 0 else intent.price
             self.state, _ = apply_intent_fill(self.state, intent, fill_price=fill_px, fill_time=bar_ts)
+            self.state = dataclasses.replace(self.state, open_qty=actual_qty)
+            partial_note = f" [部分成交 {actual_qty}/{self.quantity}]" if actual_qty < self.quantity else ""
             msg = (
-                f"{'🟢 多單進場' if intent.side_sign == 1 else '🔴 空單進場'} ({self.quantity}口 @ {fill_px:.0f})\n"
+                f"{'🟢 多單進場' if intent.side_sign == 1 else '🔴 空單進場'} ({actual_qty}口 @ {fill_px:.0f}){partial_note}\n"
                 f"原因: {intent.reason}"
             )
             logger.info(msg)
@@ -232,7 +295,7 @@ class SessionFSM:
             self.state = self.position_guard.post_trade_verify(
                 self.state,
                 self.gateway,
-                self.quantity,
+                actual_qty,
                 res,
                 intent.action,
                 state_repo=self.state_repo,
@@ -242,16 +305,38 @@ class SessionFSM:
 
         if intent.action == "EXIT":
             close_act = "SELL" if self.state.position == 1 else "BUY"
+            cover_qty = self.state.open_qty if self.state.open_qty > 0 else self.quantity
             res = self.gateway.place_order(
                 action=close_act,
-                qty=self.quantity,
+                qty=cover_qty,
                 price_type="MKP",
                 octype="Cover",
                 price=intent.price,
             )
-            append_order_audit(self.log_dir, close_act, self.quantity, "Cover", res, signal_price=intent.price)
+            append_order_audit(self.log_dir, close_act, cover_qty, "Cover", res, signal_price=intent.price)
             if not res.ok and res.filled_qty <= 0:
                 logger.error(f"❌ 平倉委託未成交 ({close_act}): {res.status}")
+                return self.state, None
+
+            filled = int(res.filled_qty) if res.filled_qty > 0 else cover_qty
+            if not res.ok and filled < cover_qty:
+                rem_qty = cover_qty - filled
+                self.state = dataclasses.replace(self.state, open_qty=rem_qty)
+                self.state_repo.save_state(self.state)
+                logger.warning(f"⚠️ 平倉委託部分成交 ({close_act} {filled}/{cover_qty}口)，剩餘 {rem_qty} 口續留平倉保護！")
+                self.notifier.send(
+                    f"⚠️ [部分平倉] {close_act} 已平 {filled}/{cover_qty} 口 @ {res.avg_price:.0f}，剩餘 {rem_qty} 口持續平倉。",
+                    async_send=True,
+                )
+                self.state = self.position_guard.post_trade_verify(
+                    self.state,
+                    self.gateway,
+                    rem_qty,
+                    res,
+                    intent.action,
+                    state_repo=self.state_repo,
+                    notifier=self.notifier,
+                )
                 return self.state, None
 
             fill_px = res.avg_price if res.avg_price > 0 else intent.price
@@ -259,14 +344,14 @@ class SessionFSM:
             if self.state.trade_count >= max_trades:
                 self.state = dataclasses.replace(self.state, entries_halted=True)
             pnl_pts = rec.pnl_pts if rec else 0.0
-            msg = f"🏁 [策略平倉] {close_act} {self.quantity}口 @ {fill_px:.0f} ({pnl_pts:+.0f}點)\n原因: {intent.reason}"
+            msg = f"🏁 [策略平倉] {close_act} {cover_qty}口 @ {fill_px:.0f} ({pnl_pts:+.0f}點)\n原因: {intent.reason}"
             logger.info(msg)
             self.notifier.send(msg, async_send=True)
             self.state_repo.save_state(self.state)
             self.state = self.position_guard.post_trade_verify(
                 self.state,
                 self.gateway,
-                self.quantity,
+                0,
                 res,
                 intent.action,
                 state_repo=self.state_repo,
@@ -276,16 +361,34 @@ class SessionFSM:
 
         if intent.action in ("SAR_BUY", "SAR_SELL"):
             close_act = "SELL" if self.state.position == 1 else "BUY"
+            cover_qty = self.state.open_qty if self.state.open_qty > 0 else self.quantity
             close_res = self.gateway.place_order(
                 action=close_act,
-                qty=self.quantity,
+                qty=cover_qty,
                 price_type="MKP",
                 octype="Cover",
                 price=intent.price,
             )
-            append_order_audit(self.log_dir, close_act, self.quantity, "SAR_Cover", close_res, signal_price=intent.price)
+            append_order_audit(self.log_dir, close_act, cover_qty, "SAR_Cover", close_res, signal_price=intent.price)
             if not close_res.ok and close_res.filled_qty <= 0:
                 logger.error(f"❌ SAR 第一腳平倉未成交 ({close_act}): {close_res.status}")
+                return self.state, None
+
+            close_filled = int(close_res.filled_qty) if close_res.filled_qty > 0 else cover_qty
+            if not close_res.ok and close_filled < cover_qty:
+                rem_qty = cover_qty - close_filled
+                self.state = dataclasses.replace(self.state, open_qty=rem_qty)
+                self.state_repo.save_state(self.state)
+                logger.error(f"⚠️ SAR 第一腳僅部分平倉 ({close_filled}/{cover_qty}口)，暫停反手開新倉以防部位錯亂！")
+                self.state = self.position_guard.post_trade_verify(
+                    self.state,
+                    self.gateway,
+                    rem_qty,
+                    close_res,
+                    intent.action,
+                    state_repo=self.state_repo,
+                    notifier=self.notifier,
+                )
                 return self.state, None
 
             close_px = close_res.avg_price if close_res.avg_price > 0 else intent.price
@@ -299,6 +402,7 @@ class SessionFSM:
             )
             append_order_audit(self.log_dir, rev_act, self.quantity, "SAR_New", rev_res, signal_price=close_px)
             if rev_res.ok or rev_res.filled_qty > 0:
+                rev_qty = int(rev_res.filled_qty) if rev_res.filled_qty > 0 else self.quantity
                 rev_px = rev_res.avg_price if rev_res.avg_price > 0 else close_px
                 self.state, rec = apply_intent_fill(
                     self.state,
@@ -307,19 +411,22 @@ class SessionFSM:
                     fill_time=bar_ts,
                     new_entry_price=rev_px,
                 )
+                self.state = dataclasses.replace(self.state, open_qty=rev_qty)
                 verify_res = rev_res
-                msg = f"🔄 [SAR 假突破反手] 先平倉 @ {close_px:.0f} ({rec.pnl_pts:+.0f}點)，立即反手 {rev_act} @ {rev_px:.0f}"
+                verify_qty = rev_qty
+                msg = f"🔄 [SAR 假突破反手] 先平 {cover_qty}口 @ {close_px:.0f} ({rec.pnl_pts:+.0f}點)，立即反手 {rev_act} {rev_qty}口 @ {rev_px:.0f}"
             else:
                 self.state, rec = apply_exit_only(self.state, intent, fill_price=close_px, fill_time=bar_ts)
                 verify_res = close_res
-                msg = f"⚠️ [SAR 部分執行] 原倉已平 @ {close_px:.0f}，但反手開新倉失敗 ({rev_res.status})，轉空手。"
+                verify_qty = 0
+                msg = f"⚠️ [SAR 部分執行] 原倉 {cover_qty}口已平 @ {close_px:.0f}，但反手開新倉失敗 ({rev_res.status})，轉空手。"
             logger.warning(msg)
             self.notifier.send(msg, async_send=True)
             self.state_repo.save_state(self.state)
             self.state = self.position_guard.post_trade_verify(
                 self.state,
                 self.gateway,
-                self.quantity,
+                verify_qty,
                 verify_res,
                 intent.action,
                 state_repo=self.state_repo,
@@ -446,15 +553,25 @@ class SessionFSM:
         """持倉期間於分鐘尚未收線前以 O(1) OnlineIndicators 即時檢查停損、鎖利、移停與反手"""
         if self.state.position == 0:
             return
+        cfg = self.state.effective_config or self.base_cfg
+        now_str = now_dt.strftime("%H:%M:%S")
         latest = self.bar_aggregator.get_latest_bar_state(today_str)
         if latest is None:
             return
         _, _, _, latest_ts, o, h, l, c, v = latest
         now_min = pd.Timestamp(now_dt.replace(second=0, microsecond=0))
-        if latest_ts < now_min or latest_ts in self._processed_timestamps:
+        eval_ts = latest_ts
+        if latest_ts < now_min:
+            if now_str >= cfg.force_close_time and now_min not in self._processed_timestamps:
+                eval_ts = now_min
+                o = h = l = c
+                v = 0
+            else:
+                return
+        elif latest_ts in self._processed_timestamps:
             return
 
-        if self._intrabar_sar_state is not None and self._intrabar_sar_state.get("ts") == latest_ts:
+        if eval_ts == latest_ts and self._intrabar_sar_state is not None and self._intrabar_sar_state.get("ts") == latest_ts:
             sar_s = self._intrabar_sar_state
             if c > sar_s["high"]:
                 sar_s["high"] = c
@@ -463,27 +580,26 @@ class SessionFSM:
             o = sar_s["high"] if self.state.position == 1 else sar_s["low"]
             h = max(sar_s["high"], c)
             l = min(sar_s["low"], c)
-        else:
+        elif eval_ts != latest_ts or self._intrabar_sar_state is None or self._intrabar_sar_state.get("ts") != latest_ts:
             self._intrabar_sar_state = None
 
         vwap, ema9, ema21 = self.online_ind.peek(c, float(v))
         eb = EnrichedBar(
-            bar=Bar(timestamp=latest_ts, open=o, high=h, low=l, close=c, volume=float(v)),
+            bar=Bar(timestamp=eval_ts, open=o, high=h, low=l, close=c, volume=float(v)),
             vwap=vwap,
             ema9=ema9,
             ema21=ema21,
         )
-        cfg = self.state.effective_config or self.base_cfg
-        intent = evaluate_bar(self.state, eb, cfg)
+        intent = evaluate_bar(self.state, eb, cfg, t_str=now_str if now_str >= cfg.force_close_time else None)
         if intent.action == "HOLD":
             self.state, _ = apply_intent_fill(self.state, intent)
             return
 
-        self.execute_order_intent(intent, latest_ts, eb.bar)
+        self.execute_order_intent(intent, eval_ts, eb.bar)
         if intent.action in ("SAR_BUY", "SAR_SELL") and self.state.position != 0:
-            self._intrabar_sar_state = {"ts": latest_ts, "high": c, "low": c}
+            self._intrabar_sar_state = {"ts": eval_ts, "high": c, "low": c}
         elif self.state.position == 0:
-            self._processed_timestamps.add(latest_ts)
+            self._processed_timestamps.add(eval_ts)
 
     def _handle_command_if_any(self) -> None:
         cmd = load_command(self.command_path)
@@ -596,10 +712,7 @@ class SessionFSM:
                 self.wake_and_login("盤中自動重連")
 
             now_ts = pd.Timestamp(now.replace(second=0, microsecond=0))
-            if not self.bar_aggregator.history_loaded and self.gateway.connected:
-                hist_df = self.gateway.fetch_kbars(today_str, today_str, timeout=5000)
-                if not hist_df.empty:
-                    self.bar_aggregator.load_history_kbars(hist_df, today_str=today_str, now_min=now_ts)
+            self._sync_intraday_history(today_str, now_ts)
 
             if self.bar_aggregator.needs_snapshot_sync(now_ts) and self.gateway.connected:
                 snap = self.gateway.fetch_snapshot_price(today_str)
@@ -634,13 +747,22 @@ class SessionFSM:
             return phase
 
         if phase == SessionPhase.FORCE_CLOSE:
+            if not self.gateway.connected:
+                self.wake_and_login("尾盤強平前自動重連")
             if now_str >= cfg.failsafe_close_time:
                 self.state = self.position_guard.enforce_failsafe_close(
                     self.state, self.gateway, notifier=self.notifier, state_repo=self.state_repo
                 )
             else:
+                now_ts = pd.Timestamp(now.replace(second=0, microsecond=0))
+                self._sync_intraday_history(today_str, now_ts)
+                if self.bar_aggregator.needs_snapshot_sync(now_ts) and self.gateway.connected:
+                    snap = self.gateway.fetch_snapshot_price(today_str)
+                    if snap is not None:
+                        self.bar_aggregator.update_snapshot(snap[0], snap[1], snap[2])
                 df_day = self.bar_aggregator.to_dataframe(today_str=today_str)
                 self._process_closed_bars(df_day, now)
+                self._evaluate_open_intrabar(today_str, now)
             return phase
 
         if phase == SessionPhase.POST_CLOSE_SETTLE:
@@ -650,10 +772,12 @@ class SessionFSM:
                 return phase
 
             if not self.state.post_close_done:
+                if not self.gateway.connected:
+                    self.wake_and_login("盤後確認歸零前自動重連")
                 self.state = self.position_guard.enforce_failsafe_close(
                     self.state, self.gateway, notifier=self.notifier, state_repo=self.state_repo
                 )
-                if self.state.position == 0:
+                if self.state.position == 0 and self.position_guard.last_failsafe_verified_flat:
                     self.state = dataclasses.replace(self.state, post_close_done=True)
                     self.notifier.send(
                         f"🛡️ [13:10 當沖平倉完成] {today_str} 帳上部位確認 0 口，零過夜風險，等待 13:45:15 數據結算。",
@@ -734,7 +858,12 @@ class SessionFSM:
                     )
                     last_reconcile = now_ts
                 if now_ts - last_heartbeat >= 900.0 and phase in active_phases and self.gateway.connected:
-                    self.gateway.keep_alive()
+                    prev_api = getattr(self.gateway, "api", None)
+                    hb_ok = self.gateway.keep_alive()
+                    if not hb_ok:
+                        self.wake_and_login("保活心跳失敗自動重連")
+                    elif getattr(self.gateway, "api", None) is not prev_api:
+                        self.bar_aggregator.history_loaded = False
                     last_heartbeat = now_ts
                 self._wake_event.clear()
                 if not self._stop_requested:

@@ -331,6 +331,7 @@ class StateRepo:
                 "updated_at": datetime.datetime.now().strftime("%H:%M:%S"),
                 "contract_code": state.contract_code,
                 "position": int(state.position),
+                "open_qty": int(state.open_qty),
                 "entry_price": float(state.entry_price),
                 "entry_time": str(state.entry_time) if state.entry_time is not None else None,
                 "highest_profit": float(state.highest_profit),
@@ -388,11 +389,14 @@ class StateRepo:
                     parsed_et = None
 
             hp = float(data.get("highest_profit", 0.0))
+            pos_val = int(data.get("position", 0))
+            open_qty_val = int(data.get("open_qty", abs(pos_val) if pos_val != 0 else 0))
             return dataclasses.replace(
                 state,
                 trading_date=str(data.get("date", state.trading_date)),
                 contract_code=str(data.get("contract_code", state.contract_code) or state.contract_code),
-                position=int(data.get("position", 0)),
+                position=pos_val,
+                open_qty=open_qty_val,
                 entry_price=float(data.get("entry_price", 0.0)),
                 entry_time=parsed_et,
                 highest_profit=hp,

@@ -165,6 +165,7 @@ class PositionGuard:
         self.log_dir = log_dir
         self.post_trade_retries = max(0, int(post_trade_retries))
         self.post_trade_retry_delay = float(post_trade_retry_delay)
+        self.last_failsafe_verified_flat: bool = False
 
     def post_trade_verify(
         self,
@@ -222,6 +223,7 @@ class PositionGuard:
             flat_state = dataclasses.replace(
                 state,
                 position=0,
+                open_qty=0,
                 entry_price=0.0,
                 entry_time=None,
                 highest_profit=0.0,
@@ -332,6 +334,7 @@ class PositionGuard:
             new_state = dataclasses.replace(
                 restored,
                 position=pos_dir,
+                open_qty=abs(int(real_net)),
                 entry_price=entry_px,
                 entry_time=restored.entry_time or pd.Timestamp.now(),
                 trade_count=max(restored.trade_count, 1),
@@ -356,6 +359,7 @@ class PositionGuard:
         new_state = dataclasses.replace(
             restored,
             position=0,
+            open_qty=0,
             entry_price=0.0,
             entry_time=None,
             highest_profit=0.0,
@@ -392,6 +396,7 @@ class PositionGuard:
             new_state = dataclasses.replace(
                 state,
                 position=0,
+                open_qty=0,
                 entry_price=0.0,
                 entry_time=None,
                 highest_profit=0.0,
@@ -412,6 +417,7 @@ class PositionGuard:
             new_state = dataclasses.replace(
                 state,
                 position=pos_dir,
+                open_qty=abs(int(real_net)),
                 entry_price=avg_px,
                 entry_time=pd.Timestamp.now(),
                 trade_count=max(state.trade_count, 1),
@@ -421,6 +427,46 @@ class PositionGuard:
             )
             if notifier:
                 notifier.send(f"🚨 [盤中對帳接管] 發現券商部位 {real_net:+d} 口 @ {avg_px:.0f}，已納入停損/尾盤守護！", async_send=True)
+            if state_repo:
+                state_repo.save_state(new_state)
+            return new_state
+
+        if real_net != 0 and state.position != 0 and (real_net * state.position) < 0:
+            pos_dir = 1 if real_net > 0 else -1
+            avg_px = float(details.get("avg_price", 0.0) or 0.0)
+            logger.critical(
+                f"🚨 [盤中對帳方向衝突] 策略為 {state.position:+d} 但券商帳上為 {real_net:+d} 口 @ {avg_px:.0f}，強制對齊券商真實部位並停開新倉！"
+            )
+            new_state = dataclasses.replace(
+                state,
+                position=pos_dir,
+                open_qty=abs(int(real_net)),
+                entry_price=avg_px if avg_px > 0 else state.entry_price,
+                entry_time=pd.Timestamp.now(),
+                highest_profit=0.0,
+                hp_before_bar_ts=None,
+                hp_before_bar_val=0.0,
+                entries_halted=True,
+            )
+            if notifier:
+                notifier.send(
+                    f"🚨 [盤中對帳方向異常] 券商實際部位 {real_net:+d} 口 @ {avg_px:.0f} 與策略不符，已強制對齊並停開新倉！",
+                    async_send=True,
+                )
+            if state_repo:
+                state_repo.save_state(new_state)
+            return new_state
+
+        if real_net != 0 and state.position != 0 and state.open_qty != abs(int(real_net)):
+            logger.warning(
+                f"⚠️ [盤中對帳口數更新] 策略記錄 {state.open_qty} 口，券商實際 {abs(int(real_net))} 口，同步實際平倉口數！"
+            )
+            new_state = dataclasses.replace(state, open_qty=abs(int(real_net)))
+            if notifier:
+                notifier.send(
+                    f"⚠️ [盤中對帳] 部位口數調整為 {abs(int(real_net))} 口 (券商真實淨口數 {real_net:+d})，後續平倉將對齊此口數。",
+                    async_send=True,
+                )
             if state_repo:
                 state_repo.save_state(new_state)
             return new_state
@@ -435,35 +481,68 @@ class PositionGuard:
         state_repo: Optional[StateRepo] = None,
         max_attempts: int = 3,
     ) -> TradingDayState:
-        """13:09:00 ~ 13:10:00 安全底線死守平倉：直接依券商帳上淨部位 MKP IOC 強制補平"""
+        """13:09:00 ~ 13:10:00 安全底線死守平倉：依券商帳上淨部位 MKP IOC (末試升級 MKT) 強制補平，遇斷線自動重連"""
         target_code = state.contract_code or gateway.contract_code
         cur_state = state
+        self.last_failsafe_verified_flat = False
 
+        if not gateway.connected:
+            logger.warning("🔄 [收盤死守平倉] 偵測到券商未連線，嘗試立即重連...")
+            gateway.reconnect(target_code)
+
+        last_real_net: Optional[int] = None
         for attempt in range(1, max_attempts + 1):
+            px_type = "MKT" if (attempt == max_attempts and attempt > 1) else "MKP"
             details = gateway.query_position_details(contract_code=target_code)
             other_positions = details.get("other_positions") or []
             if other_positions:
-                self.flatten_other_month_positions(other_positions, gateway, notifier=notifier, price_type="MKP")
+                self.flatten_other_month_positions(other_positions, gateway, notifier=notifier, price_type=px_type)
 
             real_net = details.get("net")
-            if real_net is None or real_net == 0:
-                if cur_state.position != 0 and real_net == 0:
-                    cur_state = dataclasses.replace(cur_state, position=0, entries_halted=True)
+            last_real_net = real_net
+            if real_net is None:
+                logger.error(f"⚠️ [13:09 收盤死守平倉 #{attempt}] 查詢帳務回傳 None，嘗試重連後重試...")
+                gateway.reconnect(target_code)
+                time.sleep(0.3)
+                continue
+
+            if real_net == 0:
+                if cur_state.position != 0 or cur_state.open_qty != 0:
+                    cur_state = dataclasses.replace(cur_state, position=0, open_qty=0, entries_halted=True)
+                self.last_failsafe_verified_flat = True
                 break
 
             act = "SELL" if real_net > 0 else "BUY"
-            res = gateway.place_order(action=act, qty=abs(real_net), price_type="MKP", octype="Cover")
+            res = gateway.place_order(action=act, qty=abs(real_net), price_type=px_type, octype="Cover")
             if self.log_dir:
-                append_order_audit(self.log_dir, act, abs(real_net), "FailsafeCover", res)
+                append_order_audit(self.log_dir, act, abs(real_net), f"FailsafeCover({px_type})", res)
             logger.warning(
-                f"🛡️ [13:09 收盤死守平倉 #{attempt}] {act} {abs(real_net)}口 -> {res.status} @ {res.avg_price:.0f}"
+                f"🛡️ [13:09 收盤死守平倉 #{attempt} ({px_type})] {act} {abs(real_net)}口 -> {res.status} @ {res.avg_price:.0f}"
             )
             if res.ok:
-                cur_state = dataclasses.replace(cur_state, position=0, entries_halted=True)
+                cur_state = dataclasses.replace(cur_state, position=0, open_qty=0, entries_halted=True)
+                last_real_net = 0
+                self.last_failsafe_verified_flat = True
                 if notifier:
-                    notifier.send(f"🛡️ [13:09 收盤強制補平完成] {act} {abs(real_net)} 口 @ {res.avg_price:.0f}", async_send=True)
+                    notifier.send(
+                        f"🛡️ [13:09 收盤強制補平完成 ({px_type})] {act} {abs(real_net)} 口 @ {res.avg_price:.0f}",
+                        async_send=True,
+                    )
                 break
+            elif res.filled_qty > 0:
+                rem = max(0, abs(real_net) - int(res.filled_qty))
+                cur_state = dataclasses.replace(cur_state, open_qty=rem)
             time.sleep(0.3)
+
+        if cur_state.position != 0 and last_real_net != 0:
+            logger.critical(
+                f"🚨 [收盤死守平倉警訊] 重試 {max_attempts} 次後仍未確認平倉完成 (local={cur_state.position}, broker={last_real_net})，將於下一輪持續追平！"
+            )
+            if notifier:
+                notifier.send(
+                    f"🚨 [收盤強平未確認] {target_code} 仍未能確認歸零 (broker={last_real_net})，機器人將持續重連追平，請留意！",
+                    async_send=True,
+                )
 
         if state_repo:
             state_repo.save_state(cur_state)
