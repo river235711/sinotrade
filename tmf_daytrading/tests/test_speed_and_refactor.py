@@ -674,7 +674,7 @@ class TestSpeedAndRefactor(unittest.TestCase):
                 c_new = SimpleNamespace(code="TMFL6", name="微台指202612")
                 trader.api = mock_api
                 trader.contract = c_new
-                mock_resolve.side_effect = lambda api, code="TMFR1": c_old if code == "TMFK6" else c_new
+                mock_resolve.side_effect = lambda api, code="TMFR1", allow_fallback=True: c_old if code == "TMFK6" else c_new
                 trader.place_order = MagicMock(return_value={"status": "Simulated"})
 
                 strat = ORBStrategy(self.cfg, self.inst)
@@ -683,10 +683,53 @@ class TestSpeedAndRefactor(unittest.TestCase):
                 trader._periodic_reconcile(strat)
 
                 self.assertTrue(trader.entries_halted)
+                mock_resolve.assert_called_with(mock_api, code="TMFK6", allow_fallback=False)
                 trader.place_order.assert_called_once()
                 _, kwargs = trader.place_order.call_args
                 self.assertEqual(trader.place_order.call_args[0][0], "BUY")
                 self.assertEqual(kwargs.get("contract"), c_old)
+
+        # 2b. resolve_tmf_contract allow_fallback=False 在查無指定舊月合約時不誤退回 TMFR1，且 _reset_daily_flags 全數歸零
+        from live.market_data import resolve_tmf_contract
+        api_fb = MagicMock()
+        c_r1 = SimpleNamespace(code="TMFR1", target_code="TMFL6", name="微台指近月")
+        c_cur = SimpleNamespace(code="TMFL6", target_code="", name="微台指202612")
+        api_fb.contracts.futures.return_value = [c_r1, c_cur]
+        self.assertIsNone(resolve_tmf_contract(api_fb, code="TMFJ6", allow_fallback=False))
+        self.assertEqual(resolve_tmf_contract(api_fb, code="TMFJ6", allow_fallback=True), c_cur)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("live.shioaji_trader.get_mode_log_dir", return_value=tmp), \
+                 patch("live.shioaji_trader.TradeNotifier"):
+                trader = ShioajiTMFTrader(simulation=True)
+                trader._intrabar_sar_state = {"ts": pd.Timestamp("2026-11-13 09:20:00")}
+                trader._orb_finalized = True
+                trader._orb_report_sent = True
+                trader._offline_hc_alert_sent = True
+                trader._morning_wake_logged = True
+                trader._noon_cutoff_sent = True
+                trader._eod_close_notified = True
+                trader._eod_done_date = "2026-11-13"
+                trader._holiday_detected = True
+                trader._last_wake_price = 23100.0
+                trader.entries_halted = True
+                trader.pending_flatten = True
+                trader.order_failures = 2
+
+                trader._reset_daily_flags()
+                self.assertIsNone(trader._intrabar_sar_state)
+                self.assertFalse(trader._orb_finalized)
+                self.assertFalse(trader._orb_report_sent)
+                self.assertFalse(trader._offline_hc_alert_sent)
+                self.assertFalse(trader._morning_wake_logged)
+                self.assertFalse(trader._noon_cutoff_sent)
+                self.assertFalse(trader._eod_close_notified)
+                self.assertIsNone(trader._eod_done_date)
+                self.assertFalse(trader._holiday_detected)
+                self.assertEqual(trader._last_wake_price, 0.0)
+                self.assertFalse(trader.entries_halted)
+                self.assertFalse(trader.pending_flatten)
+                self.assertEqual(trader.order_failures, 0)
 
         # 3. load_tmf_contract 換約時退訂舊合約，且 _on_tick 過濾非訂閱合約 tick.code
         with tempfile.TemporaryDirectory() as tmp:

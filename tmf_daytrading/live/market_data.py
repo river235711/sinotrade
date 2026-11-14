@@ -26,7 +26,7 @@ logger = logging.getLogger("TMFTrader.MarketData")
 CNYES_TXF_URL = "https://ws.api.cnyes.com/ws/api/v1/charting/history?symbol=TWF:TXF:FUTURES&resolution=1&quote=1"
 
 
-def resolve_tmf_contract(api: Any, code: str = "TMFR1") -> Any:
+def resolve_tmf_contract(api: Any, code: str = "TMFR1", allow_fallback: bool = True) -> Any:
     """
     從 Shioaji API 解析 TMF 主力或指定合約；若為連續月合約 (如 TMFR1) 自動解出實際可下單月份合約
     """
@@ -61,7 +61,7 @@ def resolve_tmf_contract(api: Any, code: str = "TMFR1") -> Any:
             selected = raw_c
             break
 
-    if selected is None:
+    if selected is None and allow_fallback:
         for c in tmf_contracts:
             raw_c = _unwrap(c)
             if getattr(raw_c, "code", getattr(c, "code", "")) == "TMFR1":

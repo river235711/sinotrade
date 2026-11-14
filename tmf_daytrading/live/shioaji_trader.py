@@ -71,10 +71,6 @@ class ShioajiTMFTrader:
         self._tick_handler_api_id: Optional[int] = None
         self._subscribed_contract_code: Optional[str] = None
         self._subscribed_contract_obj: Any = None
-        self._intrabar_sar_state: Optional[dict] = None
-        self._orb_finalized: bool = False
-        self._orb_report_sent: bool = False
-        self._offline_hc_alert_sent: bool = False
         self.ca_activated: bool = False
         self._last_position_details: Optional[dict] = None
         self.notifier = TradeNotifier()
@@ -96,17 +92,29 @@ class ShioajiTMFTrader:
         self._wake_event = threading.Event()
         self._stop_requested = False
         self._active_strategy: Optional[ORBStrategy] = None
-        self._last_wake_price: float = 0.0
+
+        # 風控核心設定
+        self.is_kill_switch_triggered = False   # True 時拒絕所有委託 (含平倉)，僅供緊急手動使用
+        self.max_order_failures = 3
+
+        # 每日盤中可重置狀態旗標
+        self._reset_daily_flags()
+
+    def _reset_daily_flags(self):
+        """統一初始化與跨日重置單日盤中狀態與推播旗標，防止跨日換日漏清"""
+        self._intrabar_sar_state: Optional[dict] = None
+        self._orb_finalized: bool = False
+        self._orb_report_sent: bool = False
+        self._offline_hc_alert_sent: bool = False
+        self._morning_wake_logged: bool = False
+        self._noon_cutoff_sent: bool = False
         self._eod_close_notified: bool = False
         self._eod_done_date: Optional[str] = None
         self._holiday_detected: bool = False
-
-        # 風控狀態
-        self.is_kill_switch_triggered = False   # True 時拒絕所有委託 (含平倉)，僅供緊急手動使用
-        self.entries_halted = False             # True 時只允許平倉，不再開新倉
-        self.pending_flatten = False            # True 時代表已觸發平倉但帳上尚未歸零，每秒持續以 MKT+IOC 追殺直到 0 口
-        self.order_failures = 0                 # 開倉單連續未成交次數
-        self.max_order_failures = 3
+        self._last_wake_price: float = 0.0
+        self.entries_halted: bool = False
+        self.pending_flatten: bool = False
+        self.order_failures: int = 0
 
     def request_stop(self, signum=None, frame=None):
         """接收 SIGINT / SIGTERM 信號或外部呼叫，0 毫秒立即喚醒主迴圈並安全停止"""
@@ -681,7 +689,7 @@ class ShioajiTMFTrader:
                 continue
             action = "SELL" if other_net > 0 else "BUY"
             qty = abs(other_net)
-            other_contract = resolve_tmf_contract(self.api, code=other_code) if self.api is not None else None
+            other_contract = resolve_tmf_contract(self.api, code=other_code, allow_fallback=False) if self.api is not None else None
             if other_contract is None:
                 logger.critical(f"🚨 無法解析非當月 TMF 殘倉合約 {other_code} ({other_net:+d}口)，無法自動下單平倉，請立即手動檢查！")
                 self.notifier.send(f"🚨 [跨月殘倉警告] 帳上發現非當月合約 {other_code} ({other_net:+d}口) 且無法解析合約物件，請立即手動平倉！")
@@ -1359,6 +1367,146 @@ class ShioajiTMFTrader:
             self.notifier.send(f"⚠️ [08:35 開盤前健檢異常] {hc_err}", async_send=async_notify)
             return False
 
+    def _handle_day_rollover(
+        self,
+        cur_date_str: str,
+        base_cfg: ORBStrategyConfig,
+        data_dir: str,
+        processed_timestamps: set,
+    ) -> ORBStrategy:
+        """處理 00:00 跨日自動換日重置、重載當日 ATR 參數與連線狀態同步"""
+        self.bar_aggregator.clear()
+        self._reset_daily_flags()
+        processed_timestamps.clear()
+        strat_cfg, atr_info = config_for_date(base_cfg, data_dir, cur_date_str)
+        strategy = ORBStrategy(config=strat_cfg, inst_config=InstrumentConfig())
+        self._active_strategy = strategy
+
+        # 若 API 仍在線才載入合約與夜盤；若已離線休眠，留至 08:30 喚醒時完整載入 (夜盤05:00才完全收盤)
+        if self.api is not None:
+            self.load_overnight_levels_for_strategy(strategy, cur_date_str)
+            if self.load_tmf_contract(self._contract_code) is None:
+                logger.warning(f"⚠️ 跨日換日載入合約 ({self._contract_code}) 失敗，將於盤前喚醒或重連時重試。")
+
+        logger.info("=" * 75)
+        logger.info(f"🌅 [跨日自動換日] 進入新交易日 {cur_date_str}，已重新載入今日 20日 ATR 動態參數：")
+        logger.info(f"• 當前交易合約: {self._contract_code}")
+        logger.info(f"• 波動自適應: {describe(strat_cfg, atr_info)}")
+        if self.api is None:
+            logger.info("• 連線狀態: 💤 離線省電深度睡眠中 (將於今日 08:30:00 自動喚醒登入)")
+        logger.info("=" * 75)
+        return strategy
+
+    def _handle_post_close_phase(
+        self,
+        strategy: ORBStrategy,
+        base_cfg: ORBStrategyConfig,
+        data_dir: str,
+        cur_date_str: str,
+        now_str: str,
+        shutdown_time: str,
+        last_standby_log: float,
+    ) -> float:
+        """處理 13:10 收盤後之殘留部位追平、13:45 數據滾動結算與離線深度休眠待機"""
+        final_pos = 0 if (self.api is None and not self.pending_flatten) else self.get_real_position()
+        if final_pos is None and self.api is not None and not self.simulation:
+            self.reconnect()
+            final_pos = self.get_real_position()
+        if final_pos or self.pending_flatten:
+            logger.critical(
+                f"🚨 [收盤後不死鳥追平] 已過 {shutdown_time} 帳上仍有殘留部位 ({final_pos})，"
+                f"拒絕進入待機，每 2 秒持續以 MKT+IOC 強制追平直到 0 口！"
+            )
+            real_hint = _UNSET if final_pos is None else final_pos
+            self._relentless_flatten_step(strategy, real_pos=real_hint)
+            self._wake_event.clear()
+            self._wake_event.wait(timeout=2.0)
+            return last_standby_log
+
+        # 13:10:00 嚴格當沖平倉已完成 (帳上保證 0 口部位)
+        if not getattr(self, "_eod_close_notified", False):
+            self._eod_close_notified = True
+            self._save_state(strategy)
+            self.notifier.send(
+                f"🛡️ [13:10 當沖平倉完成]\n"
+                f"收盤風控稽核通過，帳上部位確認為 0 口！\n"
+                f"• 今日無留倉、零過夜風險。\n"
+                f"• 等待 13:45 台指日盤收盤數據結算..."
+            )
+
+        # 檢查是否到達 13:45:15 (台指日盤正式收盤)，抓取今日完整 300 根 K 棒執行滾動回測與日總結
+        if now_str >= "13:45:15" and self._eod_done_date != cur_date_str:
+            self._eod_done_date = cur_date_str
+            self._save_state(strategy)
+            logger.info(f"🏁 日盤正式收盤 (13:45)！帳上確認 0 部位，開始執行今日 ({cur_date_str}) 盤後總結與數據滾動...")
+            try:
+                from live.update_20days import roll_20days
+                roll_20days(push_git=True)
+            except Exception as roll_err:
+                logger.warning(f"自動滾動更新 20 日資料略過: {roll_err}")
+            next_cfg, next_info = config_for_date(base_cfg, data_dir, "9999-12-31")
+            logger.info("=" * 75)
+            logger.info("🌙 [跨日待機模式] 今日日報表與 20 日回測已更新，進入盤後低耗待命守護！")
+            logger.info(f"📐 下一交易日預載參數: {describe(next_cfg, next_info)}")
+            logger.info("=" * 75)
+            self.notifier.send(
+                f"🏁 [13:45 日盤正式收盤總結]\n"
+                f"今日 ({cur_date_str}) 日盤正式收盤！\n"
+                f"• 完整 300 根 1分K 已歸檔\n"
+                f"• 20 日滾動資料集已更新並推送到 GitHub\n"
+                f"• 下一交易日預載 ATR 參數已生效：\n  {describe(next_cfg, next_info)}"
+            )
+            # 盤後安全登出：正式進入深度省電防打擾睡眠，免除夜間維護 503 警報與網路消耗
+            if self.api is not None and strategy.position == 0 and not self.pending_flatten:
+                self.logout_and_sleep(reason="13:45 盤後結算完成 (明日 08:30 自動喚醒)")
+        elif now_str < "13:45:15" and self._eod_done_date != cur_date_str:
+            if time.time() - last_standby_log >= 300.0:
+                last_standby_log = time.time()
+                logger.info(f"☕ [{now_str}] 今日當沖交易已完成 (0部位)，等待 13:45:15 台指日盤正式收盤後執行滾動回測與日總結...")
+            self._wake_event.clear()
+            self._wake_event.wait(timeout=5.0)
+            return last_standby_log
+
+        if time.time() - last_standby_log >= 600.0:
+            last_standby_log = time.time()
+            logger.info(f"🌙 [{now_str}] 盤後待機守護中 (帳上零部位)，等待下一交易日 08:45:00 日盤開盤...")
+        self._wake_event.clear()
+        self._wake_event.wait(timeout=5.0)
+        return last_standby_log
+
+    def _handle_premarket_phase(
+        self,
+        strategy: ORBStrategy,
+        active_date_str: str,
+        now_str: str,
+        last_standby_log: float,
+    ) -> float:
+        """處理交易日清晨 (00:00:00 ~ 08:44:59) 之 08:30 自動喚醒與 08:35 開盤前健檢"""
+        if now_str >= "08:30:00" and self.api is None:
+            logger.info(f"⏰ [{now_str}] 到達 08:30 預排定時，啟動開盤前自動登入與連線...")
+            if self.wake_and_login(reason="08:30 開盤前自動喚醒"):
+                self.load_overnight_levels_for_strategy(strategy, active_date_str)
+
+        if now_str >= "08:35:00" and not getattr(self, "_morning_wake_logged", False):
+            if self.api is None or self.contract is None:
+                if self.wake_and_login(reason="08:35 健檢前自動重連嘗試"):
+                    self.load_overnight_levels_for_strategy(strategy, active_date_str)
+            if self.api is not None and self.contract is not None:
+                self._run_premarket_health_check(async_notify=False)
+            else:
+                # 連線尚未恢復時保留 _morning_wake_logged=False，待連線上線後自動補做完整健檢
+                if not getattr(self, "_offline_hc_alert_sent", False):
+                    self._offline_hc_alert_sent = True
+                    warn_msg = "⚠️ [08:35 開盤前健檢延後] 尚未連上 Shioaji / 綁定合約，將於連線恢復後自動補做完整健檢！"
+                    logger.warning(warn_msg)
+                    self.notifier.send(warn_msg)
+        elif time.time() - last_standby_log >= 1800.0:
+            last_standby_log = time.time()
+            logger.info(f"🌙 [{now_str}] 開盤前待命守護中 (帳上零部位)，等待今日 08:45:00 日盤開盤...")
+        self._wake_event.clear()
+        self._wake_event.wait(timeout=5.0)
+        return last_standby_log
+
     def run_intraday_bot(self, strat_cfg: ORBStrategyConfig = None):
         """
         啟動日盤全自動監控與下單迴圈 (08:45 ~ 13:24)
@@ -1387,13 +1535,11 @@ class ShioajiTMFTrader:
         shutdown_time = getattr(strat_cfg, "shutdown_time", "13:10:00")
 
         # 預先讀取今日狀態檔之收盤通知旗標 (避免盤後重啟重複發送 13:10 / 13:45 通知與重跑滾動更新)
-        eod_done_date = None
         saved_init = self._load_state()
         if saved_init and saved_init.get("date") == today_str:
             self._eod_close_notified = bool(saved_init.get("eod_close_notified", False))
             if saved_init.get("eod_done", False):
                 self._eod_done_date = today_str
-                eod_done_date = today_str
 
         logger.info("=" * 75)
         logger.info("🤖 TMF 微台指 ORB Pro 自動當沖機器人 (雙速極速版 + ATR 動態波動自適應) 已啟動！")
@@ -1453,40 +1599,13 @@ class ShioajiTMFTrader:
                 # 跨日自動換日重置 (00:00 過後自動載入新交易日 ATR 參數並清空前日快取)
                 if cur_date_str != active_date_str:
                     active_date_str = cur_date_str
-                    self.bar_aggregator.clear()
-                    self._intrabar_sar_state = None
-                    self._orb_finalized = False
-                    self._orb_report_sent = False
-                    self._offline_hc_alert_sent = False
                     _last_struct_sig = None
                     _prefix_state = None
-                    processed_timestamps.clear()
-                    self.entries_halted = False
-                    self.pending_flatten = False
-                    self._morning_wake_logged = False
-                    self._noon_cutoff_sent = False
-                    self._eod_close_notified = False
-                    self._eod_done_date = None
-                    self._holiday_detected = False
                     holiday_empty_since = 0.0
-                    self.order_failures = 0
-                    strat_cfg, atr_info = config_for_date(base_cfg, data_dir, active_date_str)
-                    strategy = ORBStrategy(config=strat_cfg, inst_config=InstrumentConfig())
-                    self._active_strategy = strategy
-                    
-                    # 若 API 仍在線才載入合約與夜盤；若已離線休眠，留至 08:30 喚醒時完整載入 (夜盤05:00才完全收盤)
-                    if self.api is not None:
-                        self.load_overnight_levels_for_strategy(strategy, active_date_str)
-                        if self.load_tmf_contract(self._contract_code) is None:
-                            logger.warning(f"⚠️ 跨日換日載入合約 ({self._contract_code}) 失敗，將於盤前喚醒或重連時重試。")
-
-                    logger.info("=" * 75)
-                    logger.info(f"🌅 [跨日自動換日] 進入新交易日 {active_date_str}，已重新載入今日 20日 ATR 動態參數：")
-                    logger.info(f"• 當前交易合約: {self._contract_code}")
-                    logger.info(f"• 波動自適應: {describe(strat_cfg, atr_info)}")
-                    if self.api is None:
-                        logger.info("• 連線狀態: 💤 離線省電深度睡眠中 (將於今日 08:30:00 自動喚醒登入)")
-                    logger.info("=" * 75)
+                    strategy = self._handle_day_rollover(active_date_str, base_cfg, data_dir, processed_timestamps)
+                    strat_cfg = strategy.config
+                    failsafe_time = getattr(strat_cfg, "failsafe_close_time", "13:09:00")
+                    shutdown_time = getattr(strat_cfg, "shutdown_time", "13:10:00")
 
                 # 盤中不死鳥追平：若前一秒平倉未果 (pending_flatten=True)，不等待下一根 K 棒，每秒持續以 MKT+IOC 追殺直到 0 口
                 if self.pending_flatten:
@@ -1507,69 +1626,9 @@ class ShioajiTMFTrader:
 
                 # 第三道防線：13:10:00 後完成當日收盤檢查；若帳上仍有殘留部位，絕不進入待機，每隔 2 秒持續自動重連並以 MKT+IOC 追殺直到 0 口！
                 if now_str >= shutdown_time:
-                    # 若已離線休眠 (api is None) 且無待平倉，說明之前已確認 0 部位並正式休眠，不再呼叫券商查詢
-                    final_pos = 0 if (self.api is None and not self.pending_flatten) else self.get_real_position()
-                    if final_pos is None and self.api is not None and not self.simulation:
-                        self.reconnect()
-                        final_pos = self.get_real_position()
-                    if final_pos or self.pending_flatten:
-                        logger.critical(f"🚨 [收盤後不死鳥追平] 已過 {shutdown_time} 帳上仍有殘留部位 ({final_pos})，拒絕進入待機，每 2 秒持續以 MKT+IOC 強制追平直到 0 口！")
-                        real_hint = _UNSET if final_pos is None else final_pos
-                        self._relentless_flatten_step(strategy, real_pos=real_hint)
-                        self._wake_event.clear()
-                        self._wake_event.wait(timeout=2.0)
-                        continue
-
-                    # 13:10:00 嚴格當沖平倉已完成 (帳上保證 0 口部位)
-                    if not getattr(self, "_eod_close_notified", False):
-                        self._eod_close_notified = True
-                        self._save_state(strategy)
-                        self.notifier.send(
-                            f"🛡️ [13:10 當沖平倉完成]\n"
-                            f"收盤風控稽核通過，帳上部位確認為 0 口！\n"
-                            f"• 今日無留倉、零過夜風險。\n"
-                            f"• 等待 13:45 台指日盤收盤數據結算..."
-                        )
-
-                    # 檢查是否到達 13:45:15 (台指日盤正式收盤)，抓取今日完整 300 根 K 棒執行滾動回測與日總結
-                    if now_str >= "13:45:15" and eod_done_date != cur_date_str:
-                        eod_done_date = cur_date_str
-                        self._eod_done_date = cur_date_str
-                        self._save_state(strategy)
-                        logger.info(f"🏁 日盤正式收盤 (13:45)！帳上確認 0 部位，開始執行今日 ({cur_date_str}) 盤後總結與數據滾動...")
-                        try:
-                            from live.update_20days import roll_20days
-                            roll_20days(push_git=True)
-                        except Exception as roll_err:
-                            logger.warning(f"自動滾動更新 20 日資料略過: {roll_err}")
-                        next_cfg, next_info = config_for_date(base_cfg, data_dir, "9999-12-31")
-                        logger.info("=" * 75)
-                        logger.info("🌙 [跨日待機模式] 今日日報表與 20 日回測已更新，進入盤後低耗待命守護！")
-                        logger.info(f"📐 下一交易日預載參數: {describe(next_cfg, next_info)}")
-                        logger.info("=" * 75)
-                        self.notifier.send(
-                            f"🏁 [13:45 日盤正式收盤總結]\n"
-                            f"今日 ({cur_date_str}) 日盤正式收盤！\n"
-                            f"• 完整 300 根 1分K 已歸檔\n"
-                            f"• 20 日滾動資料集已更新並推送到 GitHub\n"
-                            f"• 下一交易日預載 ATR 參數已生效：\n  {describe(next_cfg, next_info)}"
-                        )
-                        # 盤後安全登出：正式進入深度省電防打擾睡眠，免除夜間維護 503 警報與網路消耗
-                        if self.api is not None and strategy.position == 0 and not self.pending_flatten:
-                            self.logout_and_sleep(reason="13:45 盤後結算完成 (明日 08:30 自動喚醒)")
-                    elif now_str < "13:45:15" and eod_done_date != cur_date_str:
-                        if time.time() - last_standby_log >= 300.0:
-                            last_standby_log = time.time()
-                            logger.info(f"☕ [{now_str}] 今日當沖交易已完成 (0部位)，等待 13:45:15 台指日盤正式收盤後執行滾動回測與日總結...")
-                        self._wake_event.clear()
-                        self._wake_event.wait(timeout=5.0)
-                        continue
-
-                    if time.time() - last_standby_log >= 600.0:
-                        last_standby_log = time.time()
-                        logger.info(f"🌙 [{now_str}] 盤後待機守護中 (帳上零部位)，等待下一交易日 08:45:00 日盤開盤...")
-                    self._wake_event.clear()
-                    self._wake_event.wait(timeout=5.0)
+                    last_standby_log = self._handle_post_close_phase(
+                        strategy, base_cfg, data_dir, cur_date_str, now_str, shutdown_time, last_standby_log
+                    )
                     continue
 
                 # 週末休市待機 (週六、週日)
@@ -1585,30 +1644,9 @@ class ShioajiTMFTrader:
 
                 # 交易日清晨開盤前待機 (00:00:00 ~ 08:44:59)
                 if now_str < "08:45:00":
-                    # 08:30:00 開盤前定時自動喚醒登入並載入夜盤數據
-                    if now_str >= "08:30:00" and self.api is None:
-                        logger.info(f"⏰ [{now_str}] 到達 08:30 預排定時，啟動開盤前自動登入與連線...")
-                        if self.wake_and_login(reason="08:30 開盤前自動喚醒"):
-                            self.load_overnight_levels_for_strategy(strategy, active_date_str)
-
-                    if now_str >= "08:35:00" and not getattr(self, "_morning_wake_logged", False):
-                        if self.api is None or self.contract is None:
-                            if self.wake_and_login(reason="08:35 健檢前自動重連嘗試"):
-                                self.load_overnight_levels_for_strategy(strategy, active_date_str)
-                        if self.api is not None and self.contract is not None:
-                            self._run_premarket_health_check(async_notify=False)
-                        else:
-                            # 連線尚未恢復時保留 _morning_wake_logged=False，待連線上線後自動補做完整健檢
-                            if not getattr(self, "_offline_hc_alert_sent", False):
-                                self._offline_hc_alert_sent = True
-                                warn_msg = "⚠️ [08:35 開盤前健檢延後] 尚未連上 Shioaji / 綁定合約，將於連線恢復後自動補做完整健檢！"
-                                logger.warning(warn_msg)
-                                self.notifier.send(warn_msg)
-                    elif time.time() - last_standby_log >= 1800.0:
-                        last_standby_log = time.time()
-                        logger.info(f"🌙 [{now_str}] 開盤前待命守護中 (帳上零部位)，等待今日 08:45:00 日盤開盤...")
-                    self._wake_event.clear()
-                    self._wake_event.wait(timeout=5.0)
+                    last_standby_log = self._handle_premarket_phase(
+                        strategy, active_date_str, now_str, last_standby_log
+                    )
                     continue
 
                 # 平時定期對帳
