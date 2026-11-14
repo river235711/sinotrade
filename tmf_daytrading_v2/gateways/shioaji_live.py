@@ -289,30 +289,48 @@ class ShioajiLiveGateway(BrokerGateway):
             logger.error("❌ 未設定 SHIOAJI_API_KEY / SHIOAJI_SECRET_KEY！")
             return False
 
-        self.api = sj.Shioaji(simulation=False)
-        logger.info("📡 正在連線至永豐金 Shioaji [實盤] 伺服器...")
-        self.api.login(api_key=self.sj_cfg.api_key, secret_key=self.sj_cfg.secret_key)
+        api = None
+        try:
+            self.connected = False
+            self.ca_activated = False
+            api = sj.Shioaji(simulation=False)
+            logger.info("📡 正在連線至永豐金 Shioaji [實盤] 伺服器...")
+            api.login(api_key=self.sj_cfg.api_key, secret_key=self.sj_cfg.secret_key)
 
-        self.ca_activated = False
-        ca_path = os.path.expanduser(self.sj_cfg.ca_path or "")
-        if ca_path and os.path.exists(ca_path):
-            self.api.activate_ca(
-                ca_path=ca_path,
-                ca_passwd=self.sj_cfg.ca_passwd,
-                person_id=self.sj_cfg.person_id,
-            )
-            self.ca_activated = True
-            logger.info("✅ 實盤數位憑證 (CA) 驗證通過！")
-        else:
-            logger.warning(f"⚠️ 找不到憑證檔 ({ca_path})，實盤下單可能失敗。")
+            ca_path = os.path.expanduser(self.sj_cfg.ca_path or "")
+            if ca_path and os.path.exists(ca_path):
+                api.activate_ca(
+                    ca_path=ca_path,
+                    ca_passwd=self.sj_cfg.ca_passwd,
+                    person_id=self.sj_cfg.person_id,
+                )
+                self.ca_activated = True
+                logger.info("✅ 實盤數位憑證 (CA) 驗證通過！")
+            else:
+                logger.warning(f"⚠️ 找不到憑證檔 ({ca_path})，實盤下單可能失敗。")
 
-        self.contract = self.resolve_contract(target_req, allow_fallback=True)
-        if self.contract is None:
-            logger.error(f"❌ 找不到合約代碼: {target_req}")
+            self.api = api
+            contract = self.resolve_contract(target_req, allow_fallback=True)
+            if contract is None:
+                logger.error(f"❌ 找不到合約代碼: {target_req}")
+                self.close()
+                return False
+            self.contract = contract
+            self.contract_code = getattr(contract, "code", target_req)
+            self.connected = True
+            return True
+        except Exception as e:
+            logger.error(f"❌ Shioaji 實盤連線/登入失敗: {e}")
+            if api is not None:
+                try:
+                    api.logout()
+                except Exception:
+                    pass
+            self.api = None
+            self.contract = None
+            self.connected = False
+            self.ca_activated = False
             return False
-        self.contract_code = getattr(self.contract, "code", target_req)
-        self.connected = True
-        return True
 
     def reconnect(self, contract_code: str = "") -> bool:
         logger.warning("🔄 正在重新連線 Shioaji 實盤伺服器...")
@@ -364,8 +382,12 @@ class ShioajiLiveGateway(BrokerGateway):
             except Exception:
                 pass
 
-        self.api.quote.subscribe(self.contract, quote_type="tick", version="v1")
-        return True
+        try:
+            self.api.quote.subscribe(self.contract, quote_type="tick", version="v1")
+            return True
+        except Exception as e:
+            logger.error(f"❌ 訂閱實盤 Tick 行情失敗: {e}")
+            return False
 
     def fetch_kbars(self, start_date: str, end_date: str, timeout: int = 5000) -> pd.DataFrame:
         if self.api is None or self.contract is None:

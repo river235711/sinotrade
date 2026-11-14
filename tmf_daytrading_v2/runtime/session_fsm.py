@@ -113,6 +113,9 @@ class SessionFSM:
         self._intrabar_sar_state: Optional[dict] = None
         self._closed_bar_count: int = 0
         self._holiday_empty_since_ts: Optional[float] = None
+        self._pending_flatten: bool = False
+        self._initial_history_synced: bool = False
+        self._last_history_sync_attempt_ts: float = 0.0
         self.state: TradingDayState = self.rollover_day(datetime.date.today().strftime("%Y-%m-%d"))
 
     @staticmethod
@@ -163,17 +166,41 @@ class SessionFSM:
         )
         # 重連後重啟歷史 K 棒回補，以自動補齊斷線期間缺漏的 1 分 K (但不重播已收盤舊訊號下單)
         self.bar_aggregator.history_loaded = False
+        self._last_history_sync_attempt_ts = 0.0
         logger.info(f"✅ [{reason}] 券商重連與合約同步完成！合約={self.state.contract_code}")
         return True
 
-    def _sync_intraday_history(self, today_str: str, now_ts: pd.Timestamp) -> None:
+    def _sync_intraday_history(
+        self,
+        today_str: str,
+        now_ts: pd.Timestamp,
+        now_dt: Optional[datetime.datetime] = None,
+    ) -> None:
         """
-        載入或回補當日歷史 1 分 K，並將啟動/斷線重連前已收盤的時間戳預先標記為已處理，
-        嚴防盤中重啟時誤把數分鐘或數小時前的歷史 K 棒訊號重播下單；
-        若已有持倉且具真實 entry_time，順便回補該段期間之 MFE 最高浮盈。
+        載入或回補當日歷史 1 分 K，附帶 08:45 首分鐘與 30 秒空回報冷卻保護以防 API 狂刷：
+        - 首次啟動：將 < now_ts 的歷史 K 棒預標記為已處理，嚴防盤中重啟誤下舊單；
+        - 盤中重連：保留剛於本分鐘收線的 now_ts - 1min 供正常評估，僅預標記更早期 < (now_ts - 1min) 的斷線缺口；
+        - 若已有持倉且具真實 entry_time，順便回補該段期間之 MFE 最高浮盈。
         """
         if self.bar_aggregator.history_loaded or not self.gateway.connected:
             return
+
+        cur_dt = now_dt or now_ts.to_pydatetime()
+        now_epoch = cur_dt.timestamp()
+        now_hms = cur_dt.strftime("%H:%M:%S")
+
+        # 08:45:00 ~ 08:45:59 首分鐘尚無已收線日盤 1 分 K，直接標記完成以免每秒狂打 api.kbars
+        if now_hms < "08:46:00":
+            self.bar_aggregator.history_loaded = True
+            self._initial_history_synced = True
+            return
+
+        if (
+            self._last_history_sync_attempt_ts > 0.0
+            and (now_epoch - self._last_history_sync_attempt_ts) < 30.0
+        ):
+            return
+        self._last_history_sync_attempt_ts = now_epoch
 
         loaded = 0
         try:
@@ -184,7 +211,7 @@ class SessionFSM:
             logger.warning(f"⚠️ 抓取券商當日歷史 K 棒失敗: {e}")
 
         if not self.bar_aggregator.history_loaded and getattr(self.gateway, "api", None) is not None:
-            if now_ts.strftime("%H:%M:%S") >= "08:47:00":
+            if now_hms >= "08:47:00":
                 try:
                     bk_df = fetch_cnyes_day_kbars(today_str, timeout=5)
                     if not bk_df.empty:
@@ -196,15 +223,19 @@ class SessionFSM:
                 except Exception as e:
                     logger.warning(f"⚠️ CNYES 備援 K 棒抓取失敗: {e}")
 
-        if not self.bar_aggregator.history_loaded and loaded <= 0:
+        was_initial_synced = self._initial_history_synced
+        if self.bar_aggregator.history_loaded or loaded > 0:
+            self._initial_history_synced = True
+        else:
             return
 
         synced_df = self.bar_aggregator.to_dataframe(today_str=today_str)
         if synced_df.empty:
             return
 
+        skip_before_ts = now_ts if not was_initial_synced else (now_ts - pd.Timedelta(minutes=1))
         for ts in synced_df.index:
-            if ts < now_ts:
+            if ts < skip_before_ts:
                 self._processed_timestamps.add(ts)
 
         if self.state.position != 0 and self.state.entry_time is not None and self.state.entry_price > 0:
@@ -251,6 +282,9 @@ class SessionFSM:
         self._intrabar_sar_state = None
         self._closed_bar_count = 0
         self._holiday_empty_since_ts = None
+        self._pending_flatten = False
+        self._initial_history_synced = False
+        self._last_history_sync_attempt_ts = 0.0
         return new_state
 
     def execute_order_intent(
@@ -315,17 +349,25 @@ class SessionFSM:
             )
             append_order_audit(self.log_dir, close_act, cover_qty, "Cover", res, signal_price=intent.price)
             if not res.ok and res.filled_qty <= 0:
-                logger.error(f"❌ 平倉委託未成交 ({close_act}): {res.status}")
+                self._pending_flatten = True
+                logger.critical(
+                    f"🚨 [啟動不死鳥追平] 平倉委託未成交 ({close_act} {cover_qty}口: {res.status})，將於每輪持續以 MKP/MKT 追平！"
+                )
+                self.notifier.send(
+                    f"🚨 [平倉未成交警報] {close_act} {cover_qty} 口被拒/取消 ({res.status})，已啟動不死鳥跨秒自動追平！",
+                    async_send=True,
+                )
                 return self.state, None
 
             filled = int(res.filled_qty) if res.filled_qty > 0 else cover_qty
             if not res.ok and filled < cover_qty:
                 rem_qty = cover_qty - filled
+                self._pending_flatten = True
                 self.state = dataclasses.replace(self.state, open_qty=rem_qty)
                 self.state_repo.save_state(self.state)
-                logger.warning(f"⚠️ 平倉委託部分成交 ({close_act} {filled}/{cover_qty}口)，剩餘 {rem_qty} 口續留平倉保護！")
+                logger.warning(f"⚠️ 平倉委託部分成交 ({close_act} {filled}/{cover_qty}口)，剩餘 {rem_qty} 口續留不死鳥追平保護！")
                 self.notifier.send(
-                    f"⚠️ [部分平倉] {close_act} 已平 {filled}/{cover_qty} 口 @ {res.avg_price:.0f}，剩餘 {rem_qty} 口持續平倉。",
+                    f"⚠️ [部分平倉] {close_act} 已平 {filled}/{cover_qty} 口 @ {res.avg_price:.0f}，剩餘 {rem_qty} 口啟動不死鳥持續平倉。",
                     async_send=True,
                 )
                 self.state = self.position_guard.post_trade_verify(
@@ -337,6 +379,8 @@ class SessionFSM:
                     state_repo=self.state_repo,
                     notifier=self.notifier,
                 )
+                if self.state.position == 0:
+                    self._pending_flatten = False
                 return self.state, None
 
             fill_px = res.avg_price if res.avg_price > 0 else intent.price
@@ -371,15 +415,23 @@ class SessionFSM:
             )
             append_order_audit(self.log_dir, close_act, cover_qty, "SAR_Cover", close_res, signal_price=intent.price)
             if not close_res.ok and close_res.filled_qty <= 0:
-                logger.error(f"❌ SAR 第一腳平倉未成交 ({close_act}): {close_res.status}")
+                self._pending_flatten = True
+                logger.critical(
+                    f"🚨 [啟動不死鳥追平] SAR 第一腳平倉未成交 ({close_act} {cover_qty}口: {close_res.status})，暫停反手並每秒追平原倉！"
+                )
+                self.notifier.send(
+                    f"🚨 [SAR 停損平倉未成交] {close_act} {cover_qty} 口被拒/取消 ({close_res.status})，已啟動不死鳥自動追平！",
+                    async_send=True,
+                )
                 return self.state, None
 
             close_filled = int(close_res.filled_qty) if close_res.filled_qty > 0 else cover_qty
             if not close_res.ok and close_filled < cover_qty:
                 rem_qty = cover_qty - close_filled
+                self._pending_flatten = True
                 self.state = dataclasses.replace(self.state, open_qty=rem_qty)
                 self.state_repo.save_state(self.state)
-                logger.error(f"⚠️ SAR 第一腳僅部分平倉 ({close_filled}/{cover_qty}口)，暫停反手開新倉以防部位錯亂！")
+                logger.error(f"⚠️ SAR 第一腳僅部分平倉 ({close_filled}/{cover_qty}口)，暫停反手並啟動不死鳥追平剩餘部位！")
                 self.state = self.position_guard.post_trade_verify(
                     self.state,
                     self.gateway,
@@ -389,6 +441,8 @@ class SessionFSM:
                     state_repo=self.state_repo,
                     notifier=self.notifier,
                 )
+                if self.state.position == 0:
+                    self._pending_flatten = False
                 return self.state, None
 
             close_px = close_res.avg_price if close_res.avg_price > 0 else intent.price
@@ -650,6 +704,19 @@ class SessionFSM:
             async_send=True,
         )
 
+    def _run_pending_flatten(self) -> None:
+        """不死鳥跨秒追平：若平倉/SAR第一腳曾遭拒單或僅部分成交，每輪優先以 MKP/MKT 追平直到帳上確認歸零"""
+        if not self._pending_flatten:
+            return
+        if not self.gateway.connected:
+            self.wake_and_login("不死鳥追平前自動重連")
+        self.state = self.position_guard.enforce_failsafe_close(
+            self.state, self.gateway, notifier=self.notifier, state_repo=self.state_repo
+        )
+        if self.state.position == 0 and self.position_guard.last_failsafe_verified_flat:
+            self._pending_flatten = False
+            logger.info("✅ [不死鳥追平] 券商帳上部位已確認歸零，解除追平警報狀態。")
+
     def step(self, now_dt: Optional[datetime.datetime] = None) -> SessionPhase:
         """執行單次主狀態機迴圈邏輯 (便於整合與單元測試確定性驅動)"""
         now = now_dt or datetime.datetime.now()
@@ -663,14 +730,17 @@ class SessionFSM:
         phase = self.determine_phase(now, cfg)
 
         self._handle_command_if_any()
+        self._run_pending_flatten()
+        if self._pending_flatten:
+            return phase
 
         if now.weekday() >= 5:
-            if self.gateway.connected and self.state.position == 0:
+            if self.gateway.connected and self.state.position == 0 and not self._pending_flatten:
                 self.logout_and_sleep("週末休市")
             return phase
 
         if phase == SessionPhase.PREMARKET_STANDBY:
-            if now_str < "08:30:00" and self.gateway.connected and self.state.position == 0:
+            if now_str < "08:30:00" and self.gateway.connected and self.state.position == 0 and not self._pending_flatten:
                 self.logout_and_sleep("盤前離線待命")
             elif now_str >= "08:30:00" and not self.gateway.connected:
                 self.wake_and_login("08:30 開盤前自動喚醒")
@@ -712,7 +782,7 @@ class SessionFSM:
                 self.wake_and_login("盤中自動重連")
 
             now_ts = pd.Timestamp(now.replace(second=0, microsecond=0))
-            self._sync_intraday_history(today_str, now_ts)
+            self._sync_intraday_history(today_str, now_ts, now_dt=now)
 
             if self.bar_aggregator.needs_snapshot_sync(now_ts) and self.gateway.connected:
                 snap = self.gateway.fetch_snapshot_price(today_str)
@@ -755,7 +825,7 @@ class SessionFSM:
                 )
             else:
                 now_ts = pd.Timestamp(now.replace(second=0, microsecond=0))
-                self._sync_intraday_history(today_str, now_ts)
+                self._sync_intraday_history(today_str, now_ts, now_dt=now)
                 if self.bar_aggregator.needs_snapshot_sync(now_ts) and self.gateway.connected:
                     snap = self.gateway.fetch_snapshot_price(today_str)
                     if snap is not None:

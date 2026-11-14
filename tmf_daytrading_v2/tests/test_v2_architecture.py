@@ -703,18 +703,22 @@ class TestRuntimeFSMAndGuards(unittest.TestCase):
             self.assertEqual(fsm_flat.state.orb_high, 23100.0)
             self.assertEqual(len(gw.orders_placed), 0)
 
-            # 斷線再透過 wake_and_login 重連 -> 會自動重啟 history_loaded 進行缺漏 K 棒回補，仍不重播舊單
+            # 斷線再透過 wake_and_login 重連 -> 會自動重啟 history_loaded 進行缺漏 K 棒回補，且超過 1 分鐘的斷線舊訊號不重播
             fsm_flat.logout_and_sleep("測試斷線")
             self.assertFalse(gw.connected)
             self.assertTrue(fsm_flat.wake_and_login("測試重連"))
             self.assertFalse(fsm_flat.bar_aggregator.history_loaded)
-            extra_ts = pd.Timestamp("2026-11-16 10:05:00")
-            gw.kbars_df.loc[extra_ts] = [23140.0, 23148.0, 23135.0, 23142.0, 25]
-            fsm_flat.step(datetime.datetime(2026, 11, 16, 10, 6, 5))
-            self.assertTrue(fsm_flat.bar_aggregator.has_bar(extra_ts))
+            outage_ts = pd.Timestamp("2026-11-16 10:05:00")
+            recent_closed_ts = pd.Timestamp("2026-11-16 10:06:00")
+            gw.kbars_df.loc[outage_ts] = [23140.0, 23148.0, 23135.0, 23142.0, 25]
+            gw.kbars_df.loc[recent_closed_ts] = [23050.0, 23060.0, 23045.0, 23055.0, 20]
+            fsm_flat.step(datetime.datetime(2026, 11, 16, 10, 7, 5))
+            self.assertTrue(fsm_flat.bar_aggregator.has_bar(outage_ts))
+            self.assertTrue(fsm_flat.bar_aggregator.has_bar(recent_closed_ts))
             self.assertEqual(len(gw.orders_placed), 0)
 
             # 情境 B：10:05 持多單 (09:40 @ 23100) 重啟接管 -> 不被 08:50 (22940) 誤觸停損，且最高浮盈回補 +90
+            gw.position_details["net"] = 1
             fsm_hold = SessionFSM(gateway=gw, base_dir=tmp, log_dir=log_dir, quantity=1, base_cfg=cfg)
             fsm_hold.rollover_day("2026-11-16")
             fsm_hold.state = dataclasses.replace(
@@ -822,6 +826,107 @@ class TestRuntimeFSMAndGuards(unittest.TestCase):
             self.assertEqual(s_flip.position, -1)
             self.assertEqual(s_flip.open_qty, 2)
             self.assertTrue(s_flip.entries_halted)
+
+    def test_pending_flatten_retries_until_flat_after_exit_or_sar_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "data"), exist_ok=True)
+            log_dir = os.path.join(tmp, "logs", "live")
+            cfg = ORBStrategyConfig(use_atr_scaling=False, use_overnight_wall_filter=False, enable_sar=True)
+            gw = FakeBrokerGateway(fill_ok=True, fill_price=23000.0)
+            gw.position_details = {"net": 1, "avg_price": 23000.0, "other_positions": [], "target_code": "TMFK6"}
+            # 1) SAR 第一腳平倉遭 MKP Cancelled -> 立起 _pending_flatten
+            # 2) 次秒 _run_pending_flatten() 呼叫 enforce_failsafe_close(): MKP 再失敗後末試 MKT 成功歸零
+            gw.order_sequence = [
+                FillResult(ok=False, filled_qty=0, avg_price=0.0, status="Cancelled"),
+                FillResult(ok=False, filled_qty=0, avg_price=0.0, status="Cancelled"),
+                FillResult(ok=False, filled_qty=0, avg_price=0.0, status="Cancelled"),
+                FillResult(ok=True, filled_qty=1, avg_price=22900.0, status="Filled"),
+            ]
+            fsm = SessionFSM(gateway=gw, base_dir=tmp, log_dir=log_dir, quantity=1, base_cfg=cfg)
+            fsm.position_guard = PositionGuard(log_dir=log_dir, post_trade_retries=1, post_trade_retry_delay=0.0)
+            fsm.rollover_day("2026-11-16")
+            fsm.bar_aggregator.history_loaded = True
+            fsm.state = dataclasses.replace(
+                fsm.state,
+                position=1,
+                open_qty=1,
+                entry_price=23000.0,
+                entry_time=pd.Timestamp("2026-11-16 09:20:00"),
+                trade_count=1,
+                orb_high=23000.0,
+                orb_low=22950.0,
+                orb_calculated=True,
+                orb_finalized=True,
+            )
+            sar_intent = OrderIntent(
+                action="SAR_SELL", side_sign=-1, price=22910.0, reason="TestSarFail", pnl_pts=-90.0, is_sar=True
+            )
+            st1, rec1 = fsm.execute_order_intent(sar_intent, pd.Timestamp("2026-11-16 09:30:00"))
+            self.assertIsNone(rec1)
+            self.assertEqual(st1.position, 1)
+            self.assertTrue(fsm._pending_flatten)
+
+            # 進入次秒 step() -> 即使非收盤時段或週六也能立即觸發不死鳥追平直到 0 口
+            fsm.step(datetime.datetime(2026, 11, 16, 9, 30, 1))
+            self.assertFalse(fsm._pending_flatten)
+            self.assertEqual(fsm.state.position, 0)
+            self.assertEqual(fsm.state.open_qty, 0)
+            self.assertEqual(gw.orders_placed[-1]["price_type"], "MKT")
+            self.assertEqual(gw.orders_placed[-1]["octype"], "Cover")
+
+    def test_live_and_paper_gateway_connect_catches_login_exception_and_cleans_up(self):
+        from config import ShioajiConfig
+        from gateways.shioaji_live import ShioajiLiveGateway
+
+        fake_api = MagicMock()
+        fake_api.login.side_effect = RuntimeError("broker maintenance timeout")
+        fake_sj_mod = MagicMock()
+        fake_sj_mod.Shioaji.return_value = fake_api
+        cfg = ShioajiConfig(api_key="k", secret_key="s", ca_path="", ca_passwd="", person_id="")
+
+        with patch.dict(sys.modules, {"shioaji": fake_sj_mod}):
+            live_gw = ShioajiLiveGateway(sj_cfg=cfg)
+            self.assertFalse(live_gw.connect())
+            self.assertFalse(live_gw.connected)
+            self.assertIsNone(live_gw.api)
+
+            paper_gw = ShioajiPaperGateway(sj_cfg=cfg)
+            self.assertFalse(paper_gw.connect())
+            self.assertFalse(paper_gw.connected)
+            self.assertIsNone(paper_gw.api)
+
+            # 若 login 成功但查無合約，需安全登出避免 Session 洩漏
+            fake_api.login.side_effect = None
+            with patch.object(live_gw, "resolve_contract", return_value=None):
+                self.assertFalse(live_gw.connect())
+                self.assertFalse(live_gw.connected)
+                self.assertIsNone(live_gw.api)
+                self.assertGreaterEqual(fake_api.logout.call_count, 1)
+
+    def test_sync_intraday_history_early_open_skip_and_30s_cooldown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "data"), exist_ok=True)
+            log_dir = os.path.join(tmp, "logs", "live")
+            gw = FakeBrokerGateway()
+            fsm = SessionFSM(gateway=gw, base_dir=tmp, log_dir=log_dir, quantity=1)
+            fsm.rollover_day("2026-11-16")
+
+            with patch.object(gw, "fetch_kbars", wraps=gw.fetch_kbars) as spy_k:
+                # 08:45:10 -> 首分鐘尚未收盤，不應狂打 fetch_kbars 且標記完成
+                fsm.step(datetime.datetime(2026, 11, 16, 8, 45, 10))
+                self.assertEqual(spy_k.call_count, 0)
+                self.assertTrue(fsm.bar_aggregator.history_loaded)
+
+                # 08:47:00 重置 history_loaded 後模擬回傳空表 -> 每 30 秒才重試 1 次，絕不每秒狂刷
+                fsm.bar_aggregator.history_loaded = False
+                fsm._last_history_sync_attempt_ts = 0.0
+                fsm.step(datetime.datetime(2026, 11, 16, 8, 47, 0))
+                fsm.step(datetime.datetime(2026, 11, 16, 8, 47, 1))
+                fsm.step(datetime.datetime(2026, 11, 16, 8, 47, 15))
+                self.assertEqual(spy_k.call_count, 1)
+
+                fsm.step(datetime.datetime(2026, 11, 16, 8, 47, 31))
+                self.assertEqual(spy_k.call_count, 2)
 
 
 class TestV1V2BacktestParity(unittest.TestCase):

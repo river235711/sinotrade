@@ -144,6 +144,8 @@ class BarAggregator:
         loaded_count = 0
         with self._lock:
             for ts, row in target_df.iterrows():
+                if ts > limit_min:
+                    continue
                 o = float(row["open"])
                 h = float(row["high"])
                 l = float(row["low"])
