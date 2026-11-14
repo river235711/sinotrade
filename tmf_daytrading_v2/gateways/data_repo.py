@@ -340,7 +340,12 @@ class StateRepo:
                 "orb_high": float(state.orb_high) if state.orb_high is not None else None,
                 "orb_low": float(state.orb_low) if state.orb_low is not None else None,
                 "orb_calculated": bool(state.orb_calculated),
+                "orb_finalized": bool(state.orb_finalized),
+                "orb_report_sent": bool(state.orb_report_sent),
                 "entries_halted": bool(state.entries_halted),
+                "holiday_detected": bool(state.holiday_detected),
+                "post_close_done": bool(state.post_close_done),
+                "eod_roll_done": bool(state.eod_roll_done),
                 "overnight_high": float(state.overnight_high) if state.overnight_high is not None else None,
                 "overnight_low": float(state.overnight_low) if state.overnight_low is not None else None,
             }
@@ -399,6 +404,11 @@ class StateRepo:
                 orb_high=float(data["orb_high"]) if data.get("orb_high") is not None else state.orb_high,
                 orb_low=float(data["orb_low"]) if data.get("orb_low") is not None else state.orb_low,
                 orb_calculated=bool(data.get("orb_calculated", state.orb_calculated)),
+                orb_finalized=bool(data.get("orb_finalized", state.orb_finalized)),
+                orb_report_sent=bool(data.get("orb_report_sent", state.orb_report_sent)),
+                holiday_detected=bool(data.get("holiday_detected", state.holiday_detected)),
+                post_close_done=bool(data.get("post_close_done", state.post_close_done)),
+                eod_roll_done=bool(data.get("eod_roll_done", state.eod_roll_done)),
             )
         except Exception as e:
             logger.warning(f"復原策略狀態失敗: {e}")

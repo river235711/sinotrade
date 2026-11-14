@@ -26,6 +26,7 @@ class BrokerGateway(ABC):
     ca_activated: bool = False
     contract: Any = None
     contract_code: str = ""
+    requested_contract_code: str = "TMFR1"
 
     @abstractmethod
     def connect(self, contract_code: str = "TMFR1") -> bool:
@@ -76,3 +77,7 @@ class BrokerGateway(ABC):
     @abstractmethod
     def close(self) -> None:
         """關閉券商連線與釋放資源"""
+
+    def keep_alive(self) -> bool:
+        """定時連線保活檢查 (預設回傳目前連線狀態)"""
+        return bool(self.connected)

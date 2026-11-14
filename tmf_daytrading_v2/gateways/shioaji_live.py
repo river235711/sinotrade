@@ -273,15 +273,18 @@ class ShioajiLiveGateway(BrokerGateway):
         self.is_simulation = False
         self.api: Any = None
         self.contract: Any = None
-        self.contract_code: str = contract_code
+        self.requested_contract_code: str = contract_code or "TMFR1"
+        self.contract_code: str = self.requested_contract_code
         self.connected: bool = False
         self.ca_activated: bool = False
         self._tick_cb: Optional[Callable[[float, int, datetime.datetime], None]] = None
 
-    def connect(self, contract_code: str = "TMFR1") -> bool:
+    def connect(self, contract_code: str = "") -> bool:
         import shioaji as sj
 
-        self.contract_code = contract_code or self.contract_code or "TMFR1"
+        if contract_code:
+            self.requested_contract_code = contract_code
+        target_req = contract_code or self.requested_contract_code or "TMFR1"
         if not self.sj_cfg.api_key or not self.sj_cfg.secret_key:
             logger.error("❌ 未設定 SHIOAJI_API_KEY / SHIOAJI_SECRET_KEY！")
             return False
@@ -303,24 +306,42 @@ class ShioajiLiveGateway(BrokerGateway):
         else:
             logger.warning(f"⚠️ 找不到憑證檔 ({ca_path})，實盤下單可能失敗。")
 
-        self.contract = self.resolve_contract(self.contract_code, allow_fallback=True)
+        self.contract = self.resolve_contract(target_req, allow_fallback=True)
         if self.contract is None:
-            logger.error(f"❌ 找不到合約代碼: {self.contract_code}")
+            logger.error(f"❌ 找不到合約代碼: {target_req}")
             return False
-        self.contract_code = getattr(self.contract, "code", self.contract_code)
+        self.contract_code = getattr(self.contract, "code", target_req)
         self.connected = True
         return True
 
-    def reconnect(self, contract_code: str = "TMFR1") -> bool:
+    def reconnect(self, contract_code: str = "") -> bool:
         logger.warning("🔄 正在重新連線 Shioaji 實盤伺服器...")
         try:
             self.close()
         except Exception:
             pass
-        ok = self.connect(contract_code or self.contract_code)
+        target_req = contract_code or self.requested_contract_code or "TMFR1"
+        ok = self.connect(target_req)
         if ok and self._tick_cb is not None:
             self.subscribe_ticks(self._tick_cb)
         return ok
+
+    def keep_alive(self) -> bool:
+        if self.api is None or not self.connected:
+            return False
+        try:
+            acc = getattr(self.api, "futopt_account", None)
+            if acc is not None and hasattr(self.api, "margin"):
+                self.api.margin(acc)
+            else:
+                self.api.update_status(acc)
+            return True
+        except Exception as e:
+            err_str = str(e).lower()
+            logger.warning(f"⚠️ Shioaji 實盤保活心跳異常: {e}")
+            if any(k in err_str for k in ("authenticated", "session", "token", "disconnect", "connect", "timeout")):
+                return self.reconnect()
+            return False
 
     def resolve_contract(self, code: str = "TMFR1", allow_fallback: bool = True) -> Any:
         return resolve_tmf_contract(self.api, code=code, allow_fallback=allow_fallback)

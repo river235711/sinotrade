@@ -120,6 +120,8 @@ class TradingDayState:
     offline_hc_alert_sent: bool = False
     post_close_done: bool = False
     settlement_alert_sent: bool = False
+    eod_roll_done: bool = False
+    holiday_detected: bool = False
 
     effective_config: Optional[ORBStrategyConfig] = None
     atr_info: Optional[Dict[str, Any]] = None

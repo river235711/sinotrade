@@ -28,7 +28,8 @@ class ShioajiPaperGateway(BrokerGateway):
         self.is_simulation = True
         self.api: Any = None
         self.contract: Any = None
-        self.contract_code: str = contract_code
+        self.requested_contract_code: str = contract_code or "TMFR1"
+        self.contract_code: str = self.requested_contract_code
         self.connected: bool = False
         self.ca_activated: bool = True
         self._tick_cb: Optional[Callable[[float, int, datetime.datetime], None]] = None
@@ -36,10 +37,12 @@ class ShioajiPaperGateway(BrokerGateway):
         # 虛擬持倉帳本 {contract_code: {"net": int, "avg_price": float}}
         self._ledger: Dict[str, Dict[str, Any]] = {}
 
-    def connect(self, contract_code: str = "TMFR1") -> bool:
+    def connect(self, contract_code: str = "") -> bool:
         import shioaji as sj
 
-        self.contract_code = contract_code or self.contract_code or "TMFR1"
+        if contract_code:
+            self.requested_contract_code = contract_code
+        target_req = contract_code or self.requested_contract_code or "TMFR1"
         if not self.sj_cfg.api_key or not self.sj_cfg.secret_key:
             logger.error("❌ 未設定 SHIOAJI_API_KEY / SHIOAJI_SECRET_KEY！")
             return False
@@ -48,20 +51,21 @@ class ShioajiPaperGateway(BrokerGateway):
         logger.info("📡 正在連線至永豐金 Shioaji [模擬行情] 伺服器...")
         self.api.login(api_key=self.sj_cfg.api_key, secret_key=self.sj_cfg.secret_key)
 
-        self.contract = self.resolve_contract(self.contract_code, allow_fallback=True)
+        self.contract = self.resolve_contract(target_req, allow_fallback=True)
         if self.contract is None:
-            logger.error(f"❌ 找不到合約代碼: {self.contract_code}")
+            logger.error(f"❌ 找不到合約代碼: {target_req}")
             return False
-        self.contract_code = getattr(self.contract, "code", self.contract_code)
+        self.contract_code = getattr(self.contract, "code", target_req)
         self.connected = True
         return True
 
-    def reconnect(self, contract_code: str = "TMFR1") -> bool:
+    def reconnect(self, contract_code: str = "") -> bool:
         try:
             self.close()
         except Exception:
             pass
-        ok = self.connect(contract_code or self.contract_code)
+        target_req = contract_code or self.requested_contract_code or "TMFR1"
+        ok = self.connect(target_req)
         if ok and self._tick_cb is not None:
             self.subscribe_ticks(self._tick_cb)
         return ok

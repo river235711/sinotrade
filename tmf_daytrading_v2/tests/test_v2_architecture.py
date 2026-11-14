@@ -25,7 +25,7 @@ import tempfile
 import threading
 import unittest
 from typing import Any, Dict, List, Optional, Tuple
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pandas as pd
 
@@ -57,17 +57,27 @@ from runtime.session_fsm import SessionFSM
 class FakeBrokerGateway(BrokerGateway):
     """純記憶體假券商配接器，供單元測試使用"""
 
-    def __init__(self, fill_ok: bool = True, fill_price: float = 0.0):
+    def __init__(
+        self,
+        fill_ok: bool = True,
+        fill_price: float = 0.0,
+        update_ledger_on_fill: bool = True,
+    ):
         self.is_simulation = False
         self.connected = True
         self.ca_activated = True
+        self.requested_contract_code = "TMFR1"
         self.contract = type("C", (), {"code": "TMFK6", "name": "微台202611"})()
         self.contract_code = "TMFK6"
         self.fill_ok = fill_ok
         self.fill_price = fill_price
+        self.update_ledger_on_fill = update_ledger_on_fill
+        self.connect_calls: List[str] = []
+        self.close_calls: int = 0
         self.orders_placed: List[Dict[str, Any]] = []
         self.resolve_calls: List[Tuple[str, bool]] = []
         self.contracts_map: Dict[str, Any] = {"TMFK6": self.contract, "TMFR1": self.contract}
+        self.query_sequence: List[Dict[str, Any]] = []
         self.position_details: Dict[str, Any] = {
             "net": 0,
             "avg_price": 0.0,
@@ -77,12 +87,18 @@ class FakeBrokerGateway(BrokerGateway):
             "target_code": "TMFK6",
         }
 
-    def connect(self, contract_code: str = "TMFR1") -> bool:
+    def connect(self, contract_code: str = "") -> bool:
+        req = contract_code or self.requested_contract_code or "TMFR1"
+        self.connect_calls.append(req)
+        resolved = self.contracts_map.get(req, self.contract)
+        if resolved is not None:
+            self.contract = resolved
+            self.contract_code = getattr(resolved, "code", self.contract_code)
         self.connected = True
         return True
 
-    def reconnect(self, contract_code: str = "TMFR1") -> bool:
-        return True
+    def reconnect(self, contract_code: str = "") -> bool:
+        return self.connect(contract_code)
 
     def resolve_contract(self, code: str = "TMFR1", allow_fallback: bool = True) -> Any:
         self.resolve_calls.append((code, allow_fallback))
@@ -121,15 +137,24 @@ class FakeBrokerGateway(BrokerGateway):
         if not self.fill_ok:
             return FillResult(ok=False, filled_qty=0, avg_price=0.0, status="Cancelled")
         px = self.fill_price if self.fill_price > 0 else price
+        if self.update_ledger_on_fill and contract_override is None:
+            delta = int(qty) if action == "BUY" else -int(qty)
+            new_net = int(self.position_details.get("net", 0)) + delta
+            self.position_details["net"] = new_net
+            self.position_details["avg_price"] = px if new_net != 0 else 0.0
+            self.position_details["direction"] = "Buy" if new_net > 0 else ("Sell" if new_net < 0 else "Flat")
         return FillResult(ok=True, filled_qty=qty, avg_price=px, status="Filled")
 
     def query_position_details(self, contract_code: Optional[str] = None) -> Dict[str, Any]:
+        if self.query_sequence:
+            return dict(self.query_sequence.pop(0))
         return dict(self.position_details)
 
     def cancel_pending_orders(self) -> None:
         pass
 
     def close(self) -> None:
+        self.close_calls += 1
         self.connected = False
 
 
@@ -301,6 +326,8 @@ class TestRuntimeFSMAndGuards(unittest.TestCase):
                 offline_hc_alert_sent=True,
                 post_close_done=True,
                 settlement_alert_sent=True,
+                eod_roll_done=True,
+                holiday_detected=True,
             )
             rolled = fsm.rollover_day("2026-11-16")
             self.assertEqual(rolled.trading_date, "2026-11-16")
@@ -314,6 +341,8 @@ class TestRuntimeFSMAndGuards(unittest.TestCase):
             self.assertFalse(rolled.offline_hc_alert_sent)
             self.assertFalse(rolled.post_close_done)
             self.assertFalse(rolled.settlement_alert_sent)
+            self.assertFalse(rolled.eod_roll_done)
+            self.assertFalse(rolled.holiday_detected)
 
     def test_order_failure_does_not_mutate_trading_state(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -332,6 +361,7 @@ class TestRuntimeFSMAndGuards(unittest.TestCase):
             os.makedirs(os.path.join(tmp, "data"), exist_ok=True)
             log_dir = os.path.join(tmp, "logs", "paper")
             gw = FakeBrokerGateway(fill_ok=True, fill_price=22905.0)
+            gw.position_details["net"] = 1
             cfg = ORBStrategyConfig(use_atr_scaling=False, use_overnight_wall_filter=False, enable_sar=False)
             fsm = SessionFSM(gateway=gw, base_dir=tmp, log_dir=log_dir, quantity=1, base_cfg=cfg)
             fsm.state = TradingDayState(
@@ -417,6 +447,205 @@ class TestRuntimeFSMAndGuards(unittest.TestCase):
         res_close = paper.place_order("SELL", 1)
         self.assertTrue(res_close.ok)
         self.assertEqual(paper.query_position_details()["net"], 0)
+
+    def test_off_market_sleep_0830_wake_and_0905_holiday_sleep(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "data"), exist_ok=True)
+            log_dir = os.path.join(tmp, "logs", "live")
+            gw = FakeBrokerGateway()
+            mock_notifier = MagicMock()
+            fsm = SessionFSM(
+                gateway=gw,
+                base_dir=tmp,
+                log_dir=log_dir,
+                quantity=1,
+                notifier=mock_notifier,
+                holiday_grace_seconds=30.0,
+            )
+
+            # 1. 盤前 08:15 自動登出休眠
+            fsm.step(datetime.datetime(2026, 11, 16, 8, 15, 0))
+            self.assertFalse(gw.connected)
+            self.assertEqual(gw.close_calls, 1)
+
+            # 2. 模擬換月：TMFR1 切換為新主力合約 TMFL6，08:30 自動喚醒並重抓合約
+            next_month = type("C", (), {"code": "TMFL6", "name": "微台202612"})()
+            gw.contracts_map["TMFR1"] = next_month
+            fsm.step(datetime.datetime(2026, 11, 16, 8, 30, 0))
+            self.assertTrue(gw.connected)
+            self.assertEqual(gw.connect_calls, ["TMFR1"])
+            self.assertEqual(fsm.state.contract_code, "TMFL6")
+
+            # 3. 09:05:00 與 09:05:31 仍 0 Tick -> 判定休市日自動登出深度睡眠
+            fsm.step(datetime.datetime(2026, 11, 16, 9, 5, 0))
+            self.assertTrue(gw.connected)
+            self.assertFalse(fsm.state.holiday_detected)
+
+            fsm.step(datetime.datetime(2026, 11, 16, 9, 5, 31))
+            self.assertTrue(fsm.state.holiday_detected)
+            self.assertTrue(fsm.state.entries_halted)
+            self.assertFalse(gw.connected)
+
+            # 4. 休市日後 13:50 不再重複連線或跑盤後流程
+            fsm.step(datetime.datetime(2026, 11, 16, 13, 50, 0))
+            self.assertFalse(gw.connected)
+
+    def test_134515_auto_eod_roll_20days(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "data"), exist_ok=True)
+            log_dir = os.path.join(tmp, "logs", "live")
+            gw = FakeBrokerGateway()
+            mock_notifier = MagicMock()
+            rolled_dates: List[str] = []
+
+            def fake_roll(d_str: str) -> bool:
+                rolled_dates.append(d_str)
+                return True
+
+            fsm = SessionFSM(
+                gateway=gw,
+                base_dir=tmp,
+                log_dir=log_dir,
+                quantity=1,
+                notifier=mock_notifier,
+                eod_roll_fn=fake_roll,
+            )
+
+            # 13:10:05 確認零部位並發送收盤完成通知，但不提前觸發 13:45:15 滾動更新
+            fsm.step(datetime.datetime(2026, 11, 16, 13, 10, 5))
+            self.assertTrue(fsm.state.post_close_done)
+            self.assertFalse(fsm.state.eod_roll_done)
+            self.assertEqual(rolled_dates, [])
+
+            # 13:45:15 自動執行 roll_20days 一次
+            fsm.step(datetime.datetime(2026, 11, 16, 13, 45, 15))
+            fsm.step(datetime.datetime(2026, 11, 16, 13, 46, 0))
+            self.assertTrue(fsm.state.eod_roll_done)
+            self.assertEqual(rolled_dates, ["2026-11-16"])
+            self.assertTrue(gw.connected)
+
+            # 13:50:00 安全登出離線休眠
+            fsm.step(datetime.datetime(2026, 11, 16, 13, 50, 0))
+            self.assertFalse(gw.connected)
+
+    def test_0915_preliminary_and_0916_bar_close_orb_update(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "data"), exist_ok=True)
+            log_dir = os.path.join(tmp, "logs", "paper")
+            gw = FakeBrokerGateway()
+            sent_msgs: List[str] = []
+            mock_notifier = MagicMock()
+            mock_notifier.send.side_effect = lambda msg, **kw: sent_msgs.append(msg)
+            cfg = ORBStrategyConfig(use_atr_scaling=False, use_overnight_wall_filter=False)
+            fsm = SessionFSM(
+                gateway=gw,
+                base_dir=tmp,
+                log_dir=log_dir,
+                quantity=1,
+                base_cfg=cfg,
+                notifier=mock_notifier,
+            )
+            fsm.rollover_day("2026-11-16")
+            fsm.bar_aggregator.history_loaded = True
+
+            # 建立 08:45~09:14 分K (09:00~09:14 區間為 23000 ~ 23100)
+            for m in range(45, 60):
+                fsm.bar_aggregator.update_tick(23050.0, 5, datetime.datetime(2026, 11, 16, 8, m, 10))
+            for m in range(0, 15):
+                px = 23100.0 if m == 5 else (23000.0 if m == 10 else 23050.0)
+                fsm.bar_aggregator.update_tick(px, 5, datetime.datetime(2026, 11, 16, 9, m, 10))
+
+            # 09:14 時不應提前設定 pre_orb / orb (對齊 BacktestEngine 與 V1)
+            fsm.step(datetime.datetime(2026, 11, 16, 9, 14, 10))
+            self.assertFalse(fsm.state.orb_calculated)
+            self.assertIsNone(fsm.state.pre_orb_high)
+
+            # 09:15:00 收到首 Tick -> 初次鎖定 ORB=23000~23100 並發送確立報告，但尚未定稿
+            fsm.bar_aggregator.update_tick(23060.0, 5, datetime.datetime(2026, 11, 16, 9, 15, 0))
+            fsm.step(datetime.datetime(2026, 11, 16, 9, 15, 0))
+            self.assertTrue(fsm.state.orb_calculated)
+            self.assertFalse(fsm.state.orb_finalized)
+            self.assertEqual(fsm.state.orb_high, 23100.0)
+            self.assertEqual(fsm.state.orb_low, 23000.0)
+            self.assertEqual(len(sent_msgs), 1)
+            self.assertIn("📌 [09:15 ORB 區間確立]", sent_msgs[0])
+
+            # 09:15:30 突破區間新高至 23140 (尚在 09:15 分鐘內不重發)
+            fsm.bar_aggregator.update_tick(23140.0, 5, datetime.datetime(2026, 11, 16, 9, 15, 30))
+            fsm.step(datetime.datetime(2026, 11, 16, 9, 15, 30))
+            self.assertEqual(len(sent_msgs), 1)
+
+            # 09:16:00 09:15 K棒完整收盤 -> 二次擴大校正 ORB 至 23140 並補發更新推播
+            fsm.bar_aggregator.update_tick(23135.0, 5, datetime.datetime(2026, 11, 16, 9, 16, 0))
+            fsm.step(datetime.datetime(2026, 11, 16, 9, 16, 0))
+            self.assertTrue(fsm.state.orb_finalized)
+            self.assertEqual(fsm.state.orb_high, 23140.0)
+            self.assertEqual(len(sent_msgs), 2)
+            self.assertIn("📌 [09:15 ORB 完整收盤更新]", sent_msgs[1])
+            self.assertIn("23000 ~ 23140", sent_msgs[1])
+
+    def test_post_trade_verify_retries_and_residual_flatten(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = StateRepo(log_dir=tmp)
+            mock_notifier = MagicMock()
+            guard = PositionGuard(log_dir=tmp, post_trade_retries=3, post_trade_retry_delay=0.0)
+
+            # 情境一：實盤買進 1 口成交後券商帳務延遲 2 次仍顯示 0，第 3 次同步為 +1 口 -> 通過不誤補平
+            gw_lag = FakeBrokerGateway(fill_ok=True, fill_price=23100.0)
+            gw_lag.query_sequence = [
+                {"net": 0, "avg_price": 0.0, "other_positions": []},
+                {"net": 0, "avg_price": 0.0, "other_positions": []},
+                {"net": 1, "avg_price": 23100.0, "other_positions": []},
+            ]
+            s_open = TradingDayState(trading_date="2026-11-16", contract_code="TMFK6", position=1, entry_price=23100.0, trade_count=1)
+            res_ok = FillResult(ok=True, filled_qty=1, avg_price=23100.0, status="Filled")
+            verified = guard.post_trade_verify(s_open, gw_lag, 1, res_ok, "BUY", state_repo=repo, notifier=mock_notifier)
+            self.assertEqual(verified.position, 1)
+            self.assertEqual(len(gw_lag.orders_placed), 0)
+            self.assertEqual(len(gw_lag.query_sequence), 0)
+
+            # 情境二：策略已執行 EXIT 期望 0 口，但 3 次重試後券商仍殘留 +1 口 -> 立即強制補平
+            gw_res = FakeBrokerGateway(fill_ok=True, fill_price=23090.0)
+            gw_res.position_details = {"net": 1, "avg_price": 23100.0, "other_positions": [], "target_code": "TMFK6"}
+            s_flat = TradingDayState(trading_date="2026-11-16", contract_code="TMFK6", position=0, trade_count=1)
+            verified_flat = guard.post_trade_verify(s_flat, gw_res, 1, res_ok, "EXIT", state_repo=repo, notifier=mock_notifier)
+            self.assertEqual(verified_flat.position, 0)
+            self.assertTrue(verified_flat.entries_halted)
+            self.assertEqual(len(gw_res.orders_placed), 1)
+            self.assertEqual(gw_res.orders_placed[0]["action"], "SELL")
+            self.assertEqual(gw_res.orders_placed[0]["octype"], "Cover")
+
+    def test_process_closed_bars_skips_redundant_batch_indicators(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "data"), exist_ok=True)
+            log_dir = os.path.join(tmp, "logs", "paper")
+            gw = FakeBrokerGateway()
+            cfg = ORBStrategyConfig(use_atr_scaling=False, use_overnight_wall_filter=False)
+            fsm = SessionFSM(gateway=gw, base_dir=tmp, log_dir=log_dir, quantity=1, base_cfg=cfg)
+            fsm.rollover_day("2026-11-16")
+            fsm.bar_aggregator.history_loaded = True
+
+            # 已收盤 09:00 K 棒 + 進行中 09:01 K 棒
+            fsm.bar_aggregator.update_tick(23050.0, 5, datetime.datetime(2026, 11, 16, 9, 0, 10))
+            fsm.bar_aggregator.update_tick(23060.0, 5, datetime.datetime(2026, 11, 16, 9, 1, 5))
+
+            import runtime.session_fsm as fsm_mod
+            with patch.object(fsm_mod, "prepare_batch_indicators", wraps=fsm_mod.prepare_batch_indicators) as spy_prep:
+                # 第一次 09:01:05 (有新收盤 K 棒 09:00) -> 計算 1 次
+                fsm.step(datetime.datetime(2026, 11, 16, 9, 1, 5))
+                self.assertEqual(spy_prep.call_count, 1)
+
+                # 同分鐘內 09:01:20, 09:01:40 進新 Tick -> 無新收盤 K 棒，0 次重算！
+                fsm.bar_aggregator.update_tick(23070.0, 2, datetime.datetime(2026, 11, 16, 9, 1, 20))
+                fsm.step(datetime.datetime(2026, 11, 16, 9, 1, 20))
+                fsm.bar_aggregator.update_tick(23080.0, 3, datetime.datetime(2026, 11, 16, 9, 1, 40))
+                fsm.step(datetime.datetime(2026, 11, 16, 9, 1, 40))
+                self.assertEqual(spy_prep.call_count, 1)
+
+                # 換分鐘至 09:02:00 (09:01 收盤) -> 才再計算第 2 次
+                fsm.bar_aggregator.update_tick(23085.0, 1, datetime.datetime(2026, 11, 16, 9, 2, 0))
+                fsm.step(datetime.datetime(2026, 11, 16, 9, 2, 0))
+                self.assertEqual(spy_prep.call_count, 2)
 
 
 class TestV1V2BacktestParity(unittest.TestCase):

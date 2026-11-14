@@ -154,10 +154,97 @@ def build_0915_orb_report(
 
 
 class PositionGuard:
-    """啟動對帳、盤中定期對帳、跨月嚴格清倉與 13:09 收盤死守平倉防護模組"""
+    """啟動對帳、盤中定期對帳、成交後 3x0.5s 重試核對、跨月嚴格清倉與 13:09 收盤死守平倉防護模組"""
 
-    def __init__(self, log_dir: Optional[str] = None):
+    def __init__(
+        self,
+        log_dir: Optional[str] = None,
+        post_trade_retries: int = 3,
+        post_trade_retry_delay: float = 0.5,
+    ):
         self.log_dir = log_dir
+        self.post_trade_retries = max(0, int(post_trade_retries))
+        self.post_trade_retry_delay = float(post_trade_retry_delay)
+
+    def post_trade_verify(
+        self,
+        state: TradingDayState,
+        gateway: BrokerGateway,
+        expected_qty: int,
+        last_result: FillResult,
+        action_tag: str,
+        state_repo: Optional[StateRepo] = None,
+        notifier: Optional[TradeNotifier] = None,
+    ) -> TradingDayState:
+        """
+        下單成交後即時核對券商帳上部位，防範 Shioaji 帳務更新延遲 (最多 3 次 × 0.5 秒重試)。
+        若確有殘倉、方向或口數不符，立即觸發安全補平。
+        """
+        expected_net = int(state.position) * int(expected_qty)
+        target_code = state.contract_code or gateway.contract_code
+        details = gateway.query_position_details(contract_code=target_code)
+        real_net = details.get("net")
+
+        if real_net is not None and real_net != expected_net and not gateway.is_simulation:
+            for _ in range(self.post_trade_retries):
+                if self.post_trade_retry_delay > 0:
+                    time.sleep(self.post_trade_retry_delay)
+                details = gateway.query_position_details(contract_code=target_code)
+                real_net = details.get("net")
+                if real_net is None or real_net == expected_net:
+                    break
+
+        if real_net is None or real_net == expected_net:
+            if real_net == expected_net:
+                logger.info(f"📒 成交後對帳通過 ({action_tag}): 帳上 {real_net:+d} 口 = 預期 {expected_net:+d} 口")
+            return state
+
+        logger.error(f"📒 成交後對帳不符 ({action_tag}): 帳上 {real_net:+d} 口，策略預期 {expected_net:+d} 口")
+
+        if expected_net == 0 and real_net != 0:
+            logger.critical(
+                f"🚨 [成交後對帳異常] 平倉後券商帳上仍有殘留部位 ({real_net:+d} 口)，立即啟動強制補平！"
+            )
+            new_state = self.enforce_failsafe_close(state, gateway, notifier=notifier, state_repo=state_repo)
+            if not new_state.entries_halted:
+                new_state = dataclasses.replace(new_state, entries_halted=True)
+                if state_repo:
+                    state_repo.save_state(new_state)
+            return new_state
+
+        if expected_net != 0 and real_net == 0:
+            if last_result.ok and last_result.status == "Filled" and last_result.filled_qty >= int(expected_qty):
+                logger.warning(
+                    f"⚠️ 成交回報已確認 Filled ({last_result.filled_qty}口 @ {last_result.avg_price:.0f})，"
+                    f"但帳務查詢仍顯示 0 口，保留策略持倉並等待定期對帳同步！"
+                )
+                return state
+            flat_state = dataclasses.replace(
+                state,
+                position=0,
+                entry_price=0.0,
+                entry_time=None,
+                highest_profit=0.0,
+                hp_before_bar_ts=None,
+                hp_before_bar_val=0.0,
+                entries_halted=True,
+            )
+            if state_repo:
+                state_repo.save_state(flat_state)
+            return flat_state
+
+        # 其他不一致 (方向相反或口數不符)：為安全起見強制平倉並停開新倉
+        new_state = self.enforce_failsafe_close(state, gateway, notifier=notifier, state_repo=state_repo)
+        new_state = dataclasses.replace(new_state, entries_halted=True)
+        if state_repo:
+            state_repo.save_state(new_state)
+        if notifier:
+            notifier.send(
+                f"🚨 [部位對帳異常] {action_tag} 後帳上為 {real_net:+d} 口 (預期 {expected_net:+d} 口)，"
+                f"已介入安全平倉與停開新倉，請確認帳務。",
+                async_send=True,
+            )
+        return new_state
 
     def flatten_other_month_positions(
         self,
