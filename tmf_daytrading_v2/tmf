@@ -383,6 +383,7 @@ cmd_push() {
         else
             git add -A
         fi
+        git update-index --chmod=+x "${sub_prefix}tmf" 2>/dev/null || true
     fi
 
     if git diff --staged --quiet; then
