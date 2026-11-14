@@ -158,10 +158,10 @@ def roll_20days(target_date: str = None, push_git: bool = True) -> bool:
     subprocess.run([sys.executable, "-B", backtest_script], check=True)
 
     if push_git:
-        push_script = os.path.join(BASE_DIR, "push.sh")
-        if os.path.exists(push_script):
+        tmf_script = os.path.join(BASE_DIR, "tmf")
+        if os.path.exists(tmf_script):
             commit_msg = f"data(v2): Roll 20-day dataset to {today_str} ({kept_dates[0]} ~ {kept_dates[-1]})"
-            subprocess.run(["bash", push_script, "--data-only", commit_msg], check=False)
+            subprocess.run(["bash", tmf_script, "push", "--data-only", commit_msg], check=False)
 
     return True
 

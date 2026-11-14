@@ -12,9 +12,14 @@ TMF DayTrading V2 架構與策略等價性完整測試套件
 8. V1 vs V2 近 20 個交易日 100% 逐筆成交與損益完全對齊驗證
 """
 import ast
+import contextlib
 import datetime
 import importlib.util
+import io
+import json
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -473,6 +478,89 @@ class TestV1V2BacktestParity(unittest.TestCase):
         self.assertEqual(len(v1_trades_all), len(v2_trades_all))
         for t1, t2 in zip(v1_trades_all, v2_trades_all):
             self.assertEqual(t1, t2)
+
+
+class TestUnifiedCLI(unittest.TestCase):
+    def test_no_legacy_sh_scripts_and_tmf_executable(self):
+        tmf_path = os.path.join(V2_DIR, "tmf")
+        self.assertTrue(os.path.isfile(tmf_path), "缺少統一入口腳本 ./tmf")
+        if os.name == "posix":
+            self.assertTrue(os.access(tmf_path, os.X_OK), "./tmf 必須具備可執行權限 (+x)")
+
+        leftover_sh = []
+        skip_dirs = {"venv", ".venv", ".git", "__pycache__"}
+        for root, dirs, files in os.walk(V2_DIR):
+            dirs[:] = [d for d in dirs if d not in skip_dirs]
+            for fn in files:
+                if fn.endswith(".sh"):
+                    leftover_sh.append(os.path.relpath(os.path.join(root, fn), V2_DIR))
+        self.assertEqual(leftover_sh, [], f"V2 目錄不應殘留 .sh 腳本: {leftover_sh}")
+
+    def test_tmf_help_and_unknown_subcommand(self):
+        bash_bin = shutil.which("bash")
+        if not bash_bin:
+            self.skipTest("bash not available")
+        tmf_path = os.path.join(V2_DIR, "tmf")
+
+        expected_sections = [
+            "統一控制入口 (./tmf)",
+            "【1. 常駐機器人啟停與監控】",
+            "【2. 盤中即時風控指令】",
+            "【3. 健檢、查帳、回測與盤後更新】",
+            "【4. Git 同步與部署】",
+        ]
+        for args in ([], ["help"], ["-h"], ["--help"]):
+            res = subprocess.run(
+                [bash_bin, tmf_path, *args],
+                cwd=V2_DIR, capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(res.returncode, 0, f"./tmf {' '.join(args)} failed: {res.stderr}")
+            for sec in expected_sections:
+                self.assertIn(sec, res.stdout)
+
+        bad = subprocess.run(
+            [bash_bin, tmf_path, "nonexistent_cmd"],
+            cwd=V2_DIR, capture_output=True, text=True, timeout=10,
+        )
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertIn("未知指令", bad.stdout + bad.stderr)
+        self.assertIn("統一控制入口 (./tmf)", bad.stdout)
+
+        res_status = subprocess.run(
+            [bash_bin, tmf_path, "status", "paper"],
+            cwd=V2_DIR, capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(res_status.returncode, 0, res_status.stderr)
+        self.assertIn("[PAPER] 模式", res_status.stdout)
+
+    def test_python_status_and_process_isolation(self):
+        import main as v2_main
+
+        v1_other = "/tmp/other_project/tmf_daytrading/main.py"
+        v2_self = os.path.join(V2_DIR, "main.py")
+        self.assertIsNone(v2_main._parse_mode_from_args(["python", v1_other, "--mode", "live"], base_dir=V2_DIR))
+        self.assertEqual(v2_main._parse_mode_from_args(["python", v2_self, "--mode", "paper"], base_dir=V2_DIR), "paper")
+        self.assertIsNone(v2_main._parse_mode_from_args(["python", v2_self, "--status", "--mode", "paper"], base_dir=V2_DIR))
+        self.assertIsNone(v2_main._parse_mode_from_args(["python", v2_self, "--tail", "stdout", "--mode", "live"], base_dir=V2_DIR))
+
+        today = datetime.date.today().strftime("%Y%m%d")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_dir = os.path.join(tmpdir, "logs", "paper")
+            os.makedirs(log_dir, exist_ok=True)
+            with open(os.path.join(log_dir, f"state_{today}.json"), "w", encoding="utf-8") as f:
+                json.dump({"position": 1, "trade_count": 2, "entries_halted": False, "orb_low": 23100, "orb_high": 23180, "orb_calculated": True}, f)
+            with open(os.path.join(log_dir, f"trader_{today}.log"), "w", encoding="utf-8") as f:
+                f.write("2026-11-14 09:05:00 [INFO] ORB calculated\n")
+            with open(os.path.join(log_dir, "stdout.log"), "w", encoding="utf-8") as f:
+                f.write("2026-11-14 09:06:00 [ERROR] sample alert\n")
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                v2_main.print_bot_status("paper", base_dir=tmpdir, pid=None)
+            out = buf.getvalue()
+            self.assertIn("持倉=1 | 成交=2", out)
+            self.assertIn("ORB calculated", out)
+            self.assertIn("sample alert", out)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,519 @@
+#!/usr/bin/env bash
+# tmf - TMF 微型臺指期 ORB 當沖系統 V2 統一控制入口
+# 整合啟動、停止、狀態、日誌追蹤、即時指令、健檢、查帳、回測、盤後更新與 Git 同步
+
+BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PID_FILE="$BASE_DIR/logs/bot.pid"
+
+find_python() {
+    local c
+    for c in \
+        "$BASE_DIR/venv/bin/python" \
+        "$BASE_DIR/.venv/bin/python" \
+        "$BASE_DIR/../sinotrade_trader/venv/bin/python" \
+        "$BASE_DIR/../venv/bin/python" \
+        "$HOME/sinotrade_trader/venv/bin/python" \
+        "$(command -v python3 2>/dev/null || true)" \
+        "$(command -v python 2>/dev/null || true)"; do
+        if [ -n "$c" ] && [ -x "$c" ]; then
+            echo "$c"
+            return 0
+        fi
+    done
+    echo "python3"
+}
+
+PYTHON_BIN="$(find_python)"
+
+is_valid_v2_pid() {
+    local pid="$1"
+    [ -n "$pid" ] || return 1
+    case "$pid" in
+        *[!0-9]*) return 1 ;;
+    esac
+    kill -0 "$pid" 2>/dev/null || return 1
+    ps -o args= -p "$pid" 2>/dev/null | grep -qE "main\.py .*--mode (live|paper)"
+}
+
+get_v2_pid() {
+    if [ -f "$PID_FILE" ]; then
+        local pid
+        pid="$(tr -d '[:space:]' < "$PID_FILE" 2>/dev/null || true)"
+        if is_valid_v2_pid "$pid"; then
+            echo "$pid"
+            return 0
+        fi
+        rm -f "$PID_FILE"
+    fi
+    pgrep -f "$BASE_DIR/main\.py --mode" 2>/dev/null | head -n 1 || true
+}
+
+collect_v2_pids() {
+    local pids=""
+    if [ -f "$PID_FILE" ]; then
+        local fpid
+        fpid="$(tr -d '[:space:]' < "$PID_FILE" 2>/dev/null || true)"
+        if is_valid_v2_pid "$fpid"; then
+            pids="$fpid"
+        fi
+    fi
+    local matched
+    matched="$(pgrep -f "$BASE_DIR/main\.py --mode" 2>/dev/null || true)"
+    for p in $matched; do
+        case " $pids " in
+            *" $p "*) ;;
+            *) pids="$pids $p" ;;
+        esac
+    done
+    echo "$pids" | xargs 2>/dev/null || true
+}
+
+show_help() {
+    cat <<'EOF'
+=================================================================
+🤖 TMF 微型臺指期 ORB 當沖系統 V2 - 統一控制入口 (./tmf)
+=================================================================
+用法: ./tmf <指令> [參數]
+
+【1. 常駐機器人啟停與監控】
+  start [paper|live] [口數]      在背景啟動機器人 (預設: paper 1 口，支援 --mode/--qty)
+  stop                           安全停止本專案 V2 運行中的機器人 (SIGTERM -> 等 5 秒 -> kill -9)
+  status [paper|live]            查詢運行狀態、PID、當日部位、最新日誌與錯誤摘要
+  tail [paper|live|stdout]       即時追蹤交易日誌 (預設自動判斷並支援跨日切換；stdout 看標準輸出)
+
+【2. 盤中即時風控指令】
+  cmd close [--mode live|paper]          立即平倉目前部位 (當日仍可續接新訊號)
+  cmd close_and_halt [--mode live|paper] 立即平倉並今日禁止再開新倉
+  cmd resume [--mode live|paper]         解除今日禁單，恢復自動交易
+
+【3. 健檢、查帳、回測與盤後更新】
+  health [參數...]               執行開盤前健康巡檢 (7 大檢查項目)
+  account [參數...]              查詢永豐金期貨實體帳戶部位與保證金
+  backtest                       執行 V2 歷史 20 日回測報表
+  update [日期] [--no-push]      盤後滾動更新 20/60 日資料庫、重跑回測並自動推送資料
+
+【4. Git 同步與部署】
+  push [--data-only] ["訊息"]    同步 V2 至 sinotrade_repo 並推送 GitHub (預設含程式碼；--data-only 僅推資料與報表)
+  pull                           從 GitHub 拉取 V2 最新程式碼並同步清理多餘檔案 (保留 .env/憑證/logs/venv)
+
+常用範例:
+  ./tmf start live 1             啟動正式實盤 1 口
+  ./tmf status                   查看目前運行狀態與最新交易日誌
+  ./tmf tail paper               即時追蹤 paper 模式每日交易日誌
+  ./tmf tail stdout              即時追蹤標準輸出 (stdout.log)
+  ./tmf cmd close_and_halt       盤中緊急全平並停單
+  ./tmf push "feat(v2): ..."     推送本專案更動至 GitHub
+
+說明:
+  help | -h | --help | (無參數)  顯示此說明選單
+=================================================================
+EOF
+}
+
+cmd_start() {
+    cd "$BASE_DIR"
+    local existing_pid
+    existing_pid="$(get_v2_pid)"
+
+    echo "================================================================="
+    echo "🚀 啟動 TMF 微型臺指期當沖機器人 V2 (背景常駐守護模式)"
+    echo "================================================================="
+
+    if [ -n "$existing_pid" ]; then
+        local running_mode
+        running_mode="$(ps -o args= -p "$existing_pid" 2>/dev/null | sed -n 's/.*--mode[= ]\([a-z]*\).*/\1/p')"
+        echo "⚠️ 機器人已經在背景運行中！(PID: $existing_pid, 模式: ${running_mode:-未知})"
+        echo "如需重啟或切換模式，請先執行 ./tmf stop 停止後再啟動。"
+        echo "================================================================="
+        return 0
+    fi
+
+    local mode="paper"
+    local qty="1"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --mode|-m)
+                mode="${2:-}"
+                shift 2
+                ;;
+            --qty|-q)
+                qty="${2:-}"
+                shift 2
+                ;;
+            live|paper)
+                mode="$1"
+                shift
+                ;;
+            [0-9]*)
+                qty="$1"
+                shift
+                ;;
+            *)
+                echo "❌ 未知參數: $1"
+                exit 1
+                ;;
+        esac
+    done
+
+    if [ "$mode" != "live" ] && [ "$mode" != "paper" ]; then
+        echo "❌ 不支援的模式: [$mode]，背景常駐僅支援 live 或 paper。"
+        echo "================================================================="
+        exit 1
+    fi
+
+    case "$qty" in
+        ''|*[!0-9]*)
+            echo "❌ 無效的下單口數: [$qty]"
+            exit 1
+            ;;
+    esac
+
+    local log_dir="$BASE_DIR/logs/$mode"
+    mkdir -p "$log_dir" "$BASE_DIR/logs"
+    local stdout_log="$log_dir/stdout.log"
+
+    if [ -f "$stdout_log" ] && [ "$(wc -c < "$stdout_log")" -gt 5242880 ]; then
+        mv -f "$stdout_log" "$stdout_log.1"
+    fi
+
+    echo "啟動參數: 模式=[$mode], 下單口數=[$qty]"
+    echo "========== $(date '+%Y-%m-%d %H:%M:%S') 啟動 main.py --mode $mode --qty $qty ==========" >> "$stdout_log"
+
+    PYTHONDONTWRITEBYTECODE=1 nohup "$PYTHON_BIN" -B "$BASE_DIR/main.py" --mode "$mode" --qty "$qty" >> "$stdout_log" 2>&1 &
+    local new_pid=$!
+    echo "$new_pid" > "$PID_FILE"
+
+    sleep 2
+    if kill -0 "$new_pid" 2>/dev/null; then
+        echo "✅ 機器人已成功在背景啟動！"
+        echo "📌 背景 PID: $new_pid (已寫入 $PID_FILE)"
+        echo "📂 主日誌 (每日分檔): $log_dir/trader_$(date +%Y%m%d).log"
+        echo "📂 SDK/錯誤輸出:     $stdout_log"
+        echo "💡 即時監看: ./tmf tail  |  狀態: ./tmf status  |  停止: ./tmf stop"
+    else
+        rm -f "$PID_FILE"
+        echo "❌ 啟動失敗，請檢查 $stdout_log 與 $log_dir/trader_$(date +%Y%m%d).log 查看錯誤原因。"
+        exit 1
+    fi
+    echo "================================================================="
+}
+
+cmd_stop() {
+    cd "$BASE_DIR"
+    local pids
+    pids="$(collect_v2_pids)"
+
+    echo "================================================================="
+    echo "🛑 安全停止 TMF 微型臺指期當沖機器人 (V2)"
+    echo "================================================================="
+
+    if [ -z "$pids" ]; then
+        rm -f "$PID_FILE"
+        echo "ℹ️ 目前沒有正在運行的 V2 交易機器人程序。"
+        echo "================================================================="
+        return 0
+    fi
+
+    echo "正在向 V2 機器人程序 (PID: $pids) 發送安全關閉信號 (SIGTERM)..."
+    kill -TERM $pids 2>/dev/null || true
+    kill -INT $pids 2>/dev/null || true
+
+    local i pids_left=""
+    for i in $(seq 1 25); do
+        sleep 0.2
+        pids_left=""
+        for p in $pids; do
+            if kill -0 "$p" 2>/dev/null; then
+                pids_left="$pids_left $p"
+            fi
+        done
+        pids_left="$(echo "$pids_left" | xargs 2>/dev/null || true)"
+        if [ -z "$pids_left" ]; then
+            break
+        fi
+    done
+
+    if [ -n "$pids_left" ]; then
+        echo "⚠️ 程式未於 5 秒內優雅退出，強制終止 (PID: $pids_left)..."
+        kill -9 $pids_left 2>/dev/null || true
+        sleep 1
+    fi
+
+    rm -f "$PID_FILE"
+    echo "✅ V2 機器人程序已成功停止！"
+    echo "================================================================="
+}
+
+cmd_status() {
+    cd "$BASE_DIR"
+    local mode_arg=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            live|paper)
+                mode_arg=(--mode "$1")
+                shift
+                ;;
+            --mode|-m)
+                mode_arg=(--mode "${2:-}")
+                shift 2
+                ;;
+            *)
+                echo "❌ 未知參數: $1 (用法: ./tmf status [paper|live])"
+                exit 1
+                ;;
+        esac
+    done
+
+    local pid
+    pid="$(get_v2_pid)"
+    local pid_arg=()
+    if [ -n "$pid" ]; then
+        pid_arg=(--pid "$pid")
+    fi
+    exec "$PYTHON_BIN" -B "$BASE_DIR/main.py" --status "${mode_arg[@]}" "${pid_arg[@]}"
+}
+
+cmd_tail() {
+    cd "$BASE_DIR"
+    local target="log"
+    local mode_arg=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            stdout|log)
+                target="$1"
+                shift
+                ;;
+            live|paper)
+                mode_arg=(--mode "$1")
+                shift
+                ;;
+            --mode|-m)
+                mode_arg=(--mode "${2:-}")
+                shift 2
+                ;;
+            *)
+                echo "❌ 未知參數: $1 (用法: ./tmf tail [paper|live|stdout])"
+                exit 1
+                ;;
+        esac
+    done
+    exec "$PYTHON_BIN" -B "$BASE_DIR/main.py" --tail "$target" "${mode_arg[@]}"
+}
+
+cmd_cmd() {
+    cd "$BASE_DIR"
+    local action="${1:-}"
+    case "$action" in
+        close|close_and_halt|resume)
+            shift
+            exec "$PYTHON_BIN" -B "$BASE_DIR/main.py" --cmd "$action" "$@"
+            ;;
+        *)
+            echo "❌ 請指定有效即時指令: close | close_and_halt | resume"
+            echo "範例: ./tmf cmd close_and_halt [--mode live|paper]"
+            exit 1
+            ;;
+    esac
+}
+
+cmd_push() {
+    set -e
+    local data_only=0
+    if [ "${1:-}" = "--data-only" ]; then
+        data_only=1
+        shift
+    fi
+
+    local msg="${1:-Update TMF daytrading V2 system}"
+    local src_dir="$BASE_DIR"
+    local separate_repo="$src_dir/../sinotrade_repo"
+    local repo_dir=""
+    local sub_prefix=""
+
+    if [ -d "$separate_repo/.git" ]; then
+        repo_dir="$separate_repo"
+        sub_prefix="tmf_daytrading_v2/"
+        if [ "$data_only" = "1" ]; then
+            echo "🔄 僅同步 tmf_daytrading_v2/data/ 與 reports/ 至 Git 倉庫 (--data-only)..."
+            if [ -d "$src_dir/data" ]; then
+                mkdir -p "$repo_dir/tmf_daytrading_v2/data"
+                rsync -av --exclude='Daily_*.csv' --exclude='*.log' "$src_dir/data/" "$repo_dir/tmf_daytrading_v2/data/"
+            fi
+            if [ -d "$src_dir/reports" ]; then
+                mkdir -p "$repo_dir/tmf_daytrading_v2/reports"
+                rsync -av --exclude='*.log' "$src_dir/reports/" "$repo_dir/tmf_daytrading_v2/reports/"
+            fi
+        else
+            echo "🔄 同步 V2 檔案至 Git 倉庫 (tmf_daytrading_v2/)..."
+            rsync -av --delete \
+              --exclude='.git/' \
+              --exclude='.env' \
+              --exclude='certs/' \
+              --exclude='*.pfx' \
+              --exclude='*.pem' \
+              --exclude='logs/' \
+              --exclude='venv/' \
+              --exclude='.venv/' \
+              --exclude='__pycache__/' \
+              --exclude='Daily_*.csv' \
+              --exclude='*.log' \
+              "$src_dir/" "$repo_dir/tmf_daytrading_v2/"
+        fi
+    else
+        repo_dir="$src_dir"
+    fi
+
+    cd "$repo_dir"
+    local current_branch
+    current_branch="$(git rev-parse --abbrev-ref HEAD)"
+    if [ "$data_only" = "1" ]; then
+        if [ -d "${sub_prefix}data" ]; then
+            git add -- "${sub_prefix}data"
+        fi
+        if [ -d "${sub_prefix}reports" ]; then
+            git add -- "${sub_prefix}reports"
+        fi
+        git reset -q -- "${sub_prefix}data/Daily_*.csv" 2>/dev/null || true
+    else
+        if [ -n "$sub_prefix" ]; then
+            git add -- "$sub_prefix"
+            if [ -f ".gitignore" ]; then
+                git add -- ".gitignore"
+            fi
+        else
+            git add -A
+        fi
+    fi
+
+    if git diff --staged --quiet; then
+        echo "✅ 沒有需要提交的更動 (已是最新狀態，分支: $current_branch)。"
+    else
+        git commit -m "$msg"
+        echo "🔄 推送前同步遠端最新更動 (rebase 防止 non-fast-forward)..."
+        git pull --rebase origin "$current_branch"
+        echo "🚀 推送更動至 GitHub 分支 [$current_branch]..."
+        git push origin "$current_branch"
+        echo "🎉 成功推送到 GitHub (river235711/sinotrade，分支: $current_branch)！"
+    fi
+}
+
+cmd_pull() {
+    set -e
+    local dest_dir="$BASE_DIR"
+    local separate_repo="$dest_dir/../sinotrade_repo"
+
+    echo "================================================================="
+    echo "🔄 正在從 GitHub 拉取 V2 最新程式碼並同步清理目錄..."
+    echo "================================================================="
+
+    if [ -d "$separate_repo/.git" ]; then
+        cd "$separate_repo"
+        git pull origin main
+        git clean -fd
+
+        echo ""
+        echo "🧹 正在將 V2 最新檔案同步至執行目錄..."
+        rsync -av --delete \
+          --exclude='.git/' \
+          --exclude='.env' \
+          --exclude='certs/' \
+          --exclude='*.pfx' \
+          --exclude='*.pem' \
+          --exclude='logs/' \
+          --exclude='venv/' \
+          --exclude='.venv/' \
+          --exclude='Daily_*.csv' \
+          --exclude='*.log' \
+          "$separate_repo/tmf_daytrading_v2/" "$dest_dir/"
+    elif git -C "$dest_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        cd "$dest_dir"
+        git pull origin main
+        git clean -fdx \
+          -e '.env' \
+          -e 'certs/' \
+          -e '*.pfx' \
+          -e '*.pem' \
+          -e 'logs/' \
+          -e 'venv/' \
+          -e '.venv/'
+    else
+        echo "❌ 找不到 Git 倉庫 ($separate_repo 或 $dest_dir)！"
+        exit 1
+    fi
+
+    chmod +x "$dest_dir/tmf" 2>/dev/null || true
+    find "$dest_dir" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+
+    echo "================================================================="
+    echo "✅ V2 更新與目錄清理完成！目前本地與 GitHub 完全一致。"
+    echo "================================================================="
+}
+
+main() {
+    local subcmd="${1:-}"
+    case "$subcmd" in
+        ""|help|-h|--help)
+            show_help
+            exit 0
+            ;;
+        start)
+            shift
+            cmd_start "$@"
+            ;;
+        stop)
+            shift
+            cmd_stop "$@"
+            ;;
+        status)
+            shift
+            cmd_status "$@"
+            ;;
+        tail)
+            shift
+            cmd_tail "$@"
+            ;;
+        cmd)
+            shift
+            cmd_cmd "$@"
+            ;;
+        health)
+            shift
+            cd "$BASE_DIR"
+            exec "$PYTHON_BIN" -B "$BASE_DIR/runtime/health_check.py" "$@"
+            ;;
+        account)
+            shift
+            cd "$BASE_DIR"
+            exec "$PYTHON_BIN" -B "$BASE_DIR/runtime/query_account.py" "$@"
+            ;;
+        backtest)
+            shift
+            cd "$BASE_DIR"
+            exec "$PYTHON_BIN" -B "$BASE_DIR/main.py" --mode backtest "$@"
+            ;;
+        update)
+            shift
+            cd "$BASE_DIR"
+            exec "$PYTHON_BIN" -B "$BASE_DIR/runtime/update_20days.py" "$@"
+            ;;
+        push)
+            shift
+            cmd_push "$@"
+            ;;
+        pull)
+            shift
+            cmd_pull "$@"
+            ;;
+        *)
+            echo "❌ 未知指令: $subcmd"
+            echo ""
+            show_help
+            exit 1
+            ;;
+    esac
+}
+
+{
+    main "$@"
+    exit $?
+}
