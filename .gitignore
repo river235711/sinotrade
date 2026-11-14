@@ -5,8 +5,11 @@
 
 # 期交所大型原始逐筆 CSV 檔 (保留輕量化快取與永久日 K 歷史檔供 ATR 計算及直接回測)
 data/Daily_*.csv
+**/data/Daily_*.csv
 !data/daily_bars.csv
+!**/data/daily_bars.csv
 data/*.zip
+**/data/*.zip
 
 # Python 快取與系統檔
 __pycache__/
@@ -17,3 +20,4 @@ __pycache__/
 
 # 實盤委託稽核紀錄
 logs/
+**/logs/
